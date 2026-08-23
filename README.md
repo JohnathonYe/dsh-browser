@@ -48,6 +48,19 @@ The paired Playwright / extension duration ratio was **1.24** (95% CI **1.16–1
 | Wait for stability | `browser_wait` | Page-load and render-settle detection |
 | Send images | `session.prompt` / `session.attachment` | Host-capability-gated image drafts, image-only prompts, and durable history previews |
 
+## Tab authorization groups (DSH-)
+
+Browser control moves from "follow one tab" to an **authorized group** model:
+
+- The unit is a **Chrome tab group**; once authorized, every tab in it becomes AI-operable.
+- Authorizing a **single page** auto-creates a group (name prefixed with `DSH-` such as `DSH-task`); tabs newly added to the group are authorized automatically.
+- **Multiple groups** are supported; AI uses `browser_tab_switch` to move between groups/pages and `browser_new_tab` to open a tab inside the authorized group (auto-joined).
+- Within an authorized group **no per-action permission is required** (including new domains opened by AI); authorize/revoke is the only gate, and opening a new tab follows an allow/ask policy.
+- **Background operation**: switching tabs, window focus loss, or minimizing does not stop the AI; the extension can operate background tabs.
+- The side panel shows authorized groups, the tab name the AI is currently operating, plus authorize/revoke and the open-tab policy.
+
+New tools: `browser_tab_list`, `browser_tab_switch`, `browser_new_tab`.
+
 ## Repository layout
 
 ```
