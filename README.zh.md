@@ -61,6 +61,14 @@ Playwright / 扩展的配对耗时比为 **1.24**（95% CI **1.16–1.34**）：
 
 新增工具：`browser_tab_list`（列授权组标签页）、`browser_tab_switch`、`browser_new_tab`。
 
+## 浏览器截图（`browser_screenshot`）
+
+- `browser_screenshot` 用 **`chrome.debugger`** 精确截取 AI 当前控制的那个标签页（无论它是否活动/后台）：`chrome.debugger.attach(目标tab)` → `Page.captureScreenshot` 拿到**真实光栅化截图**（非 DOM 重绘）。
+- 截图以工具结果的 image content 返回，视觉模型可直接读取。
+- 默认截**当前视口**；需要整页时 AI 可先 `browser_scroll` 到目标位置再截。
+- 需要扩展权限 `debugger` 与 `<all_urls>`（截图任意页必需）。
+- 副作用：Chrome 会在被截页面顶部显示"正在调试此浏览器"黄色提示条，该文案由浏览器写死、无法自定义。
+
 ## 组成
 
 ```

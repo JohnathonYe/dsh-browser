@@ -753,6 +753,24 @@ async function pushBudgetToControlledTab(negotiated: BridgeCaps): Promise<void> 
   }
 }
 
+/** Bound on one screenshot's debugger round-trips so a hung renderer cannot stall a call forever. */
+const SCREENSHOT_TIMEOUT_MS = 15_000
+
+/** Reject after `ms` without abandoning the underlying promise. */
+async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), ms)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 /** Run the authorization-level browser tools (list/switch/new tab) without content-script dispatch. */
 async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
   await authorizationReady
@@ -802,13 +820,67 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     }
     return { ok: false, error: { code: 'action-failed', message: 'Could not open a new tab.' } }
   }
+  if (call.name === 'browser_screenshot') {
+    // Page content sharing off blocks every page-content read, screenshots included.
+    if (settings.sharePageContent === 'off') {
+      return { ok: false, error: { code: 'action-failed', message: 'Page content sharing is disabled in Settings > Page content sharing.' } }
+    }
+    const target = await resolveAuthorizedTab()
+    if ('ok' in target) return target
+    const tabId = target.id
+    if (tabId === undefined) {
+      return { ok: false, error: { code: 'action-failed', message: 'Screenshot capture failed: the controlled tab has no id.' } }
+    }
+    // captureVisibleTab only captures the window's visible active tab, so it
+    // cannot hit a background tab the model targeted. The chrome.debugger
+    // transport captures the exact tab regardless of what is on screen and
+    // reports failures (e.g. "Another debugger is already attached") as errors.
+    let attached = false
+    try {
+      await chrome.debugger.attach({ tabId }, '1.3')
+      attached = true
+      await withTimeout(
+        chrome.debugger.sendCommand({ tabId }, 'Page.enable'),
+        SCREENSHOT_TIMEOUT_MS,
+        'Enabling the page domain timed out',
+      )
+      const capture = await withTimeout(
+        chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', { format: 'png' }),
+        SCREENSHOT_TIMEOUT_MS,
+        'Capturing the screenshot timed out',
+      )
+      const data = typeof capture === 'object' && capture !== null
+        ? (capture as { data?: unknown }).data
+        : undefined
+      if (typeof data !== 'string' || data === '') {
+        return { ok: false, error: { code: 'content-unavailable', message: 'Screenshot capture returned no image data.' } }
+      }
+      const title = (await chrome.tabs.get(tabId).catch(() => null))?.title ?? ''
+      return {
+        ok: true,
+        result: {
+          text: title === '' ? 'Captured the controlled tab.' : `Captured ${title}.`,
+          image: { mediaType: 'image/png', data },
+        },
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { ok: false, error: { code: 'action-failed', message: `Screenshot capture failed: ${message}` } }
+    } finally {
+      // Detach only our own session so a failed attach cannot tear down a
+      // debugger owned by someone else (e.g. an open DevTools window).
+      if (attached) {
+        await chrome.debugger.detach({ tabId }).catch(() => {})
+      }
+    }
+  }
   return { ok: false, error: { code: 'action-failed', message: 'Unknown browser control tool.' } }
 }
 
 /** Route one tool.call frame to the user-approved controlled tab. */
 function routeToolCall(call: ToolCall): void {
   if (bridge === null) return
-  if (call.name === 'browser_tab_list' || call.name === 'browser_tab_switch' || call.name === 'browser_new_tab') {
+  if (call.name === 'browser_tab_list' || call.name === 'browser_tab_switch' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot') {
     const controller = new AbortController()
     activeToolCalls.set(call.id, controller)
     const timer = setTimeout(() => { controller.abort() }, 90_000)

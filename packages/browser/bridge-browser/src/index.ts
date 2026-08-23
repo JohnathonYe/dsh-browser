@@ -181,6 +181,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       toolTimeoutMs: resolved.toolTimeoutMs,
       snapshotMaxChars: resolved.snapshotMaxChars,
       maxInteractiveItems: resolved.maxInteractiveItems,
+      injectBrowserImage: (sessionId, attachment) => { browserContext.injectImage(sessionId, attachment) },
     })
     return () => { for (const dispose of disposers.values()) dispose() }
   }, 'bridge-browser: browser tools')

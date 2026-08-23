@@ -61,6 +61,14 @@ Browser control moves from "follow one tab" to an **authorized group** model:
 
 New tools: `browser_tab_list`, `browser_tab_switch`, `browser_new_tab`.
 
+## Browser screenshot (`browser_screenshot`)
+
+- `browser_screenshot` uses **`chrome.debugger`** to capture exactly the tab the AI currently controls (whether active or background): `chrome.debugger.attach(targetTab)` → `Page.captureScreenshot` returns a genuine rasterized screenshot (not a DOM redraw).
+- The screenshot is returned as image content in the tool result, readable by a vision model.
+- By default it captures the **current viewport**; for the full page, the AI can `browser_scroll` to a position first, then capture.
+- Requires the extension permissions `debugger` and `<all_urls>` (needed to screenshot any page).
+- Side effect: Chrome shows a yellow "is debugging this browser" infobar over the captured page; that text is hardcoded by the browser and cannot be customized.
+
 ## Repository layout
 
 ```

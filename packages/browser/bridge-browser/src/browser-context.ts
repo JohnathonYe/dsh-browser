@@ -11,6 +11,7 @@
  */
 
 import type { Agent, AgentRegistry } from '@deepseek-ai/dsh-agent'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 
 /** Provenance key used for snapshot supersession and transcript presentation. */
@@ -37,9 +38,26 @@ export function createBrowserSnapshotMessage(snapshot: string): UserMessage {
   })
 }
 
+/** One plugin-supplied screenshot caption for the image's provenance surface. */
+const SCREENSHOT_DESCRIPTION = 'A screenshot of the controlled browser tab, captured on request.'
+
+/** Build one context message carrying a single image block. */
+export function createBrowserImageMessage(attachment: ImageAttachmentRef): UserMessage {
+  return createUserMessage({
+    content: [{ type: 'image', attachment }],
+    source: {
+      kind: 'plugin',
+      plugin: BROWSER_CONTEXT_PLUGIN,
+      form: 'snapshot',
+      sections: [{ name: 'browser-screenshot', text: SCREENSHOT_DESCRIPTION }],
+    },
+  })
+}
+
 /** Deliver followed-page snapshots to live or not-yet-materialized Agents. */
 export class BrowserContextInjector {
   private readonly pending = new Map<string, string>()
+  private readonly pendingImages = new Map<string, ImageAttachmentRef>()
 
   constructor(
     private readonly agents: Pick<AgentRegistry, 'get'>,
@@ -70,13 +88,41 @@ export class BrowserContextInjector {
     return 'queued'
   }
 
+  /**
+   * Inject one captured screenshot as an image message into a live session, or
+   * retain the newest per session until the Agent materializes.
+   */
+  injectImage(sessionId: string, attachment: ImageAttachmentRef): 'injected' | 'queued' {
+    const agent = this.agents.get(sessionId as Parameters<AgentRegistry['get']>[0])
+    if (agent !== undefined) {
+      this.pendingImages.delete(sessionId)
+      agent.inject(createBrowserImageMessage(attachment))
+      return 'injected'
+    }
+
+    this.pendingImages.delete(sessionId)
+    while (this.pendingImages.size >= this.maxPending) {
+      const oldest = this.pendingImages.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.pendingImages.delete(oldest)
+    }
+    this.pendingImages.set(sessionId, attachment)
+    return 'queued'
+  }
+
   /** Flush one provisional session at the supported Agent startup boundary. */
   activate(agent: Agent): boolean {
     const sessionId = String(agent.id)
     const snapshot = this.pending.get(sessionId)
-    if (snapshot === undefined) return false
-    agent.inject(createBrowserSnapshotMessage(snapshot))
-    this.pending.delete(sessionId)
-    return true
+    if (snapshot !== undefined) {
+      agent.inject(createBrowserSnapshotMessage(snapshot))
+      this.pending.delete(sessionId)
+    }
+    const image = this.pendingImages.get(sessionId)
+    if (image !== undefined) {
+      agent.inject(createBrowserImageMessage(image))
+      this.pendingImages.delete(sessionId)
+    }
+    return snapshot !== undefined || image !== undefined
   }
 }

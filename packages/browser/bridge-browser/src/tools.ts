@@ -1,19 +1,23 @@
 /**
  * Model-facing browser tools. Every tool executes by dispatching a `tool.call`
  * over the bridge to the connected extension, which performs the action in the
- * user's explicitly controlled tab and returns a pure-text result.
+ * user's explicitly controlled tab and returns its result.
  *
- * The whole surface is text-only by design (DeepSeek models have no vision):
- * `browser_snapshot` renders the page as structured text with a numbered
- * interactive inventory, and every other tool addresses elements by that
- * inventory's stable index. Results are single `{ text }` objects rendered as
- * one text ContentBlock.
+ * The surface is text-first: `browser_snapshot` renders the page as structured
+ * text with a numbered interactive inventory, and most tools address elements
+ * by that inventory's stable index. `browser_screenshot` is the one exception:
+ * it returns a PNG image content block in the tool result so a vision-capable
+ * model can read the page and the UI can render it. Other results are single
+ * `{ text }` objects rendered as one text ContentBlock.
  *
  * @module
  */
 
+import { isDeepStrictEqual } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { defineTool, type ToolDefinition, type ToolExecution, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { BridgeServer } from './server.ts'
 
 /** Options resolved from plugin config before tool registration. */
@@ -24,11 +28,37 @@ export interface BrowserToolsOptions {
   snapshotMaxChars: number
   /** Upper bound on interactive inventory items per snapshot. */
   maxInteractiveItems: number
+  /** Inject one captured screenshot into a live Agent session as an image message. */
+  injectBrowserImage?: (sessionId: string, attachment: ImageAttachmentRef) => void | Promise<void>
 }
 
 /** Canonical tool result: one text payload. */
 interface TextResult {
   text: string
+}
+
+/** The extension's screenshot result payload: descriptive text plus raw image. */
+interface ScreenshotResult {
+  text: string
+  image?: { mediaType: string; data: string }
+}
+
+/** One screenshot execution's image-enriched projection, staged for finalizeContent. */
+interface ScreenshotProjection {
+  /** The canonical value that produced this projection (stale-guard). */
+  value: unknown
+  /** The render output this projection would otherwise replace (stale-guard). */
+  fallback: ContentBlock[]
+  /** The model-facing content with the image block materialised. */
+  content: ContentBlock[]
+}
+
+/** Screenshot image formats the attachment store accepts. */
+const IMAGE_MEDIA_TYPES: readonly ImageMediaType[] = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+
+/** Narrow a declared MIME string to the durable image vocabulary. */
+function isImageMediaType(value: string): value is ImageMediaType {
+  return (IMAGE_MEDIA_TYPES as readonly string[]).includes(value)
 }
 
 /** Output contract shared by every browser tool. */
@@ -63,6 +93,10 @@ export const BROWSER_TOOL_NAMES = [
   'browser_reload',
   'browser_get_text',
   'browser_wait',
+  'browser_tab_list',
+  'browser_tab_switch',
+  'browser_new_tab',
+  'browser_screenshot',
 ] as const
 
 /**
@@ -82,15 +116,92 @@ export function registerBrowserTools(
   options: BrowserToolsOptions,
 ): Map<string, () => void> {
   const disposers = new Map<string, () => void>()
-  const call = async (exec: Pick<ToolRunContext, 'agent' | 'signal'>, name: string, args: Record<string, unknown>): Promise<TextResult> => {
+  // Request the extension's raw result (the screenshot tool also reads the
+  // `image` payload the other tools never touch).
+  const request = async (exec: Pick<ToolRunContext, 'agent' | 'signal'>, name: string, args: Record<string, unknown>): Promise<unknown> => {
     const sessionId = exec.agent === undefined ? undefined : String(exec.agent.id)
-    const result = sessionId === undefined
-      ? await bridge.requestTool(name, args, exec.signal, options.toolTimeoutMs)
-      : await bridge.requestTool(name, args, exec.signal, options.toolTimeoutMs, sessionId)
-    return normalizeTextResult(result, name)
+    return sessionId === undefined
+      ? bridge.requestTool(name, args, exec.signal, options.toolTimeoutMs)
+      : bridge.requestTool(name, args, exec.signal, options.toolTimeoutMs, sessionId)
+  }
+  const call = async (exec: Pick<ToolRunContext, 'agent' | 'signal'>, name: string, args: Record<string, unknown>): Promise<TextResult> => {
+    return normalizeTextResult(await request(exec, name, args), name)
   }
 
-  for (const tool of defineTools(call, options)) {
+  // Defined here rather than in defineTools: the screenshot tool reads the
+  // extension's `image` payload and needs this scope's `ctx`/`request`. The
+  // projection is keyed by the exact execution so finalizeContent can
+  // materialise the image block for that call only.
+  const projections = new WeakMap<ToolExecution, ScreenshotProjection>()
+  const screenshot = (): ToolDefinition => defineTool({
+    name: 'browser_screenshot',
+    description: 'Capture a PNG screenshot of the currently controlled browser tab and return it in the tool result as an image content block.',
+    parameters: {},
+    timeoutMs: options.toolTimeoutMs,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          text: { type: 'string', required: true },
+          image: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              mediaType: { type: 'string', required: true },
+              data: { type: 'string', required: true },
+            },
+          },
+        },
+      },
+      render: (_args: unknown, value: unknown) => {
+        const result = value as ScreenshotResult
+        return [{ type: 'text' as const, text: result.text }]
+      },
+    },
+    execute: async (_args, exec) => {
+      const raw = await request(exec, 'browser_screenshot', {})
+      const result = raw as ScreenshotResult
+      // Persist the image so the harness can materialise it as an image block in
+      // the tool result (the same projection pattern the MCP client uses). The
+      // text block always survives, so a text-only model still has context.
+      const image = result.image
+      if (image !== undefined
+        && isImageMediaType(image.mediaType)
+        && typeof image.data === 'string'
+        && image.data.length > 0) {
+        const attachments = ctx.get('attachments')
+        if (attachments !== undefined) {
+          const attachment = await attachments.saveImage({
+            data: Uint8Array.from(Buffer.from(image.data, 'base64')),
+            mediaType: image.mediaType,
+            name: 'dsh-browser-screenshot',
+          })
+          const text = typeof result.text === 'string' ? result.text : ''
+          projections.set(exec, {
+            value: result,
+            fallback: [{ type: 'text', text }],
+            content: [{ type: 'text', text }, { type: 'image', attachment }],
+          })
+        }
+      }
+      return result
+    },
+    finalizeContent(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) {
+      // Failures and non-image runs defer to the render output.
+      if (result.isError) return undefined
+      const projection = projections.get(exec)
+      if (projection === undefined) return undefined
+      projections.delete(exec)
+      // Replace the render output only when this exact value produced the image,
+      // so a stale or unrelated projection can never hijack another call's content.
+      if (!isDeepStrictEqual(result.value, projection.value)) return undefined
+      if (!isDeepStrictEqual(result.content, projection.fallback)) return undefined
+      return projection.content
+    },
+  })
+
+  for (const tool of [...defineTools(call, options), screenshot()]) {
     disposers.set(tool.name, ctx.tools.register(tool))
   }
   return disposers
