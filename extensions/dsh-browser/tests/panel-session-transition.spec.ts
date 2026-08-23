@@ -54,6 +54,8 @@ describe('panel session transitions', () => {
       onApprovalRequest: vi.fn(() => unsubscribe),
       onApprovalResolved: vi.fn(() => unsubscribe),
       onTabAffinity: vi.fn(() => unsubscribe),
+      onTabAuthorization: vi.fn(() => unsubscribe),
+      sendTabAuthorization: vi.fn(async () => {}),
       onSessionResumeHint: vi.fn((callback) => { onResumeHint = callback; return unsubscribe }),
       respondToApproval: vi.fn(async () => {}),
       resolveTabAffinity: vi.fn(async () => {}),

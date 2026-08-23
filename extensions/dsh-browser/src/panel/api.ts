@@ -10,6 +10,7 @@ import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts
 import type { BridgeState } from '../background/bridge.ts'
 import type { Settings } from '../background/index.ts'
 import type { TabAffinityDecision, TabAffinityState } from '../background/tab-affinity.ts'
+import type { TabAuthSnapshot, TabAuthAction } from '../background/tab-authorization.ts'
 import type { ApprovalDecision, ApprovalRequest } from '../security/approval.ts'
 import { getUiLocale } from '../i18n.ts'
 
@@ -64,6 +65,11 @@ interface TabAffinityMessage {
   state: TabAffinityState
 }
 
+interface TabAuthorizationMessage {
+  type: 'tab-authorization'
+  state: TabAuthSnapshot
+}
+
 interface TabAffinityRebindResultMessage {
   type: 'tab-affinity.rebind.result'
   id: string
@@ -76,7 +82,7 @@ interface SessionResumeHintMessage {
   sessionId: string | null
 }
 
-type BackgroundMessage = RpcResultMessage | RespondResultMessage | StatusMessage | EventMessage | ApprovalRequestMessage | ApprovalResolvedMessage | TabAffinityMessage | TabAffinityRebindResultMessage | SessionResumeHintMessage
+type BackgroundMessage = RpcResultMessage | RespondResultMessage | StatusMessage | EventMessage | ApprovalRequestMessage | ApprovalResolvedMessage | TabAffinityMessage | TabAuthorizationMessage | TabAffinityRebindResultMessage | SessionResumeHintMessage
 
 /** Structured gateway failure retained for product-level error handling. */
 export class PanelRpcError extends Error {
@@ -107,6 +113,8 @@ export interface PanelApi {
   onApprovalRequest(callback: (request: ApprovalRequest) => void): () => void
   onApprovalResolved(callback: (id: string) => void): () => void
   onTabAffinity(callback: (state: TabAffinityState) => void): () => void
+  onTabAuthorization(callback: (state: TabAuthSnapshot) => void): () => void
+  sendTabAuthorization(action: TabAuthAction): Promise<void>
   onSessionResumeHint(callback: (sessionId: string | null) => void): () => void
   respondToApproval(id: string, decision: ApprovalDecision): Promise<void>
   resolveTabAffinity(revision: number, decision: TabAffinityDecision, sessionId: string | null): Promise<void>
@@ -133,6 +141,7 @@ export function connectPanel(): PanelApi {
   const approvalListeners = new Set<(request: ApprovalRequest) => void>()
   const approvalResolvedListeners = new Set<(id: string) => void>()
   const tabAffinityListeners = new Set<(state: TabAffinityState) => void>()
+  const tabAuthorizationListeners = new Set<(state: TabAuthSnapshot) => void>()
   const sessionResumeHintListeners = new Set<(sessionId: string | null) => void>()
 
   let port: chrome.runtime.Port | null = null
@@ -182,6 +191,9 @@ export function connectPanel(): PanelApi {
         break
       case 'tab-affinity':
         for (const listener of tabAffinityListeners) listener(msg.state)
+        break
+      case 'tab-authorization':
+        for (const listener of tabAuthorizationListeners) listener(msg.state)
         break
       case 'tab-affinity.rebind.result': {
         const entry = pendingRebinds.get(msg.id)
@@ -353,6 +365,13 @@ export function connectPanel(): PanelApi {
     onTabAffinity(callback) {
       tabAffinityListeners.add(callback)
       return () => { tabAffinityListeners.delete(callback) }
+    },
+    onTabAuthorization(callback) {
+      tabAuthorizationListeners.add(callback)
+      return () => { tabAuthorizationListeners.delete(callback) }
+    },
+    sendTabAuthorization(action) {
+      return send({ type: 'tab-authorization', action })
     },
     onSessionResumeHint(callback) {
       sessionResumeHintListeners.add(callback)

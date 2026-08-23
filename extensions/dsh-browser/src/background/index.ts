@@ -64,6 +64,11 @@ import {
   RecentSessionTracker,
   sessionIdFromFrame,
 } from './session-continuity.ts'
+import {
+  TabAuthorizationController,
+  normalizeGroupTitle,
+  type TabAuthAction,
+} from './tab-authorization.ts'
 
 /** User settings persisted in chrome.storage.local. */
 export interface Settings {
@@ -131,6 +136,8 @@ async function probeBridge(url: string): Promise<boolean> {
 
 const STORAGE_KEY = 'dshSettings'
 const TAB_AFFINITY_STORAGE_KEY = 'dshTabAffinity'
+const TAB_AUTHORIZATION_STORAGE_KEY = 'dshTabAuthorization'
+type StoredTabAuthorization = { groupIds: number[] }
 
 type StoredTabAffinity =
   | { controlledTabId: number; keptActiveTabId?: number }
@@ -147,6 +154,7 @@ let bridgeStartRevision = 0
 const interactionResponses = new InteractionResponseRouter()
 const transientEvents = new TransientEventCache()
 const tabAffinity = new TabAffinityController()
+const tabAuthorization = new TabAuthorizationController()
 const focusedWindow = new FocusedWindowTracker()
 const recentSession = new RecentSessionTracker({
   read: async () => (await chrome.storage.session.get(RECENT_SESSION_STORAGE_KEY))[RECENT_SESSION_STORAGE_KEY],
@@ -461,6 +469,94 @@ async function restoreTabAffinity(): Promise<void> {
 
 const affinityReady = restoreTabAffinity()
 
+// ---- Tab authorization (DSH- 授权组) ----
+let lastPersistedAuthorization: string | undefined
+let authorizationPersistence = Promise.resolve()
+
+function persistTabAuthorization(): void {
+  const groups = tabAuthorization.snapshot().groups
+  const serialized = JSON.stringify(groups.map((g) => g.groupId))
+  if (serialized === lastPersistedAuthorization) return
+  lastPersistedAuthorization = serialized
+  authorizationPersistence = authorizationPersistence.catch(() => {}).then(async () => {
+    if (groups.length === 0) {
+      await chrome.storage.session.remove(TAB_AUTHORIZATION_STORAGE_KEY)
+    } else {
+      await chrome.storage.session.set({ [TAB_AUTHORIZATION_STORAGE_KEY]: { groupIds: groups.map((g) => g.groupId) } })
+    }
+  }).catch(() => {
+    if (lastPersistedAuthorization === serialized) lastPersistedAuthorization = undefined
+  })
+}
+
+function broadcastTabAuthorization(): void {
+  const payload = { type: 'tab-authorization', state: tabAuthorization.snapshot() }
+  for (const port of panelPorts) {
+    try { port.postMessage(payload) } catch { /* port closed */ }
+  }
+}
+
+/** Re-enumerate live group membership so the authorized set stays current (new drags / AI new tabs). */
+async function refreshAuthorizedTabs(groupId?: number): Promise<void> {
+  const groups = groupId === undefined
+    ? tabAuthorization.snapshot().groups
+    : tabAuthorization.snapshot().groups.filter((g) => g.groupId === groupId)
+  for (const g of groups) {
+    try {
+      const exists = await chrome.tabGroups.get(g.groupId).catch(() => null)
+      if (exists === null) {
+        tabAuthorization.revokeGroup(g.groupId)
+        continue
+      }
+      const tabs = await chrome.tabs.query({ groupId: g.groupId }).catch(() => [])
+      const ids = tabs.map((t) => t.id).filter((id): id is number => id !== undefined)
+      tabAuthorization.addTabsToGroup(g.groupId, ids)
+    } catch { /* skip */ }
+  }
+  persistTabAuthorization()
+  broadcastTabAuthorization()
+}
+
+async function restoreTabAuthorization(): Promise<void> {
+  try {
+    const stored = await chrome.storage.session.get(TAB_AUTHORIZATION_STORAGE_KEY)
+    const candidate = stored[TAB_AUTHORIZATION_STORAGE_KEY] as Partial<StoredTabAuthorization> | undefined
+    if (candidate && Array.isArray(candidate.groupIds)) {
+      for (const groupId of candidate.groupIds) {
+        try {
+          const tabs = await chrome.tabs.query({ groupId }).catch(() => [])
+          const ids = tabs.map((t) => t.id).filter((id): id is number => id !== undefined)
+          if (ids.length > 0) tabAuthorization.authorizeGroup(groupId, '', ids)
+        } catch { /* skip missing group */ }
+      }
+    }
+  } catch { /* best-effort */ }
+  persistTabAuthorization()
+  broadcastTabAuthorization()
+}
+
+const authorizationReady = restoreTabAuthorization()
+
+/** Resolve the AI's current authorized target tab (no handoff; works on background tabs). */
+async function resolveAuthorizedTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'> | ToolAnswer> {
+  await authorizationReady
+  const tabId = tabAuthorization.resolveTarget()
+  if (tabId === null) return affinityFailure('missing')
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    const summary = summarizeTab(tab)
+    if (summary === null) return affinityFailure('missing')
+    tabAuthorization.setTarget(tabId, { title: summary.title, url: summary.url })
+    broadcastTabAuthorization()
+    return tab
+  } catch {
+    tabAuthorization.removeTab(tabId)
+    persistTabAuthorization()
+    broadcastTabAuthorization()
+    return affinityFailure('lost')
+  }
+}
+
 /** Bind at prompt submission so a switch while the model is thinking is visible. */
 async function ensureInitialTabBinding(): Promise<boolean> {
   await affinityReady
@@ -657,9 +753,78 @@ async function pushBudgetToControlledTab(negotiated: BridgeCaps): Promise<void> 
   }
 }
 
+/** Run the authorization-level browser tools (list/switch/new tab) without content-script dispatch. */
+async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
+  await authorizationReady
+  if (call.name === 'browser_tab_list') {
+    const groups = tabAuthorization.snapshot().groups
+    const lines: string[] = []
+    for (const g of groups) {
+      for (const tabId of g.tabIds) {
+        try {
+          const tab = await chrome.tabs.get(tabId)
+          lines.push(`[tabId ${tabId}] ${tab.title || '(untitled)'} — ${tab.url || ''}`)
+        } catch { /* tab closed */ }
+      }
+    }
+    return { ok: true, result: { text: lines.join('\n') || 'No authorized tabs yet.' } }
+  }
+  if (call.name === 'browser_tab_switch') {
+    const tabId = Number((call.args as { tabId?: unknown })?.tabId)
+    if (Number.isInteger(tabId) && tabAuthorization.isAuthorizedTab(tabId)) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null)
+      const title = tab?.title ?? ''
+      const url = tab?.url ?? ''
+      tabAuthorization.setTarget(tabId, { title, url })
+      broadcastTabAuthorization()
+      return { ok: true, result: { text: `Switched to tab ${tabId}${title ? ': ' + title : ''}` } }
+    }
+    return { ok: false, error: { code: 'no-active-tab', message: 'Invalid or unauthorized tabId. Use browser_tab_list first.' } }
+  }
+  if (call.name === 'browser_new_tab') {
+    const groups = tabAuthorization.snapshot().groups
+    if (groups.length === 0) {
+      return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Authorize a group in the panel first.' } }
+    }
+    if (!tabAuthorization.mayOpenTab()) {
+      return { ok: false, error: { code: 'action-failed', message: 'Open-tab policy is "ask"; switch it to allow in the panel, or allow once here.' } }
+    }
+    const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
+    const groupId = groups[groups.length - 1].groupId
+    const tab = await chrome.tabs.create({ url: url || 'about:blank', active: false }).catch(() => null)
+    if (tab && tab.id !== undefined) {
+      await chrome.tabs.group({ tabIds: [tab.id], groupId }).catch(() => {})
+      tabAuthorization.addTabsToGroup(groupId, [tab.id])
+      tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
+      persistTabAuthorization()
+      broadcastTabAuthorization()
+      return { ok: true, result: { text: `Opened a new tab (id ${tab.id}) in group ${groupId}.` } }
+    }
+    return { ok: false, error: { code: 'action-failed', message: 'Could not open a new tab.' } }
+  }
+  return { ok: false, error: { code: 'action-failed', message: 'Unknown browser control tool.' } }
+}
+
 /** Route one tool.call frame to the user-approved controlled tab. */
 function routeToolCall(call: ToolCall): void {
   if (bridge === null) return
+  if (call.name === 'browser_tab_list' || call.name === 'browser_tab_switch' || call.name === 'browser_new_tab') {
+    const controller = new AbortController()
+    activeToolCalls.set(call.id, controller)
+    const timer = setTimeout(() => { controller.abort() }, 90_000)
+    void runBrowserControlTool(call).then(
+      (answer) => {
+        if (controller.signal.aborted || bridge === null) return
+        if (answer.ok) bridge.send({ t: 'tool.result', id: call.id, ok: true, result: answer.result })
+        else bridge.send({ t: 'tool.result', id: call.id, ok: false, error: answer.error! })
+      },
+      (error: unknown) => {
+        if (controller.signal.aborted || bridge === null) return
+        bridge.send({ t: 'tool.result', id: call.id, ok: false, error: { code: 'internal', message: error instanceof Error ? error.message : String(error) } })
+      },
+    ).finally(() => { clearTimeout(timer); activeToolCalls.delete(call.id) })
+    return
+  }
   recentSession.remember(call.sessionId)
   activeToolCalls.get(call.id)?.abort()
   const controller = new AbortController()
@@ -670,16 +835,19 @@ function routeToolCall(call: ToolCall): void {
   const budget = caps === null
     ? undefined
     : { maxItems: caps.maxInteractiveItems, maxChars: caps.snapshotMaxChars }
-  void resolveToolTab().then((target) => 'ok' in target
+  const authGroups = tabAuthorization.snapshot().groups
+  const resolveTarget = authGroups.length > 0 ? resolveAuthorizedTab() : resolveToolTab()
+  void resolveTarget.then((target) => 'ok' in target
     ? target
     : dispatchToolCall(
         call,
-        settings.sharePageContent,
+        authGroups.length > 0 ? 'auto' : settings.sharePageContent,
         budget,
-        (prompt) => authorizeToolCall(prompt, controller.signal, target.windowId, call.sessionId),
+        async (prompt) => authGroups.length > 0 ? 'approved' : authorizeToolCall(prompt, controller.signal, target.windowId, call.sessionId),
         controller.signal,
         target,
-        () => target.id !== undefined && tabAffinity.allowsTarget(target.id),
+        () => target.id !== undefined
+          && (authGroups.length > 0 ? tabAuthorization.isAuthorizedTab(target.id) : tabAffinity.allowsTarget(target.id)),
       )).then(
     (answer) => {
       if (controller.signal.aborted) return
@@ -941,10 +1109,44 @@ chrome.runtime.onConnect.addListener((port) => {
         })
         break
       }
+      case 'tab-authorization': {
+        const action = (message as { action?: unknown }).action as (TabAuthAction & { tabId?: number; title?: string }) | undefined
+        if (!action || typeof action.kind !== 'string') break
+        const handle = async (): Promise<void> => {
+          if (action.kind === 'authorize') {
+            const tabId = action.tabId
+            if (typeof tabId !== 'number') return
+            const tab = await chrome.tabs.get(tabId).catch(() => null)
+            if (tab === null) return
+            let groupId = tab.groupId
+            if (groupId === undefined || groupId < 0) {
+              groupId = await chrome.tabs.group({ tabIds: [tabId] }).catch(() => -1)
+              if (groupId < 0) return
+              await chrome.tabGroups.update(groupId, { title: normalizeGroupTitle(action.title ?? '') }).catch(() => {})
+            }
+            const tabs = await chrome.tabs.query({ groupId }).catch(() => [])
+            const ids = tabs.map((t) => t.id).filter((id): id is number => id !== undefined)
+            if (tabAuthorization.isAuthorizedGroup(groupId)) tabAuthorization.addTabsToGroup(groupId, ids)
+            else tabAuthorization.authorizeGroup(groupId, normalizeGroupTitle(action.title ?? ''), ids)
+            await refreshAuthorizedTabs()
+          } else if (action.kind === 'revoke') {
+            tabAuthorization.revokeGroup(action.groupId)
+          } else if (action.kind === 'mode') {
+            tabAuthorization.setMode(action.mode)
+          } else if (action.kind === 'target') {
+            tabAuthorization.setTarget(action.tabId)
+          }
+          persistTabAuthorization()
+          broadcastTabAuthorization()
+        }
+        void handle().catch(() => {})
+        break
+      }
       case 'request-status':
         try {
           port.postMessage({ type: 'status', state: bridge?.state ?? ('stopped' as BridgeState), caps })
           port.postMessage({ type: 'tab-affinity', state: tabAffinity.snapshot() })
+          port.postMessage({ type: 'tab-authorization', state: tabAuthorization.snapshot() })
           for (const frame of transientEvents.replay()) port.postMessage({ type: 'event', frame })
           approvals.replay((request) => {
             port.postMessage({ type: 'approval.request', request })
@@ -989,6 +1191,45 @@ chrome.notifications.onClicked.addListener((notificationId) => {
   // the call to remain inside this handler.
   openAssistantPanel(windowId)
 })
+
+// ---- Tab authorization event wiring ----
+chrome.tabs.onUpdated.addListener((tabId, _changeInfo, tab) => {
+  void authorizationReady.then(async () => {
+    if (tab.groupId !== undefined && tab.groupId >= 0 && tabAuthorization.isAuthorizedGroup(tab.groupId)) {
+      if (tab.id !== undefined) {
+        tabAuthorization.addTabsToGroup(tab.groupId, [tab.id])
+        persistTabAuthorization()
+        broadcastTabAuthorization()
+      }
+    } else if (tabAuthorization.isAuthorizedTab(tabId)) {
+      await refreshAuthorizedTabs()
+    }
+  })
+})
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.groupId !== undefined && tab.groupId >= 0 && tabAuthorization.isAuthorizedGroup(tab.groupId) && tab.id !== undefined) {
+    tabAuthorization.addTabsToGroup(tab.groupId, [tab.id])
+    persistTabAuthorization()
+    broadcastTabAuthorization()
+  }
+})
+chrome.tabs.onDetached.addListener((tabId) => {
+  if (tabAuthorization.isAuthorizedTab(tabId)) {
+    tabAuthorization.removeTab(tabId)
+    persistTabAuthorization()
+    broadcastTabAuthorization()
+  }
+})
+if (chrome.tabGroups && chrome.tabGroups.onRemoved) {
+  chrome.tabGroups.onRemoved.addListener((tabGroup) => {
+    const groupId = tabGroup.id
+    if (tabAuthorization.isAuthorizedGroup(groupId)) {
+      tabAuthorization.revokeGroup(groupId)
+      persistTabAuthorization()
+      broadcastTabAuthorization()
+    }
+  })
+}
 
 // ---- Tab affinity ----
 

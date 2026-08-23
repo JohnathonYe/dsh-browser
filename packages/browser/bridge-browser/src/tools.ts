@@ -250,6 +250,31 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     },
   })
 
+  const tabList = (): ToolDefinition => defineTool({
+    name: 'browser_tab_list',
+    description: 'List every tab currently authorized to this agent (grouped by DSH- group). Each entry has tabId, title and url. Use browser_tab_switch to move the current target to another authorized tab.',
+    parameters: {},
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (_args, exec) => call(exec, 'browser_tab_list', {}),
+  })
+  const tabSwitch = (): ToolDefinition => defineTool({
+    name: 'browser_tab_switch',
+    description: 'Switch the browser target to another authorized tab (by tabId from browser_tab_list). The agent then operates that tab even when it is in the background.',
+    parameters: { tabId: { type: 'number', required: true, description: 'Authorized tabId to make the current target.' } },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_tab_switch', args as Record<string, unknown>),
+  })
+  const newTab = (): ToolDefinition => defineTool({
+    name: 'browser_new_tab',
+    description: 'Open a new tab in the currently authorized group (or the latest DSH- group). The new tab joins the authorization group and becomes operable. Subject to the "open tab" policy (allow by default, or ask per open).',
+    parameters: { url: { type: 'string', description: 'Optional URL to open in the new tab.' } },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_new_tab', args as Record<string, unknown>),
+  })
+
   return [
     snapshot(),
     click(),
@@ -262,5 +287,8 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     simple('browser_reload', 'Reload the current page.'),
     getText(),
     wait(),
+    tabList(),
+    tabSwitch(),
+    newTab(),
   ]
 }

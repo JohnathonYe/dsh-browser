@@ -13,6 +13,7 @@ import type { BridgeCaps } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import type { BridgeState } from '../background/bridge.ts'
 import type { AffinityTab, TabAffinityDecision, TabAffinityState } from '../background/tab-affinity.ts'
+import type { TabAuthSnapshot, TabAuthMode } from '../background/tab-authorization.ts'
 import { connectPanel, type PanelApi, type PanelSettings } from './api.ts'
 import { renderMarkdown } from './markdown.ts'
 import whaleUrl from '../../assets/icons/deepseek-256.png'
@@ -210,6 +211,41 @@ function TabAffinityBanner({
   )
 }
 
+function TabAuthorizationBar({
+  state, activeTabId, onAuthorize, onRevoke, onMode,
+}: {
+  state: TabAuthSnapshot | null
+  activeTabId: number | null
+  onAuthorize: () => void
+  onRevoke: (groupId: number) => void
+  onMode: (mode: TabAuthMode) => void
+}): React.JSX.Element | null {
+  if (state === null) return null
+  const target = state.target
+  return (
+    <section className="tab-auth">
+      <div className="tab-auth-heading">
+        <span className="eyebrow">DSH 授权组</span>
+        <strong>{state.groups.length === 0 ? '未授权任何标签组' : `已授权 ${state.groups.length} 个组`}</strong>
+      </div>
+      {target?.title && <p className="tab-auth-target">AI 正在操作：{target.title}</p>}
+      <div className="tab-affinity-actions">
+        {activeTabId !== null && (
+          <button className="keep" onClick={onAuthorize}>授权当前页/组</button>
+        )}
+        <button className="follow" onClick={() => onMode(state.mode === 'allow' ? 'ask' : 'allow')}>
+          开tab: {state.mode === 'allow' ? '允许' : '每次询问'}
+        </button>
+        {state.groups.map((g) => (
+          <button key={g.groupId} className="follow" onClick={() => onRevoke(g.groupId)}>
+            取消 {g.title || g.groupId}
+          </button>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function ApprovalDialog({
   request,
   onDecision,
@@ -344,6 +380,7 @@ export function App(): React.JSX.Element {
   const [showSettings, setShowSettings] = useState(false)
   const [approvalQueue, setApprovalQueue] = useState<ApprovalRequest[]>([])
   const [tabAffinity, setTabAffinity] = useState<TabAffinityState | null>(null)
+  const [auth, setAuth] = useState<TabAuthSnapshot | null>(null)
   const [trustedOriginInput, setTrustedOriginInput] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [showSessionPicker, setShowSessionPicker] = useState(false)
@@ -475,13 +512,14 @@ export function App(): React.JSX.Element {
       updateApprovalQueue((current) => current.filter((request) => request.id !== id))
     })
     const offTabAffinity = api.onTabAffinity(setTabAffinity)
+    const offAuth = api.onTabAuthorization(setAuth)
     const offResumeHint = api.onSessionResumeHint((sessionId) => {
       setResumeHint({ ready: true, sessionId })
     })
     void api.requestStatus().catch((cause: unknown) => {
       setError(cause instanceof Error ? cause.message : String(cause))
     })
-    return () => { offStatus(); offEvent(); offApproval(); offApprovalResolved(); offTabAffinity(); offResumeHint() }
+    return () => { offStatus(); offEvent(); offApproval(); offApprovalResolved(); offTabAffinity(); offAuth(); offResumeHint() }
   }, [api])
 
   useEffect(() => {
@@ -1130,6 +1168,13 @@ export function App(): React.JSX.Element {
         </div>
       </header>
       <TabAffinityBanner state={tabAffinity} copy={copy} onDecision={decideTabAffinity} />
+      <TabAuthorizationBar
+        state={auth}
+        activeTabId={tabAffinity?.active?.tabId ?? null}
+        onAuthorize={() => { const t = tabAffinity?.active; if (t) void api.sendTabAuthorization({ kind: 'authorize', tabId: t.tabId, title: t.title }) }}
+        onRevoke={(groupId) => void api.sendTabAuthorization({ kind: 'revoke', groupId })}
+        onMode={(mode) => void api.sendTabAuthorization({ kind: 'mode', mode })}
+      />
       {showSessionPicker && (
         <section className="session-picker" aria-label={copy.app.sessions}>
           <div className="session-picker-head">
