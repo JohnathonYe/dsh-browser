@@ -8,7 +8,7 @@
 
 `dsh` 是由 DeepSeek AI 开发的开源、插件化 agent harness（智能体框架）。本仓库将配套的浏览器桥插件与 Chrome/Firefox MV3 扩展组成一个独立的 pnpm workspace。
 
-浏览器操作仍采用纯文本设计：页面会转换为结构化文本和带编号的交互元素清单，模型通过编号定位元素。dsh 0.1.1 的多模态对话走独立通道——宿主声明图片能力时，侧栏可发送 PNG、JPEG、WebP 和 GIF；浏览器工具本身仍不会截取页面截图。
+浏览器操作的核心仍是纯文本：页面会转换为结构化文本和带编号的交互元素清单，模型通过编号定位元素（点击/填写/滚动）。同时提供 `browser_screenshot`（`chrome.debugger` 光栅化截图）供视觉模型读取，并内置拟人化操作（曲线鼠标移动、分档滚轮、先悬停再点击、目标可见才操作、屏外先滚到可见）。dsh 0.1.1 的多模态对话走独立通道——宿主声明图片能力时，侧栏可发送 PNG、JPEG、WebP 和 GIF。
 
 ## 快速安装
 
@@ -47,6 +47,10 @@ Playwright / 扩展的配对耗时比为 **1.24**（95% CI **1.16–1.34**）：
 | 读取区域 | `browser_get_text` | 懒加载内容 / 局部文本 |
 | 等待稳定 | `browser_wait` | 页面加载与渲染稳定检测 |
 | 发送图片 | `session.prompt` / `session.attachment` | 按宿主能力启用图片草稿、纯图片消息和持久历史预览 |
+| 截图 | `browser_screenshot` | `chrome.debugger` 精确截取受控标签页（可后台），返回光栅化视口截图 |
+| 悬停 | `browser_hover` | 对目标先悬停预览（tooltip/下拉） |
+| 拖动 | `browser_drag` | 滑块/元素随手感拖动（down→move→up） |
+| 拟人操作 | 内建 | 曲线移动、分档滚轮、先 hover 再点击、目标可见才操作、屏外先滚到可见 |
 
 ## 授权组（DSH-）
 
@@ -60,6 +64,15 @@ Playwright / 扩展的配对耗时比为 **1.24**（95% CI **1.16–1.34**）：
 - 侧边栏「DSH 授权组」显示已授权组、AI 当前操作的标签页名称，以及授权/取消授权/开新标签页策略。
 
 新增工具：`browser_tab_list`（列授权组标签页）、`browser_tab_switch`、`browser_new_tab`。
+
+## 多实例选择（AI 驱动）
+
+当**多个浏览器实例**（多个 Chrome/Firefox）连到同一个 dsh 时，是否选目标不再由插件侧栏决定，而是**交给模型询问用户**：
+
+- 扩展在 `chrome.storage.local` 持久化一个随机 `instanceId` 并随 `hello` 上报；服务端用连接注册表按 `instanceId` 分组，多实例互不抢占。
+- 实例的显示名 = **扩展名 · 代表性标签页标题**（优先取该浏览器第一个真实 `http(s)` 且有标题的页面，排除 `chrome://`、`about:`、扩展页、dsh 自身页），并附带**标签页数量**，便于区分；不使用晦涩的 instanceId。
+- 系统提示指引模型：当任何 `browser_*` 工具报错含 `multiple browser instances are connected` 或 `select one before issuing browser actions` 时，**必须先用 `ask_user_question` 询问用户选择哪个实例**（展示 `label (N tabs)`），拿到 instanceId 后调用 `browser_select_instance(instanceId)` 再继续；用户取消/未选择时不自行挑一个。
+- 新增工具：`browser_list_instances`（列出已连接实例 `{instanceId,label,tabCount,selected}`）、`browser_select_instance(instanceId)`（选中并路由后续操作）。
 
 ## 浏览器截图（`browser_screenshot`）
 
@@ -172,7 +185,7 @@ pnpm --filter dsh-browser-extension run test
 - 桥路径在 `/api` 信任栅栏之外，自带 bearer token 认证。
 - Chrome 扩展的本地 Origin 保留零配置回环访问；Firefox Origin 是每次安装生成的 UUID，必须携带 bearer token。
 - 特权网关方法（`settings.*`/`credentials.*`/`host.open*`）对非回环来源一律拒绝。
-- 单活动连接；浏览器页面管线为纯文本且不截图；用户主动添加的对话图片交给 dsh 持久附件服务，密码和卡号值永不回传。
-- 助手开始工作时会绑定当时的活动标签页（提交提示时绑定；直接调用浏览器工具时则在首次调用绑定）。用户手动切页后，后续浏览器操作会暂停，侧栏会询问让助手继续原页面还是跟随新页面；选择原页面后允许在后台继续，但扩展绝不静默改绑或切换用户正在看的页面。受控标签页关闭后也会暂停，直到用户显式选择当前页。
+- 多实例连接：服务端按 instanceId 分组，实例可共存；未显式选择时工具调用会报错并让模型询问用户，不会悄悄用一个实例。
+- 助手在**授权组**内工作，绑定一个或一组标签页；不再有「跟随标签页」逻辑。用户切页不影响已授权组内的操作（后台可操作）；想切换目标需通过授权组而非跟随。受控标签页关闭时，相关工具调用会被拒绝，直到有可操作的授权页面。
 - 网页文字会标记为不可信输入。默认「自动共享」只按需读取受控标签页且不额外弹窗；对隐私敏感时可选择「每次询问」，或用「关闭」完全阻断读取。在「每次询问」模式下，读取弹窗可以仅允许一次，也可以持久切回自动读取；之后仍可在设置中关闭。读取的页面文字会发送给当前选择的模型。
 - 点击、输入、按键、导航、历史跳转和刷新默认失败关闭，必须由用户批准。可以只在当前侧栏会话中信任单个 origin（最后一个侧栏关闭或 Service Worker 重启即清空）；永久信任需在设置中显式管理。显式跨域 `browser_navigate` 和未知目标的历史跳转始终重新询问。

@@ -14,6 +14,14 @@ import { pageText, truncate } from './extract.ts'
 import type { ElementIds } from './ids.ts'
 import type { SnapshotBudget } from './snapshot.ts'
 import { buildSnapshot, renderSnapshot } from './snapshot.ts'
+import {
+  dragFromTo,
+  elementCenter,
+  ensureInViewport,
+  humanWheelScroll,
+  moveMouseHuman,
+  moveMouseSynchronous,
+} from './movement.ts'
 
 /** A settled action result. */
 export interface ActionResult {
@@ -157,6 +165,54 @@ function setNativeValue(input: HTMLInputElement | HTMLTextAreaElement, value: st
   input.dispatchEvent(new Event('change', { bubbles: true }))
 }
 
+/** A slider/range control we drag rather than click. */
+function isRangeElement(el: Element): el is HTMLInputElement {
+  return el instanceof HTMLInputElement && el.type === 'range'
+}
+
+/** Read a range's min/max, tolerant of blank or `any` values. */
+function rangeBounds(input: HTMLInputElement): { min: number; max: number } {
+  const min = input.min === '' || input.min === undefined ? 0 : Number(input.min)
+  const max = input.max === '' || input.max === undefined ? 100 : Number(input.max)
+  return { min: Number.isFinite(min) ? min : 0, max: Number.isFinite(max) && max > min ? max : 100 }
+}
+
+/** Clamp and snap a target value to a range's min/max/step. */
+function clampRangeValue(input: HTMLInputElement, value: number): number {
+  const { min, max } = rangeBounds(input)
+  const step = input.step === '' || input.step === undefined ? 1 : Number(input.step)
+  let clamped = Math.min(max, Math.max(min, value))
+  if (Number.isFinite(step) && step > 0) {
+    clamped = Math.round((clamped - min) / step) * step + min
+    clamped = Math.min(max, Math.max(min, clamped))
+  }
+  return clamped
+}
+
+/** The value corresponding to the element's centre (where a click cursor lands). */
+function rangeClickValue(input: HTMLInputElement): number {
+  const { min, max } = rangeBounds(input)
+  return clampRangeValue(input, (min + max) / 2)
+}
+
+/** Pixel X on the track for a given value. */
+function rangeValueToX(input: HTMLInputElement, value: number): number {
+  const rect = input.getBoundingClientRect()
+  const { min, max } = rangeBounds(input)
+  const fraction = (value - min) / (max - min || 1)
+  return rect.left + Math.max(0, Math.min(1, fraction)) * rect.width
+}
+
+/** Humanized slider drag: mousedown on the thumb, step mousemove, mouseup, then commit the value. */
+async function dragRangeTo(input: HTMLInputElement, targetValue: number): Promise<void> {
+  const target = clampRangeValue(input, targetValue)
+  const center = elementCenter(input)
+  const from = { x: rangeValueToX(input, Number(input.value) || 0), y: center.y }
+  const to = { x: rangeValueToX(input, target), y: center.y }
+  await dragFromTo(input, from, to, { stepMs: 12, steps: 7 })
+  setNativeValue(input, String(target))
+}
+
 /** Action implementations; each returns a text result. */
 export interface ActionContext {
   ids: ElementIds
@@ -172,6 +228,10 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return snapshotAction(args, ctx)
     case 'browser_click':
       return clickAction(args, ctx)
+    case 'browser_hover':
+      return hoverAction(args, ctx)
+    case 'browser_drag':
+      return dragAction(args, ctx)
     case 'browser_type':
       return typeAction(args, ctx)
     case 'browser_press':
@@ -226,8 +286,11 @@ function withPageDelta(text: string, ctx: ActionContext): ActionResult {
 async function clickAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const index = numberArg(args, 'index')
   const el = elementOrThrow(ctx.ids, index)
-  el.scrollIntoView({ block: 'center', behavior: 'instant' })
+  // Never operate on an off-screen target: bring it into the viewport first.
+  ensureInViewport(el)
   if (el instanceof HTMLAnchorElement) {
+    // Humanized pointer: glide along a curve to the link before activating it.
+    moveMouseSynchronous(el)
     const target = el.target.trim().toLowerCase()
     const sameFrameTarget = target === '' || target === '_self'
     let href: URL | undefined
@@ -285,6 +348,16 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
   if (el instanceof HTMLButtonElement && el.disabled) {
     throw new ActionError('action-failed', `Button [${index}] is disabled.`)
   }
+  if (isRangeElement(el)) {
+    // A slider/range is driven by dragging, not by a plain click: glide the
+    // pointer there, then drag the thumb toward where the cursor landed.
+    moveMouseSynchronous(el)
+    const value = rangeClickValue(el)
+    await dragRangeTo(el, value)
+    await waitForPageSettled(ACTION_SETTLE)
+    return withPageDelta(`Dragged slider [${index}] to ${value}.`, ctx)
+  }
+  moveMouseSynchronous(el)
   ;(el as HTMLElement).click()
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(`Clicked [${index}].`, ctx)
@@ -296,9 +369,15 @@ async function typeAction(args: Record<string, unknown>, ctx: ActionContext): Pr
   if (text === '') throw new ActionError('bad-args', 'text must not be empty.')
   const replace = args.replace === true
   const el = elementOrThrow(ctx.ids, index)
+  ensureInViewport(el)
   const contentEditable = el instanceof HTMLElement && el.isContentEditable
   if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || contentEditable)) {
     throw new ActionError('action-failed', `Element [${index}] is not editable (${el.tagName.toLowerCase()}).`)
+  }
+  // Focus the field before writing so the page sees a real (and focused)
+  // cursor rather than only a value mutation.
+  if (contentEditable || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+    try { (el as HTMLElement).focus() } catch { /* some fields refuse focus; value write still applies */ }
   }
   if (contentEditable) {
     if (replace) el.textContent = ''
@@ -328,24 +407,69 @@ async function pressAction(args: Record<string, unknown>, ctx: ActionContext): P
 async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const direction = typeof args.direction === 'string' ? args.direction : ''
   const amount = typeof args.amount === 'number' ? args.amount : Math.floor(window.innerHeight * 0.8)
+  let delta: number
   switch (direction) {
     case 'top':
-      window.scrollTo({ top: 0, behavior: 'instant' })
+      delta = -window.scrollY
       break
     case 'bottom':
-      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' })
+      delta = document.documentElement.scrollHeight - window.scrollY
       break
     case 'up':
-      window.scrollBy({ top: -amount, behavior: 'instant' })
+      delta = -amount
       break
     case 'down':
-      window.scrollBy({ top: amount, behavior: 'instant' })
+      delta = amount
       break
     default:
       throw new ActionError('bad-args', `direction must be up, down, top, or bottom; received "${direction}".`)
   }
+  // Split the scroll into several wheel ticks with small pauses instead of
+  // jumping the page in one instant move, so the motion reads as a hand.
+  await humanWheelScroll(delta, { segments: 6, stepMs: 14 })
   await waitForPageSettled(SCROLL_SETTLE)
   return withPageDelta(`Scrolled ${direction}.`, ctx)
+}
+
+async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const index = numberArg(args, 'index')
+  const el = elementOrThrow(ctx.ids, index)
+  ensureInViewport(el)
+  // Move the pointer over the element and let JS-driven hover affordances
+  // (tooltips, dropdown previews) render before the model decides whether to
+  // click. The returned delta carries whatever a hover revealed.
+  await moveMouseHuman(el, { stepMs: 12, settleMs: 150 })
+  await waitForPageSettled(ACTION_SETTLE)
+  return withPageDelta(
+    `Hovered [${index}]. The pointer is now over the element; call browser_snapshot to read any hover effect.`,
+    ctx,
+  )
+}
+
+async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const index = numberArg(args, 'index')
+  const el = elementOrThrow(ctx.ids, index)
+  ensureInViewport(el)
+  if (isRangeElement(el)) {
+    const value = typeof args.value === 'number' && Number.isFinite(args.value) ? args.value : undefined
+    if (value === undefined) {
+      throw new ActionError('bad-args', 'value is required to drag a slider/range element.')
+    }
+    moveMouseSynchronous(el)
+    await dragRangeTo(el, value)
+    await waitForPageSettled(ACTION_SETTLE)
+    return withPageDelta(`Dragged slider [${index}] to ${clampRangeValue(el, value)}.`, ctx)
+  }
+  const dx = typeof args.dx === 'number' && Number.isFinite(args.dx) ? args.dx : 0
+  const dy = typeof args.dy === 'number' && Number.isFinite(args.dy) ? args.dy : 0
+  if (dx === 0 && dy === 0) {
+    throw new ActionError('bad-args', 'Provide value (for a slider/range) or dx/dy (for a generic drag).')
+  }
+  moveMouseSynchronous(el)
+  const center = elementCenter(el)
+  await dragFromTo(el, center, { x: center.x + dx, y: center.y + dy }, { stepMs: 12, steps: 7 })
+  await waitForPageSettled(ACTION_SETTLE)
+  return withPageDelta(`Dragged [${index}] by (${dx}, ${dy}).`, ctx)
 }
 
 async function navigateAction(args: Record<string, unknown>): Promise<ActionResult> {

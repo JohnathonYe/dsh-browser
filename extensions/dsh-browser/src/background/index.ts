@@ -149,6 +149,14 @@ let bridge: BridgeClient | null = null
 let rpc: ReturnType<typeof createRpc> | null = null
 const panelPorts = new Set<chrome.runtime.Port>()
 const BRIDGE_KEEPALIVE_ALARM = 'bridge-keepalive'
+/**
+ * Eager connect: the extension claims the bridge as soon as the service worker
+ * loads (no side panel required) and keeps it up with automatic reconnect. The
+ * keepalive alarm re-arms the worker so a sleeping service worker reconnects.
+ * A connection is only given up when another owner replaces it (close code
+ * 4000), which is terminal and not fought.
+ */
+const EAGER_BRIDGE = true
 /** Invalidates an asynchronous discovery attempt when its panel lease ends. */
 let bridgeStartRevision = 0
 const interactionResponses = new InteractionResponseRouter()
@@ -164,10 +172,86 @@ const recentSession = new RecentSessionTracker({
 })
 /** Ephemeral allowlist: cleared when the last side panel closes or this worker restarts. */
 const sessionTrustedActionOrigins = new Set<string>()
+/** Stable per-install id reported in `hello` (persisted in chrome.storage.local). */
+const INSTANCE_ID_STORAGE_KEY = 'dshInstanceId'
+let instanceId = ''
+const instanceIdReady = loadInstanceId()
+async function loadInstanceId(): Promise<string> {
+  const stored = await chrome.storage.local.get(INSTANCE_ID_STORAGE_KEY)
+  const existing = stored[INSTANCE_ID_STORAGE_KEY]
+  if (typeof existing === 'string' && existing.trim() !== '') {
+    instanceId = existing
+    return existing
+  }
+  const generated = crypto.randomUUID()
+  instanceId = generated
+  await chrome.storage.local.set({ [INSTANCE_ID_STORAGE_KEY]: generated })
+  return generated
+}
+/** Human-friendly instance label for the panel's instance list. */
+function extensionLabel(): string {
+  try {
+    const manifest = (chrome.runtime as { getManifest?: (() => { name?: string }) | undefined }).getManifest?.()
+    return manifest?.name ?? 'Browser'
+  } catch {
+    return 'Browser'
+  }
+}
+/** 浏览器内部页面判定：这些不是真实可操作的网页，不能代表业务页标题。 */
+function isInternalBrowserPage(url: string): boolean {
+  if (url.trim() === '') return false
+  return url.startsWith('chrome:')
+    || url.startsWith('chrome-extension://')
+    || url.startsWith('edge:')
+    || url.startsWith('edge-extension://')
+    || url.startsWith('about:')
+    || url.startsWith('moz-extension://')
+}
+/** 在给定标签页数组中挑选代表性的 tab：优先第一个真实可操作网页（http/https 且标题非空、非浏览器内部页），
+ * 再沿用现有逻辑（当前活动且未固定 → 第一个未固定 → 第一个），便于多实例用各自业务页标题区分。 */
+function pickRepresentativeTab(tabs: chrome.tabs.Tab[]): chrome.tabs.Tab | undefined {
+  if (tabs.length === 0) return undefined
+  const realPage = tabs.find((tab) => {
+    const url = tab.url ?? ''
+    return !isInternalBrowserPage(url) && isTargetableHttpUrl(url) && (tab.title ?? '').trim() !== ''
+  })
+  if (realPage !== undefined) return realPage
+  const active = tabs.find((tab) => tab.active && !tab.pinned)
+  if (active !== undefined) return active
+  const unpinned = tabs.find((tab) => !tab.pinned)
+  if (unpinned !== undefined) return unpinned
+  return tabs[0]
+}
+/** 用扩展名 + 代表性标签页标题（缺省时退回标签页数量）拼出实例 label，便于多实例间区分。 */
+function buildInstanceLabel(tabTitle: string | undefined, tabCount: number): string {
+  const base = extensionLabel()
+  const title = tabTitle?.trim() ?? ''
+  if (title !== '') return `${base} · ${title}`
+  const locale = getUiLocale()
+  const suffix = locale === 'zh'
+    ? `${tabCount} 个标签页`
+    : tabCount === 1 ? '1 tab' : `${tabCount} tabs`
+  return `${base} · ${suffix}`
+}
+/** 连接时基于当前代表标签页标题生成实例 label 与 tab 数（随 hello 上报，每次连接/重连刷新）。 */
+async function resolveInstanceLabel(): Promise<{ label: string; tabCount: number }> {
+  try {
+    const tabs = await chrome.tabs.query({})
+    const representative = pickRepresentativeTab(tabs)
+    return { label: buildInstanceLabel(representative?.title, tabs.length), tabCount: tabs.length }
+  } catch {
+    // tabs 查询失败时退化为纯扩展名，不影响后续连接。
+    return { label: extensionLabel(), tabCount: 0 }
+  }
+}
+/** Latest `instances` frame for panel replays after a reconnect. */
+let lastInstances: Extract<ServerFrame, { t: 'instances' }> | null = null
 /** Tool calls that can still be withdrawn by a bridge `tool.cancel` frame. */
 const activeToolCalls = new Map<string, AbortController>()
 let lastPersistedAffinity: string | undefined
 let affinityPersistence = Promise.resolve()
+/** 最近一次解析出的 bridge URL（自动探测或手动配置）。用于识别 DSH 自身页面。 */
+let lastResolvedBridgeUrl: string | undefined
 /** The next prompt waits until an accepted follow has refreshed dsh context. */
 let followedPageRefresh: Promise<void> = Promise.resolve()
 let activeFollowRefresh: AbortController | null = null
@@ -271,6 +355,13 @@ function broadcastTabAffinity(): void {
 function broadcastEvent(frame: ServerFrame): void {
   for (const port of panelPorts) {
     try { port.postMessage({ type: 'event', frame }) } catch { /* port already closed */ }
+  }
+}
+
+function broadcastInstances(frame: Extract<ServerFrame, { t: 'instances' }>): void {
+  lastInstances = frame
+  for (const port of panelPorts) {
+    try { port.postMessage({ type: 'instances', instances: frame.instances, selected: frame.selected }) } catch { /* port already closed */ }
   }
 }
 
@@ -518,15 +609,59 @@ function affinityFailure(kind: 'lost' | 'missing'): ToolAnswer {
   return { ok: false, error: { code: 'no-active-tab', message: 'No active tab is available for browser operations.' } }
 }
 
+/** 解析为不含 scheme 的 "host:port" 标识；非 http(s)/ws(s) 返回 null。 */
+function httpOriginKey(url: string): string | null {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:' && u.protocol !== 'ws:' && u.protocol !== 'wss:') return null
+    return u.host
+  } catch {
+    return null
+  }
+}
+
+/** DSH 自身页面判定：扩展页 / chrome 原生页 / dsh-web UI。 */
+function isDshOwnPage(url: string): boolean {
+  if (url === '') return false
+  // 扩展后台页、侧边栏、popup 等 chrome-extension:// 页面不是目标 Web 页。
+  if (url.startsWith('chrome-extension://') || url.startsWith('moz-extension://') || url.startsWith('edge-extension://')) return true
+  // chrome:// / edge:// / about: 等浏览器内部页同样不可作为受控目标。
+  if (url.startsWith('chrome:') || url.startsWith('edge:') || url.startsWith('about:')) return true
+  // dsh-web 托管在 bridge 对应的同源 host:port，所以只用 bridge URL 的 origin
+  // 判定；用户另开的 localhost:8080 等本地开发服务器不会被误判。
+  const originKey = httpOriginKey(url)
+  if (originKey === null) return false
+  const bridgeKey = httpOriginKey(lastResolvedBridgeUrl ?? '')
+  if (bridgeKey === null) return false
+  return originKey === bridgeKey
+}
+
+/** 冷启动可自建的受控目标必须是真实可操作的 Web 页面。 */
+function isSelfBuildTarget(tab: Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'>): boolean {
+  return !isDshOwnPage(tab.url ?? '')
+}
+
+/** 是否为真实可操作的 http(s) URL（可用于 browser_new_tab 冷启动建组）。 */
+function isTargetableHttpUrl(url: string): boolean {
+  try {
+    const u = new URL(url)
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
 /** Resolve one stable tool tab. 无授权组时直接取当前活动页作为冷启动目标；不再借用
  * affinity 的「跟随当前页 / keep-follow」绑定。用户切 tab 不再让操作暂停，也不弹
  * 提示。后续由 routeToolCall 的冷启动逻辑把该 tab 建成 DSH- 授权组，从而进入
- * 「只按授权组」的语义。 */
+ * 「只按授权组」的语义。若当前活动页是 DSH 自身页（dsh-web / 扩展页），则判定为
+ * 无可用目标，跳过冷启动自建，交由模型走「打开目标 tab」路径。 */
 async function resolveToolTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'> | ToolAnswer> {
   try {
     const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
     if (tab === undefined || tab.id === undefined) return affinityFailure('missing')
     if (summarizeTab(tab) === null) return affinityFailure('missing')
+    if (isDshOwnPage(tab.url ?? '')) return affinityFailure('missing')
     return tab
   } catch {
     return affinityFailure('missing')
@@ -710,23 +845,37 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     return { ok: false, error: { code: 'no-active-tab', message: 'Invalid or unauthorized tabId. Use browser_tab_list first.' } }
   }
   if (call.name === 'browser_new_tab') {
+    const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
     const groups = tabAuthorization.snapshot().groups
-    if (groups.length === 0) {
-      return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Authorize a group in the panel first.' } }
+    // 冷启动：完全没有任何授权组时，仅当 AI 明确打开一个真实 http(s) 目标时才建组
+    // （这正是「打开目标 tab」路径，绝不把 dsh-web / 扩展页作为目标）。
+    const hasRealUrl = url !== undefined && isTargetableHttpUrl(url)
+    if (groups.length === 0 && !hasRealUrl) {
+      return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Open a real URL, or authorize a group in the panel first.' } }
     }
     if (!tabAuthorization.mayOpenTab()) {
       return { ok: false, error: { code: 'action-failed', message: 'Open-tab policy is "ask"; switch it to allow in the panel, or allow once here.' } }
     }
-    const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
-    const groupId = groups[groups.length - 1].groupId
     const tab = await chrome.tabs.create({ url: url || 'about:blank', active: false }).catch(() => null)
     if (tab && tab.id !== undefined) {
-      await chrome.tabs.group({ tabIds: [tab.id], groupId }).catch(() => {})
-      tabAuthorization.addTabsToGroup(groupId, [tab.id])
+      if (groups.length > 0) {
+        const groupId = groups[groups.length - 1].groupId
+        await chrome.tabs.group({ tabIds: [tab.id], groupId }).catch(() => {})
+        tabAuthorization.addTabsToGroup(groupId, [tab.id])
+      } else {
+        // 冷启动建组：把 AI 明确打开的真实目标 tab 直接建成 DSH- 授权组。
+        const groupId = await chrome.tabs.group({ tabIds: [tab.id] }).catch(() => -1)
+        if (groupId < 0) {
+          return { ok: false, error: { code: 'action-failed', message: 'Could not group the new tab into a DSH- group.' } }
+        }
+        const shown = normalizeGroupTitle('AI')
+        await chrome.tabGroups.update(groupId, { title: shown }).catch(() => {})
+        tabAuthorization.authorizeGroup(groupId, shown, [tab.id])
+      }
       tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
       persistTabAuthorization()
       broadcastTabAuthorization()
-      return { ok: true, result: { text: `Opened a new tab (id ${tab.id}) in group ${groupId}.` } }
+      return { ok: true, result: { text: `Opened a new tab (id ${tab.id})${groups.length > 0 ? ` in group ${groups[groups.length - 1].groupId}` : ' in a new DSH- group'}.` } }
     }
     return { ok: false, error: { code: 'action-failed', message: 'Could not open a new tab.' } }
   }
@@ -822,7 +971,11 @@ function routeToolCall(call: ToolCall): void {
     if ('ok' in target) return target
     // 冷启动授权：完全没有任何授权组时，允许 AI 把本次操作的 tab 自动建成 DSH- 组并授权；
     // 这样 AI 从零开始也能自己创建授权组。一旦已有授权组，就不再自动乱建（守住授权边界）。
-    if (tabAuthorization.snapshot().groups.length === 0 && target.id !== undefined && target.windowId !== undefined) {
+    // 目标必须是真实可操作的非 DSH 自身页，绝不能把 dsh-web / 扩展页绑进组。
+    if (tabAuthorization.snapshot().groups.length === 0
+      && target.id !== undefined
+      && target.windowId !== undefined
+      && isSelfBuildTarget(target)) {
       try {
         const groupId = await chrome.tabs.group({ tabIds: [target.id] })
         const shown = normalizeGroupTitle('AI')
@@ -881,14 +1034,15 @@ function cancelAllToolCalls(): void {
 /** (Re)start the bridge with the current settings. 零配置：地址留空时自动探测；回环连接无需 token。 */
 async function startBridge(): Promise<void> {
   const revision = ++bridgeStartRevision
-  if (panelPorts.size === 0) return
+  // 确保 instanceId 已从 chrome.storage.local 加载，才可随 hello 上报。
+  await instanceIdReady
   let url = settings.bridgeUrl
   if (url === '') {
-    url = await discoverBridge(() => revision === bridgeStartRevision && panelPorts.size > 0) ?? ''
+    url = await discoverBridge(() => revision === bridgeStartRevision && EAGER_BRIDGE) ?? ''
   }
-  // Discovery is asynchronous. A panel may have closed or a newer settings
-  // update may have started while its fetches were in flight.
-  if (revision !== bridgeStartRevision || panelPorts.size === 0) return
+  // Discovery is asynchronous. A newer settings update may have started while
+  // its fetches were in flight (the revision invalidates the stale attempt).
+  if (revision !== bridgeStartRevision) return
   if (url === '') {
     bridge?.stop()
     bridge = null
@@ -905,6 +1059,8 @@ async function startBridge(): Promise<void> {
   } catch {
     // 非法 URL 原样交给 WebSocket 构造函数报错。
   }
+  // 记录解析后的 bridge URL，供 DSH 自身页判定使用。
+  lastResolvedBridgeUrl = url
   if (bridge === null) {
     const client = new BridgeClient({
       onStateChange: (state) => {
@@ -914,7 +1070,7 @@ async function startBridge(): Promise<void> {
           transientEvents.clear()
         }
         broadcastStatus()
-        if (state === 'stopped' && panelPorts.size === 0) disarmBridgeKeepalive()
+        if (state === 'stopped' && !EAGER_BRIDGE && panelPorts.size === 0) disarmBridgeKeepalive()
       },
       onFrame: (frame) => {
         if (frame.t === 'event') {
@@ -925,6 +1081,7 @@ async function startBridge(): Promise<void> {
         else if (frame.t === 'tool.call') routeToolCall(frame)
         else if (frame.t === 'tool.cancel') cancelToolCall(frame.id)
         else if (frame.t === 'respond.result') interactionResponses.route(frame)
+        else if (frame.t === 'instances') broadcastInstances(frame)
         // rpc.result is settled by the rpc facade (wrapped below).
       },
       onHelloOk: (negotiated) => {
@@ -932,9 +1089,16 @@ async function startBridge(): Promise<void> {
         broadcastStatus()
         void pushBudgetToControlledTab(negotiated)
       },
-    }, probeBridge, () => panelPorts.size > 0)
+    }, probeBridge, () => EAGER_BRIDGE)
     bridge = client
     rpc = createRpc(client)
+  }
+  // 上报本实例的稳定身份，供服务端连接注册表分组/选择。label 用代表性标签页标题，便于多实例间区分。
+  if (bridge !== null) {
+    bridge.instanceId = instanceId
+    const instance = await resolveInstanceLabel()
+    bridge.instanceLabel = instance.label
+    bridge.instanceTabCount = instance.tabCount
   }
   bridge.start(url, settings.token)
 }
@@ -1021,30 +1185,28 @@ chrome.runtime.onConnect.addListener((port) => {
         void settingsReady.then(async () => {
           const previousConnection = { bridgeUrl: settings.bridgeUrl, token: settings.token }
           await persistSettings(settingsMsg.settings)
-          if (panelPorts.size > 0) {
-            await startBridge()
-            broadcastStatus()
-            return
-          }
           const connectionChanged = settings.bridgeUrl !== previousConnection.bridgeUrl
             || settings.token !== previousConnection.token
-          if (!connectionChanged) return
-          // The settings write outlived its originating panel. Do not keep a
-          // healthy socket authenticated with stale connection settings: make
-          // the next explicit panel lease start from the persisted values.
-          bridgeStartRevision += 1
-          bridge?.stop()
-          bridge = null
-          rpc = null
-          caps = null
-          broadcastStatus()
-          disarmBridgeKeepalive()
+          // Eager mode: a changed bridge address/token must rebuild the socket
+          // even when no side panel is open, so the next reconnect uses the new
+          // values. Other setting changes keep the healthy socket untouched.
+          if (connectionChanged || panelPorts.size > 0) {
+            await startBridge()
+            broadcastStatus()
+          }
         })
         break
       }
       case 'session.active': {
         const session = message as { sessionId?: unknown }
         recentSession.remember(session.sessionId)
+        break
+      }
+      case 'select.instance': {
+        const selection = message as { instanceId?: unknown }
+        if (typeof selection.instanceId === 'string' && selection.instanceId.trim() !== '') {
+          bridge?.send({ t: 'select.instance', instanceId: selection.instanceId })
+        }
         break
       }
       case 'approval.response': {
@@ -1142,6 +1304,9 @@ chrome.runtime.onConnect.addListener((port) => {
           port.postMessage({ type: 'status', state: bridge?.state ?? ('stopped' as BridgeState), caps })
           port.postMessage({ type: 'tab-affinity', state: tabAffinity.snapshot() })
           port.postMessage({ type: 'tab-authorization', state: tabAuthorization.snapshot() })
+          if (lastInstances !== null) {
+            port.postMessage({ type: 'instances', instances: lastInstances.instances, selected: lastInstances.selected })
+          }
           for (const frame of transientEvents.replay()) port.postMessage({ type: 'event', frame })
           approvals.replay((request) => {
             port.postMessage({ type: 'approval.request', request })
@@ -1167,11 +1332,14 @@ chrome.runtime.onConnect.addListener((port) => {
     panelPorts.delete(port)
     interactionResponses.removePort(port)
     if (panelPorts.size === 0) {
-      bridgeStartRevision += 1
-      bridge?.suspendReconnect()
       sessionTrustedActionOrigins.clear()
       approvals.notifyPending()
-      if (bridge?.state !== 'connected') disarmBridgeKeepalive()
+      if (!EAGER_BRIDGE) {
+        // Legacy lease model: the bridge is only held while a panel is open.
+        bridgeStartRevision += 1
+        bridge?.suspendReconnect()
+        if (bridge?.state !== 'connected') disarmBridgeKeepalive()
+      }
     }
   })
 })
@@ -1284,14 +1452,20 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== BRIDGE_KEEPALIVE_ALARM) return
-  if (panelPorts.size === 0) {
-    if (bridge === null || bridge.state !== 'connected') disarmBridgeKeepalive()
-    return
+  if (!EAGER_BRIDGE) {
+    // Legacy lease model: without a panel there is nothing to keep alive.
+    if (panelPorts.size === 0) {
+      if (bridge === null || bridge.state !== 'connected') disarmBridgeKeepalive()
+      return
+    }
   }
-  // `stopped` is intentionally terminal until an explicit panel reopen or
-  // settings save. In particular, code 4000 means another browser owns the
-  // single bridge slot and the keepalive must not reclaim it.
-  if (bridge === null || bridge.state === 'reconnecting') {
+  // Eager mode: the keepalive wakes a sleeping/restarted service worker so it
+  // reconnects. A `stopped` bridge is only restarted when it was not replaced
+  // by another owner (close code 4000) — that situation is terminal and must
+  // not be fought in a tight reconnect/evict loop.
+  if (bridge === null
+    || bridge.state === 'reconnecting'
+    || (bridge.state === 'stopped' && bridge.replacedByAnother !== true)) {
     void settingsReady.then(() => startBridge())
   }
 })
@@ -1321,9 +1495,8 @@ if (import.meta.env.EXT_TARGET === 'firefox') {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {})
 }
 
-// Alarms survive some extension/service-worker restarts. Remove any stale
-// schedule left by an older eager-connection build; onConnect re-arms it.
-disarmBridgeKeepalive()
-
-// `settingsReady` intentionally has no bridge-start continuation: opening a
-// side panel is the first action allowed to claim the bridge connection.
+// Eager connect: arm the keepalive and claim the bridge as soon as the
+// service worker loads, without waiting for a side panel. The keepalive wakes
+// the worker on a half-minute cadence so a sleeping service worker reconnects.
+armBridgeKeepalive()
+void settingsReady.then(() => { startBridge() })

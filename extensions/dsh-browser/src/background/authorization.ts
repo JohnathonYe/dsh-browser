@@ -8,6 +8,7 @@ import { getUiLocale, type UiLocale } from '../i18n.ts'
 const PAGE_READS = new Set(['browser_snapshot', 'browser_get_text'])
 const STATE_CHANGING_ACTIONS = new Set([
   'browser_click',
+  'browser_drag',
   'browser_type',
   'browser_press',
   'browser_navigate',
@@ -101,6 +102,7 @@ function summarizeAction(call: ToolCall, locale: UiLocale): string {
   const index = typeof call.args.index === 'number' ? call.args.index : '?'
   switch (call.name) {
     case 'browser_click': return localized(locale, `Click element [${index}]${frame}`, `点击元素 [${index}]${frame}`)
+    case 'browser_drag': return localized(locale, `Drag element [${index}]${frame}`, `拖动元素 [${index}]${frame}`)
     case 'browser_type': {
       const length = typeof call.args.text === 'string' ? call.args.text.length : 0
       return localized(

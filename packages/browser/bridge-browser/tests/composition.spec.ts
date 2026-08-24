@@ -169,6 +169,17 @@ describe('real Loader composition', () => {
     expect(browserPrompt).toContain('Reuse that injected snapshot')
     expect(browserPrompt).not.toMatch(/\p{Script=Han}/u)
 
+    // Multi-instance selection must guide the model to present instances as a
+    // readable "label (N tabs)" name (never an instanceId prefix) and to defer
+    // to the user on cancel/no-selection. Keep it English (no Han characters).
+    const multiBrowserPrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:multi-instance')?.text
+    expect(multiBrowserPrompt).toBeDefined()
+    expect(multiBrowserPrompt).toContain('label (N tabs)')
+    expect(multiBrowserPrompt).toContain('browser_select_instance(instanceId)')
+    expect(multiBrowserPrompt).toContain('do not choose an instance on your own')
+    expect(multiBrowserPrompt).not.toMatch(/\p{Script=Han}/u)
+
     // Zero-config discovery endpoint answers with the bridge WebSocket URL.
     const configResponse = await fetch(`http://127.0.0.1:${port}/ext/bridge-config`)
     expect(configResponse.status).toBe(200)

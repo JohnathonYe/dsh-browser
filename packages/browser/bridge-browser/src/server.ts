@@ -1,7 +1,7 @@
 /**
  * Bridge WebSocket carrier: token-authenticated connection registry, gateway
- * RPC passthrough, per-connection event pump, and tool-call dispatch to the
- * connected browser extension.
+ * RPC passthrough, per-connection event pump, and tool-call dispatch to a
+ * chosen browser extension instance.
  *
  * The route this server mounts (`/ext/bridge`) lives OUTSIDE the /api trust
  * fence (which only guards the client-connection routes), so the bridge brings
@@ -12,9 +12,13 @@
  * pins to loopback (`PRIVILEGED_METHODS`) stay loopback-only here regardless
  * of the token, defense in depth for `--host 0.0.0.0` deployments.
  *
- * One active connection at a time: a new authenticated socket replaces the
- * previous one (the old socket is closed and its in-flight tool calls settle
- * as `bridge-closed`).
+ * Multiple browser instances (one per Chrome/Firefox profile) may connect at
+ * once; each is keyed by a stable per-install `instanceId` presented in
+ * `hello` and keeps its own event pump. Rather than a single active slot with
+ * 4000-preemption, the server holds a connection registry and routes every
+ * `tool.call` to the currently selected instance. Selection is explicit (the
+ * UI / panel lists instances and lets the user pick); a single connected
+ * instance is auto-selected so the single-browser flow stays unchanged.
  *
  * @module
  */
@@ -31,6 +35,7 @@ import {
   parseBridgeFrame,
   type BridgeFrame,
   type BridgeCaps,
+  type BrowserInstance,
   type ClientFrame,
   type ToolErrorCode,
 } from './protocol.ts'
@@ -109,13 +114,21 @@ interface PendingTool {
   resolve: (result: unknown) => void
   reject: (error: BridgeToolError) => void
   timer: NodeJS.Timeout
+  /** The instance the call was dispatched to; only its reply settles the call. */
+  instanceId: string
 }
 
-/** A socket that passed authentication and owns the single active slot. */
+/** An authenticated socket owning one registry slot (keyed by instanceId). */
 interface ReadyConnection {
   ws: WebSocket
   /** Remote address captured at upgrade time (loopback gate for privileged methods). */
   remoteAddress: string | undefined
+  /** Stable per-install id presented in `hello`. */
+  instanceId: string
+  /** Human-friendly label for the instance list UI. */
+  label: string
+  /** Number of open tabs reported in `hello` (0 when absent). */
+  tabCount: number
   abort: AbortController
   pump: Promise<void>
   ping: NodeJS.Timeout
@@ -147,7 +160,12 @@ export function messageToText(data: Buffer | ArrayBuffer | Buffer[]): string {
  */
 export class BridgeServer {
   private readonly wss = new WebSocketServer({ noServer: true })
-  private current: ReadyConnection | null = null
+  /** Connected browser instances keyed by stable per-install instanceId. */
+  private readonly connections = new Map<string, ReadyConnection>()
+  /** The instance that receives tool calls; null until an explicit choice. */
+  private selectedInstanceId: string | null = null
+  /** Whether selectedInstanceId came from an explicit user choice (vs auto-selected). */
+  private selectedExplicit = false
   private readonly pendingTools = new Map<string, PendingTool>()
   private readonly orderedSessionRpcs = new Map<string, Promise<void>>()
   private closed = false
@@ -167,15 +185,15 @@ export class BridgeServer {
   }
 
   /**
-   * Request one browser action from the connected extension.
+   * Request one browser action from the selected extension instance.
    * @param name - tool name (also the wire action name).
    * @param args - validated tool arguments.
    * @param signal - caller cancellation (abort settles the call as cancelled).
    * @param timeoutMs - per-call budget; defaults to the plugin config value.
    * @param sessionId - optional owning Agent session for approval continuity.
    * @returns the extension's action result.
-   * @throws BridgeToolError when no extension is connected, the call times
-   *   out, is cancelled, or the extension reports a failure.
+   * @throws BridgeToolError when no instance is selected / connected, the call
+   *   times out, is cancelled, or the extension reports a failure.
    */
   requestTool(
     name: string,
@@ -184,15 +202,15 @@ export class BridgeServer {
     timeoutMs: number = this.deps.toolTimeoutMs,
     sessionId?: string,
   ): Promise<unknown> {
-    const conn = this.current
-    if (conn === null) {
-      throw new BridgeToolError('bridge-closed', 'no browser extension is connected to the bridge')
-    }
     // A caller that already aborted must not dispatch: the abort listener
     // below does not replay for pre-aborted signals, so the call would be
     // sent to the extension and executed despite the cancellation.
     if (signal.aborted) {
       throw new BridgeToolError('bridge-closed', 'tool call cancelled before dispatch')
+    }
+    const conn = this.resolveSelectedConnection()
+    if (conn === null) {
+      throw new BridgeToolError('bridge-closed', this.selectionErrorMessage())
     }
     const id = randomUUID()
     const expiresAt = Date.now() + timeoutMs
@@ -218,7 +236,7 @@ export class BridgeServer {
         cancel(new BridgeToolError('timeout', `browser action "${name}" timed out after ${timeoutMs}ms`))
       }, timeoutMs)
       signal.addEventListener('abort', onAbort, { once: true })
-      this.pendingTools.set(id, { resolve, reject, timer })
+      this.pendingTools.set(id, { resolve, reject, timer, instanceId: conn.instanceId })
       conn.ws.send(JSON.stringify({
         t: 'tool.call',
         id,
@@ -247,11 +265,11 @@ export class BridgeServer {
     // "The server is not running" when closing an already-closed server).
     if (this.closed) return
     this.closed = true
-    // Capture the live pump BEFORE replaceConnection nulls the connection.
-    const pumps = this.current === null ? [] : [this.current.pump]
-    this.replaceConnection()
+    // Capture the live pumps BEFORE the registry is torn down.
+    const pumps: Promise<void>[] = []
+    for (const conn of this.connections.values()) pumps.push(conn.pump)
+    this.releaseAll()
     for (const socket of this.wss.clients) socket.terminate()
-    this.current = null
     await new Promise<void>((resolve, reject) => {
       this.wss.close((error) => {
         /* v8 ignore next -- acceptor close cannot fail: close() is idempotent
@@ -264,9 +282,101 @@ export class BridgeServer {
     await Promise.all(pumps)
   }
 
-  /** @returns whether an authenticated extension is currently connected. */
+  /** @returns whether at least one authenticated extension is connected. */
   hasConnection(): boolean {
-    return this.current !== null
+    return this.connections.size > 0
+  }
+
+  /** @returns the connected instances (for the panel / selection UI). */
+  listInstances(): BrowserInstance[] {
+    return [...this.connections.values()].map((conn) => ({ instanceId: conn.instanceId, label: conn.label, tabCount: conn.tabCount }))
+  }
+
+  /** @returns the currently selected instance id, or null when none. */
+  selectedInstance(): string | null {
+    return this.selectedInstanceId
+  }
+
+  /**
+   * Choose which instance receives tool calls. The choice is explicit (it
+   * stays authoritative even when multiple instances are connected).
+   * @param instanceId - the target instance id.
+   * @returns true when accepted, false when the instance is not connected.
+   */
+  selectInstance(instanceId: string): boolean {
+    if (!this.connections.has(instanceId)) return false
+    this.selectedInstanceId = instanceId
+    this.selectedExplicit = true
+    this.broadcastInstances()
+    return true
+  }
+
+  /**
+   * Resolve the connection that should receive a tool call. When exactly one
+   * instance is connected and no selection exists, that instance is chosen as
+   * the default (single-browser flow stays indistinguishable from before).
+   * @returns the selected connection, or null when it cannot be decided.
+   */
+  private resolveSelectedConnection(): ReadyConnection | null {
+    if (this.selectedInstanceId !== null) {
+      const selected = this.connections.get(this.selectedInstanceId)
+      if (selected !== undefined) return selected
+      // The selected instance disconnected; fall through to a fresh decision.
+      this.selectedInstanceId = null
+      this.selectedExplicit = false
+    }
+    if (this.connections.size === 1) {
+      const [instanceId, conn] = [...this.connections.entries()][0]!
+      this.selectedInstanceId = instanceId
+      this.selectedExplicit = false
+      return conn
+    }
+    return null
+  }
+
+  /**
+   * Recompute the active selection after a connect/disconnect. A single
+   * connected instance is auto-selected so the single-browser flow stays
+   * unchanged; when multiple instances are connected, only an explicit user
+   * choice remains authoritative (an auto-selected default is cleared so the
+   * user is asked to pick).
+   */
+  private recomputeSelection(): void {
+    if (this.selectedInstanceId !== null && !this.connections.has(this.selectedInstanceId)) {
+      this.selectedInstanceId = null
+      this.selectedExplicit = false
+    }
+    if (this.selectedInstanceId === null && this.connections.size === 1) {
+      this.selectedInstanceId = this.connections.keys().next().value as string
+      this.selectedExplicit = false
+      return
+    }
+    if (!this.selectedExplicit && this.connections.size > 1) {
+      this.selectedInstanceId = null
+    }
+  }
+
+  /** Human-readable guidance when no instance can be targeted. When several
+   * instances are connected, the message carries each instance's id and label
+   * so a model can hand the choice to an ask-user facility and then call
+   * `browser_select_instance`. */
+  private selectionErrorMessage(): string {
+    if (this.connections.size === 0) {
+      return 'no browser extension is connected to the bridge'
+    }
+    const parts = [...this.connections.values()]
+      .map((conn) => `[instanceId=${conn.instanceId}, label=${conn.label}, tabCount=${conn.tabCount}]`)
+    const selected = this.selectedInstanceId === null ? 'none' : this.selectedInstanceId
+    return `multiple browser instances are connected; select one before issuing browser actions. `
+      + `Available: ${parts.join(', ')} (selected: ${selected})`
+  }
+
+  private broadcastInstances(): void {
+    const instances = this.listInstances()
+    const selected = this.selectedInstanceId
+    for (const conn of this.connections.values()) {
+      sendFrame(conn.ws, { t: 'instances', instances, selected })
+    }
   }
 
   private attach(ws: WebSocket, remoteAddress: string | undefined, origin: string | undefined): void {
@@ -306,23 +416,28 @@ export class BridgeServer {
         }
         clearTimeout(helloTimer)
         helloTimer = undefined
-        this.promote(ws, remoteAddress)
+        this.promote(ws, remoteAddress, frame.instanceId ?? `anon-${randomUUID()}`, frame.label, frame.tabCount)
         return
       }
-      this.handleReadyFrame(frame)
+      const conn = this.connectionFor(ws)
+      if (conn !== undefined) this.handleReadyFrame(frame, conn)
     }
     const onClose = (): void => {
       if (helloTimer !== undefined) clearTimeout(helloTimer)
-      if (this.current !== null && this.current.ws === ws) this.replaceConnection()
+      this.dropConnection(ws)
     }
     ws.on('message', onMessage)
     ws.once('close', onClose)
     ws.once('error', onClose)
   }
 
-  /** Promote an authenticated socket to the single active slot. */
-  private promote(ws: WebSocket, remoteAddress: string | undefined): void {
-    this.replaceConnection()
+  /** Promote an authenticated socket to a registry slot keyed by instanceId. */
+  private promote(ws: WebSocket, remoteAddress: string | undefined, instanceId: string, label?: string, tabCount?: number): void {
+    // Re-connecting the same instance (a reload or reconnect) replaces that
+    // slot only; distinct instances coexist without 4000-preemption.
+    if (this.connections.has(instanceId)) {
+      this.dropConnection(this.connections.get(instanceId)!.ws, instanceId)
+    }
     const abort = new AbortController()
     const ping = setInterval(() => { sendFrame(ws, { t: 'ping' }) }, this.deps.pingIntervalMs ?? PING_INTERVAL_MS)
     const pump = (async () => {
@@ -340,24 +455,93 @@ export class BridgeServer {
         }
       }
     })()
-    this.current = { ws, remoteAddress, abort, pump, ping }
+    const conn: ReadyConnection = {
+      ws,
+      remoteAddress,
+      instanceId,
+      label: label ?? instanceId.slice(0, 8),
+      tabCount: tabCount ?? 0,
+      abort,
+      pump,
+      ping,
+    }
+    this.connections.set(instanceId, conn)
+    // Auto-select a sole instance so the single-browser flow is unchanged; a
+    // second concurrent instance clears an auto (non-explicit) default.
+    this.recomputeSelection()
     sendFrame(ws, { t: 'hello.ok', caps: this.deps.caps })
     ws.once('close', () => {
       clearInterval(ping)
       abort.abort()
     })
+    this.broadcastInstances()
   }
 
-  private handleReadyFrame(frame: BridgeFrame): void {
+  /** Look up the registry entry owning a socket. */
+  private connectionFor(ws: WebSocket): ReadyConnection | undefined {
+    for (const conn of this.connections.values()) {
+      if (conn.ws === ws) return conn
+    }
+    return undefined
+  }
+
+  /** Remove a connection from the registry and settle its pending work. */
+  private dropConnection(ws: WebSocket, expectedInstanceId?: string): void {
+    const found = this.connectionFor(ws)
+    if (found === undefined) return
+    if (expectedInstanceId !== undefined && found.instanceId !== expectedInstanceId) return
+    this.connections.delete(found.instanceId)
+    clearInterval(found.ping)
+    found.abort.abort()
+    if (found.ws.readyState === WebSocket.OPEN || found.ws.readyState === WebSocket.CONNECTING) {
+      found.ws.close(4000, 'replaced')
+    }
+    for (const [id, pending] of this.pendingTools) {
+      if (pending.instanceId !== found.instanceId) continue
+      clearTimeout(pending.timer)
+      this.pendingTools.delete(id)
+      pending.reject(new BridgeToolError('bridge-closed', 'the extension connection was closed'))
+    }
+    this.recomputeSelection()
+    this.broadcastInstances()
+  }
+
+  /** Drop every connection (used by close()). */
+  private releaseAll(): void {
+    for (const conn of [...this.connections.values()]) {
+      clearInterval(conn.ping)
+      conn.abort.abort()
+      if (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING) {
+        conn.ws.close(4000, 'server closing')
+      }
+    }
+    this.connections.clear()
+    this.selectedInstanceId = null
+    for (const [id, pending] of this.pendingTools) {
+      clearTimeout(pending.timer)
+      this.pendingTools.delete(id)
+      pending.reject(new BridgeToolError('bridge-closed', 'the bridge server closed'))
+    }
+  }
+
+  private handleReadyFrame(frame: BridgeFrame, conn: ReadyConnection): void {
     switch (frame.t) {
       case 'rpc':
-        this.routeRpc(frame)
+        this.routeRpc(frame, conn)
         break
       case 'respond':
-        void this.handleRespond(frame)
+        void this.handleRespond(frame, conn)
         break
       case 'tool.result':
-        this.settleTool(frame.id, frame.ok, frame.ok ? frame.result : frame.error)
+        this.settleTool(frame.id, frame.ok, frame.ok ? frame.result : frame.error, conn.instanceId)
+        break
+      case 'select.instance':
+        // Only accept a selection for an instance that is actually connected.
+        if (this.connections.has(frame.instanceId)) {
+          this.selectedInstanceId = frame.instanceId
+          this.selectedExplicit = true
+          this.broadcastInstances()
+        }
         break
       case 'pong':
       case 'hello':
@@ -368,6 +552,7 @@ export class BridgeServer {
       case 'tool.call':
       case 'tool.cancel':
       case 'ping':
+      case 'instances':
       case 'error':
         // Protocol violations and unsolicited server-side shapes are ignored;
         // the extension is the only sender on this channel.
@@ -380,16 +565,16 @@ export class BridgeServer {
    * first prompt may still be materializing a provisional session; its cancel
    * must not reach the gateway until that admission has completed.
    */
-  private routeRpc(frame: Extract<ClientFrame, { t: 'rpc' }>): void {
+  private routeRpc(frame: Extract<ClientFrame, { t: 'rpc' }>, conn: ReadyConnection): void {
     const sessionId = orderedSessionId(frame)
     if (sessionId === undefined) {
-      void this.handleRpc(frame)
+      void this.handleRpc(frame, conn)
       return
     }
     const previous = this.orderedSessionRpcs.get(sessionId) ?? Promise.resolve()
     const task = previous.then(
-      () => this.handleRpc(frame),
-      () => this.handleRpc(frame),
+      () => this.handleRpc(frame, conn),
+      () => this.handleRpc(frame, conn),
     )
     this.orderedSessionRpcs.set(sessionId, task)
     const clear = (): void => {
@@ -398,11 +583,7 @@ export class BridgeServer {
     void task.then(clear, clear)
   }
 
-  private async handleRpc(frame: Extract<ClientFrame, { t: 'rpc' }>): Promise<void> {
-    const conn = this.current
-    /* v8 ignore next -- replacement race: a frame can land between a socket
-    replacement and the next promotion; the re-check keeps the handler total */
-    if (conn === null) return
+  private async handleRpc(frame: Extract<ClientFrame, { t: 'rpc' }>, conn: ReadyConnection): Promise<void> {
     const forbidden = PRIVILEGED_METHODS.has(frame.method) && !isLoopbackAddress(conn.remoteAddress)
     if (forbidden) {
       sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: false, error: { code: 'forbidden', message: 'method is loopback-only' } })
@@ -458,10 +639,7 @@ export class BridgeServer {
   }
 
   /** Relay a pending host-interaction response through the GUI's /api/respond channel. */
-  private async handleRespond(frame: Extract<ClientFrame, { t: 'respond' }>): Promise<void> {
-    const conn = this.current
-    /* v8 ignore next -- replacement race; a closed socket simply drops the receipt */
-    if (conn === null) return
+  private async handleRespond(frame: Extract<ClientFrame, { t: 'respond' }>, conn: ReadyConnection): Promise<void> {
     const request = new Request(new URL('/api/respond', 'http://dsh.internal'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -486,30 +664,16 @@ export class BridgeServer {
     }
   }
 
-  private settleTool(id: string, ok: boolean, payload: unknown): void {
+  private settleTool(id: string, ok: boolean, payload: unknown, instanceId: string): void {
     const pending = this.pendingTools.get(id)
     if (pending === undefined) return
+    // Only the instance the call was dispatched to may settle it; a reply from
+    // any other (unselected) instance is ignored.
+    if (pending.instanceId !== instanceId) return
     clearTimeout(pending.timer)
     this.pendingTools.delete(id)
     if (ok) pending.resolve(payload)
     else pending.reject(new BridgeToolError(payloadCode(payload), payloadMessage(payload)))
-  }
-
-  /** Close the current connection (if any) and settle its in-flight calls. */
-  private replaceConnection(): void {
-    const conn = this.current
-    if (conn === null) return
-    this.current = null
-    clearInterval(conn.ping)
-    conn.abort.abort()
-    if (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING) {
-      conn.ws.close(4000, 'replaced')
-    }
-    for (const [id, pending] of this.pendingTools) {
-      clearTimeout(pending.timer)
-      this.pendingTools.delete(id)
-      pending.reject(new BridgeToolError('bridge-closed', 'the extension connection was replaced'))
-    }
   }
 }
 

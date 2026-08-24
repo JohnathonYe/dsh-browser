@@ -43,6 +43,8 @@ interface InventoryItem {
   selected?: boolean
   href?: string
   inViewport: boolean
+  /** Likely to reveal something on hover (tooltip, menu, expanded panel). */
+  hoverable?: boolean
 }
 
 /** One numbered form field with its (masked) value. */
@@ -153,6 +155,7 @@ export function buildSnapshot(ids: ElementIds, options: SnapshotOptions, last: S
     if (ariaChecked === 'true' || ariaChecked === 'false') item.checked = ariaChecked === 'true'
     if (el instanceof HTMLOptionElement && el.selected) item.selected = true
     if (el instanceof HTMLAnchorElement && el.href !== '') item.href = hrefHeadline(el.href)
+    if (isHoverRevealing(el)) item.hoverable = true
     items.push(item)
   }
 
@@ -239,9 +242,23 @@ function selectedText(select: HTMLSelectElement): string {
   return [...select.selectedOptions].map((option) => option.textContent ?? '').join(', ')
 }
 
+/**
+ * Conservative hover affordance signal: attributes that commonly back a
+ * JS-driven tooltip, dropdown, or expansion. Multiple elements on a page can
+ * share these, so this is a hint for the model, not an action target.
+ */
+function isHoverRevealing(el: Element): boolean {
+  return el.hasAttribute('title')
+    || el.hasAttribute('aria-haspopup')
+    || el.hasAttribute('aria-describedby')
+    || el.hasAttribute('aria-expanded')
+    || el.hasAttribute('data-hover')
+}
+
 function sameItem(a: InventoryItem, b: InventoryItem): boolean {
   return a.role === b.role && a.name === b.name && a.href === b.href
     && a.disabled === b.disabled && a.checked === b.checked && a.inViewport === b.inViewport
+    && a.hoverable === b.hoverable
 }
 
 function sameForm(a: FormFieldView, b: FormFieldView): boolean {
@@ -268,6 +285,7 @@ function renderItem(item: InventoryItem): string {
     item.disabled === true ? 'disabled' : undefined,
     item.checked === undefined ? undefined : item.checked ? 'checked' : 'unchecked',
     item.inViewport ? undefined : 'outside viewport',
+    item.hoverable === true ? 'hover' : undefined,
   ].filter((value) => value !== undefined).join('/')
   const stateText = state === '' ? '' : ` [${state}]`
   const hrefText = item.href !== undefined ? ` → ${item.href}` : ''
@@ -287,6 +305,12 @@ function appendTruncationNotes(lines: string[], view: SnapshotView): void {
   if (view.truncated.mainChars > 0) notes.push(`Main content truncated by ${view.truncated.mainChars} characters`)
   if (view.truncated.itemsDropped > 0) notes.push(`${view.truncated.itemsDropped} additional elements omitted`)
   if (view.truncated.formsDropped > 0) notes.push(`${view.truncated.formsDropped} additional form fields omitted`)
+  if (view.items.some((item) => !item.inViewport)) {
+    notes.push('Some interactive elements are outside the current viewport; call browser_scroll to reach them')
+  }
+  if (view.items.some((item) => item.hoverable)) {
+    notes.push('Marked [hover] elements may reveal tooltips or menus; call browser_hover then browser_snapshot to preview')
+  }
   if (notes.length > 0) lines.push(`\n(${notes.join('; ')}. Use browser_get_text or specify region for more content.)`)
 }
 

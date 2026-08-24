@@ -197,6 +197,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         + '(text-only; numbered items are the click/type targets), unless the current turn already includes a plugin-provided '
         + 'followed-page browser_snapshot. Reuse that injected snapshot and its indices directly. Never assume page content you have not snapshotted.',
     }), 'bridge-browser: system prompt section')
+
+    // Multi-instance selection is model-driven. When several browser instances
+    // are connected and no target is chosen, every browser_* tool errors with a
+    // message listing the available instances; the model must ask the user which
+    // one to use instead of guessing, then select it before retrying the action.
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:multi-instance',
+      order: 108,
+      text: 'If any browser_* tool returns an error whose message contains "multiple browser instances are connected" '
+        + 'or "select one before issuing browser actions", more than one browser instance is connected and no target is '
+        + 'selected. Do not choose one on your own and do not retry the browser action. First ask the user which instance '
+        + 'to use. Use your ask/confirm-user tool (DSH\'s ask_user_question, or your available ask/confirm-user tool) to ask. '
+        + 'You may call browser_list_instances first to get a structured list of the same instances with their ids, labels, '
+        + 'tab counts, and the current selection. When asking, present each instance as a readable name such as '
+        + '"label (N tabs)"; do not use the instanceId prefix as an option name. The user is choosing which instance to '
+        + 'control, and the instanceId is the internal handle you must pass to browser_select_instance(instanceId). Once '
+        + 'the user names an instance, call browser_select_instance(instanceId) to select it and only then issue the intended '
+        + 'browser_* action. If the user cancels or does not provide a selection, do not choose an instance on your own; '
+        + 'tell the user a browser instance must be selected before proceeding.',
+    }), 'bridge-browser: multi-instance system prompt section')
   }
 
   ctx.logger.info(

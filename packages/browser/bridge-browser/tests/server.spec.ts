@@ -452,24 +452,70 @@ describe('BridgeServer', () => {
     ws.close()
   })
 
-  it('settles pending tool calls when a replacement connection arrives', async () => {
+  it('registers multiple instances and routes tool calls to the selected one', async () => {
     const h = await startBridge()
     harnesses.push(h)
     const first = await connect(h.url)
-    send(first.ws, { t: 'hello', token: TOKEN, caps: { textOnly: true, snapshotMaxChars: 12000, maxInteractiveItems: 60 } })
+    send(first.ws, { t: 'hello', token: TOKEN, instanceId: 'inst-a', caps: CAPS })
     await waitFor(() => first.frames.some((f) => f.t === 'hello.ok'))
-    const pending = h.bridge.requestTool('browser_click', {}, new AbortController().signal)
-    // Attach the assertion eagerly: the replacement below settles it before the final await.
-    const pendingAssertion = expect(pending).rejects.toMatchObject({ code: 'bridge-closed' })
-    await waitFor(() => first.frames.some((f) => f.t === 'tool.call'))
+    expect(h.bridge.hasConnection()).toBe(true)
 
+    // A second, distinct instance connects and coexists (no 4000-preemption).
     const second = await connect(h.url)
-    send(second.ws, { t: 'hello', token: TOKEN, caps: { textOnly: true, snapshotMaxChars: 12000, maxInteractiveItems: 60 } })
+    send(second.ws, { t: 'hello', token: TOKEN, instanceId: 'inst-b', caps: CAPS })
     await waitFor(() => second.frames.some((f) => f.t === 'hello.ok'))
+    expect(first.ws.readyState).toBe(WebSocket.OPEN)
+    expect(h.bridge.listInstances().map((i) => i.instanceId).sort()).toEqual(['inst-a', 'inst-b'])
 
-    await pendingAssertion
+    // With two instances and no explicit choice, no instance may be targeted.
+    expect(h.bridge.selectedInstance()).toBeNull()
+    expect(() => h.bridge.requestTool('browser_click', {}, new AbortController().signal))
+      .toThrowError(expect.objectContaining({ code: 'bridge-closed' }))
+
+    // Explicitly select the first instance; the call routes only to it.
+    expect(h.bridge.selectInstance('inst-a')).toBe(true)
+    const pending = h.bridge.requestTool('browser_click', {}, new AbortController().signal)
+    await waitFor(() => first.frames.some((f) => f.t === 'tool.call'))
+    expect(second.frames.some((f) => f.t === 'tool.call')).toBe(false)
+    const call = first.frames.find((frame) => frame.t === 'tool.call') as Extract<BridgeFrame, { t: 'tool.call' }>
+    send(first.ws, { t: 'tool.result', id: call.id, ok: true, result: { text: 'done' } })
+    await expect(pending).resolves.toEqual({ text: 'done' })
+
+    // Switch to the second instance: subsequent calls go there, not to the first.
+    send(second.ws, { t: 'select.instance', instanceId: 'inst-b' })
+    await waitFor(() => h.bridge.selectedInstance() === 'inst-b')
+    const pending2 = h.bridge.requestTool('browser_click', {}, new AbortController().signal)
+    await waitFor(() => second.frames.some((f) => f.t === 'tool.call'))
+    expect(first.frames.filter((f) => f.t === 'tool.call').length).toBe(1)
+    const call2 = second.frames.find((frame) => frame.t === 'tool.call') as Extract<BridgeFrame, { t: 'tool.call' }>
+    send(second.ws, { t: 'tool.result', id: call2.id, ok: true, result: { text: 'switched' } })
+    await expect(pending2).resolves.toEqual({ text: 'switched' })
+
+    // A reply from the non-selected instance for a pending id is ignored.
+    const pending3 = h.bridge.requestTool('browser_click', {}, new AbortController().signal)
+    await waitFor(() => second.frames.some((f) => f.t === 'tool.call' && f.id === call2.id + 'x') === false && second.frames.filter((f) => f.t === 'tool.call').length === 2)
+    const call3 = second.frames.filter((f) => f.t === 'tool.call')[1] as Extract<BridgeFrame, { t: 'tool.call' }>
+    send(first.ws, { t: 'tool.result', id: call3.id, ok: true, result: { text: 'wrong-instance' } })
+    await new Promise((resolve) => { setTimeout(resolve, 60) })
+    send(second.ws, { t: 'tool.result', id: call3.id, ok: true, result: { text: 'right' } })
+    await expect(pending3).resolves.toEqual({ text: 'right' })
+
     first.ws.close()
     second.ws.close()
+  })
+
+  it('re-settles pending tool calls when the selected instance disconnects', async () => {
+    const h = await startBridge()
+    harnesses.push(h)
+    const first = await connect(h.url)
+    send(first.ws, { t: 'hello', token: TOKEN, instanceId: 'inst-a', caps: CAPS })
+    await waitFor(() => first.frames.some((f) => f.t === 'hello.ok'))
+    const pending = h.bridge.requestTool('browser_click', {}, new AbortController().signal)
+    const assertion = expect(pending).rejects.toMatchObject({ code: 'bridge-closed' })
+    await waitFor(() => first.frames.some((f) => f.t === 'tool.call'))
+    first.ws.close()
+    await assertion
+    expect(h.bridge.hasConnection()).toBe(false)
   })
 
   it('aborts tool calls when the caller signal fires', async () => {

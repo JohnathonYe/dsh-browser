@@ -55,6 +55,16 @@ export class BridgeClient {
 
   /** Current coarse state (mirrors the last emitted sink value). */
   state: BridgeState = 'stopped'
+  /** True when a fresh socket took the single bridge slot and closed us with
+   * code 4000. This owner should stop trying rather than fight for the slot. */
+  replacedByAnother = false
+
+  /** Stable per-install id reported in `hello` (set by the background). */
+  instanceId = ''
+  /** Human-friendly label reported in `hello` (set by the background). */
+  instanceLabel = ''
+  /** Number of open tabs reported in `hello` (set by the background). */
+  instanceTabCount = 0
 
   /**
    * Connect (or reconnect) to the bridge. Idempotent: calling again with the
@@ -68,6 +78,7 @@ export class BridgeClient {
     this.token = token
     this.running = true
     this.attempt = 0
+    this.replacedByAnother = false
     this.generation += 1
     void this.loop(this.generation)
   }
@@ -130,6 +141,7 @@ export class BridgeClient {
         this.running = false
         this.clearAckTimer()
         this.ws = null
+        this.replacedByAnother = true
         this.emitState('stopped')
       }, { once: true })
       this.emitState('connecting')
@@ -153,6 +165,9 @@ export class BridgeClient {
         t: 'hello',
         token: this.token,
         caps: { textOnly: true, snapshotMaxChars: DEFAULT_SNAPSHOT_MAX_CHARS, maxInteractiveItems: 60 },
+        instanceId: this.instanceId,
+        ...(this.instanceLabel.trim() !== '' ? { label: this.instanceLabel } : {}),
+        tabCount: this.instanceTabCount,
       } satisfies ClientFrame))
 
       let authed = false

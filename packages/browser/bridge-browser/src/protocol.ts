@@ -69,8 +69,8 @@ export interface BridgeCaps {
 
 /** Frames sent by the extension to the bridge plugin. */
 export type ClientFrame =
-  /** First frame, within HELLO_TIMEOUT_MS of socket open. */
-  | { t: 'hello'; token: string; caps: BridgeCaps }
+  /** First frame, within HELLO_TIMEOUT_MS of socket open. Carries a stable per-install instanceId. */
+  | { t: 'hello'; token: string; caps: BridgeCaps; instanceId?: string; label?: string; tabCount?: number }
   /** Unary gateway RPC passthrough (method names from the apiproxy RpcMethodMap). */
   | { t: 'rpc'; id: string; method: string; payload: unknown }
   /** Answer or cancel a pending host interaction through /api/respond. */
@@ -78,8 +78,20 @@ export type ClientFrame =
   /** Result of a previously dispatched tool call. */
   | { t: 'tool.result'; id: string; ok: true; result: unknown }
   | { t: 'tool.result'; id: string; ok: false; error: ToolError }
+  /** Choose which connected browser instance is the control target. */
+  | { t: 'select.instance'; instanceId: string }
   /** Liveness reply. */
   | { t: 'pong' }
+
+/** One connected browser instance as reported to the UI. */
+export interface BrowserInstance {
+  /** Stable per-install id (the extension persists this in chrome.storage.local). */
+  instanceId: string
+  /** Human-friendly label (usually the extension/browser name). */
+  label: string
+  /** Number of open tabs in this instance (0 when the client did not report it). */
+  tabCount: number
+}
 
 /** Frames sent by the bridge plugin to the extension. */
 export type ServerFrame =
@@ -101,6 +113,8 @@ export type ServerFrame =
   | { t: 'ping' }
   /** Fatal connection error; the client should re-authenticate. */
   | { t: 'error'; code: string; message: string }
+  /** The set of connected browser instances plus the currently selected one. */
+  | { t: 'instances'; instances: BrowserInstance[]; selected: string | null }
 
 /** Any frame on the wire. */
 export type BridgeFrame = ClientFrame | ServerFrame
@@ -120,6 +134,7 @@ export function isServerFrame(frame: BridgeFrame): frame is ServerFrame {
     || frame.t === 'tool.call'
     || frame.t === 'tool.cancel'
     || frame.t === 'ping'
+    || frame.t === 'instances'
     || frame.t === 'error'
 }
 
@@ -130,7 +145,7 @@ export function isServerFrame(frame: BridgeFrame): frame is ServerFrame {
  * @returns true for client-sendable frames.
  */
 export function isClientFrame(frame: BridgeFrame): frame is ClientFrame {
-  return frame.t === 'hello' || frame.t === 'rpc' || frame.t === 'respond' || frame.t === 'tool.result' || frame.t === 'pong'
+  return frame.t === 'hello' || frame.t === 'rpc' || frame.t === 'respond' || frame.t === 'tool.result' || frame.t === 'select.instance' || frame.t === 'pong'
 }
 
 /**
@@ -152,7 +167,15 @@ export function parseBridgeFrame(text: string): BridgeFrame | undefined {
     case 'hello':
       return typeof frame.token === 'string'
         && isCaps(frame.caps)
-        ? { t: 'hello', token: frame.token, caps: frame.caps }
+        && (frame.instanceId === undefined || (typeof frame.instanceId === 'string' && frame.instanceId.trim() !== ''))
+        ? {
+            t: 'hello',
+            token: frame.token,
+            caps: frame.caps,
+            ...(typeof frame.instanceId === 'string' && frame.instanceId.trim() !== '' ? { instanceId: frame.instanceId } : {}),
+            ...(typeof frame.label === 'string' && frame.label.trim() !== '' ? { label: frame.label } : {}),
+            ...(typeof frame.tabCount === 'number' && Number.isFinite(frame.tabCount) && frame.tabCount >= 0 ? { tabCount: frame.tabCount } : {}),
+          }
         : undefined
     case 'rpc':
       return typeof frame.id === 'string' && typeof frame.method === 'string'
@@ -169,6 +192,10 @@ export function parseBridgeFrame(text: string): BridgeFrame | undefined {
       }
       return isToolError(frame.error)
         ? { t: 'tool.result', id: frame.id, ok: false, error: frame.error }
+        : undefined
+    case 'select.instance':
+      return typeof frame.instanceId === 'string' && frame.instanceId.trim() !== ''
+        ? { t: 'select.instance', instanceId: frame.instanceId }
         : undefined
     case 'pong':
       return { t: 'pong' }
@@ -219,8 +246,22 @@ export function parseBridgeFrame(text: string): BridgeFrame | undefined {
       return typeof frame.code === 'string' && typeof frame.message === 'string'
         ? { t: 'error', code: frame.code, message: frame.message }
         : undefined
-    default:
-      return undefined
+    case 'instances': {
+      if (!Array.isArray(frame.instances)) return undefined
+      const instances: BrowserInstance[] = []
+      for (const item of frame.instances) {
+        if (typeof item !== 'object' || item === null) return undefined
+        const { instanceId, label, tabCount } = item as Record<string, unknown>
+        if (typeof instanceId !== 'string' || instanceId.trim() === '') return undefined
+        instances.push({
+          instanceId,
+          label: typeof label === 'string' ? label : '',
+          tabCount: typeof tabCount === 'number' && Number.isFinite(tabCount) && tabCount >= 0 ? tabCount : 0,
+        })
+      }
+      if (frame.selected !== undefined && frame.selected !== null && typeof frame.selected !== 'string') return undefined
+      return { t: 'instances', instances, selected: (frame.selected ?? null) as string | null }
+    }
   }
 }
 
