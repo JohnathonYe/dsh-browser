@@ -252,23 +252,49 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         + 'the screenshot shows the cursor on the intended target; if you cannot confirm, do not click blindly.',
     }), 'bridge-browser: confirm-before-click system prompt section')
 
-    // Coordinate clicking is the more certain path: the model confirms the
-    // target's exact viewport pixel on a screenshot (the AI-cursor overlay and
-    // CDP Input share that coordinate space), then clicks it with
-    // browser_click_at(x, y) instead of acting by inventory index alone. The
-    // index-based browser_click stays supported for backward compatibility.
+    // Coordinate-acting is the more certain path: the model confirms the
+    // target's exact viewport pixel(s) on a screenshot (the AI-cursor overlay
+    // and CDP Input share that coordinate space), then clicks, hovers or drags
+    // with browser_click_at / browser_hover_at / browser_drag_at instead of
+    // acting by inventory index alone. The index-based browser_click /
+    // browser_hover / browser_drag stay supported for backward compatibility.
     // English only (composition.spec asserts no Han characters).
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser:click-at',
       order: 111,
-      text: 'To click precisely, first call browser_screenshot. The AI cursor overlay is drawn into the screenshot at its '
-        + 'current CDP position, so the screenshot shows the exact viewport pixel where the pointer sits. Read the target '
-        + 'element\'s viewport CSS-pixel coordinates from that screenshot, then call browser_click_at(x, y) with those pixels '
-        + '(the same coordinate space as the screenshot, so the click lands where you see it). browser_click(index) from a '
-        + 'snapshot inventory remains supported, but a coordinate you have confirmed on the screenshot is the more certain '
-        + 'path and should be preferred when you can read an unambiguous point. After clicking, take a screenshot again to '
-        + 'confirm the result instead of assuming success.',
+      text: 'To act precisely, first call browser_screenshot. The AI cursor overlay is drawn into the screenshot at its '
+        + 'current CDP position, so the screenshot shows the exact viewport pixel where the pointer sits. Read the target\'s '
+        + 'viewport CSS-pixel coordinates from that screenshot, then act with browser_click_at(x, y), browser_hover_at(x, y) '
+        + 'or browser_drag_at(fromX, fromY, toX, toY), all in the same coordinate space as the screenshot so the action lands '
+        + 'where you see it. The index-based browser_click / browser_hover / browser_drag from a snapshot inventory remain '
+        + 'supported, but a coordinate you have confirmed on the screenshot is the more certain path and should be preferred '
+        + 'when you can read an unambiguous point. After acting, take a screenshot again to confirm the result instead of '
+        + 'assuming success.',
     }), 'bridge-browser: click-at system prompt section')
+
+    // Index-locate failure is model-driven too. The numbered snapshot inventory
+    // is the first choice when it reliably matches the target, but cards and
+    // dynamic elements often never appear in that inventory, so a model that
+    // keeps probing selectors / guessing an index spins instead of acting.
+    // Guidance: prefer the index when it resolves, and the moment it does not,
+    // stop probing and fall back to a coordinate read from a screenshot (the
+    // same coordinate space as the AI cursor overlay and the CDP Input).
+    // English only (composition.spec asserts no Han characters).
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:index-fallback',
+      order: 112,
+      text: 'Use the snapshot index first when it reliably matches the target: browser_click(index), '
+        + 'browser_hover(index) and browser_drag(index) act on the numbered inventory from browser_snapshot; '
+        + 'if the snapshot index cannot locate the target (the element is not in the interactive inventory, '
+        + 'the index is stale or distorted, or you can see the target on a screenshot yet no index reaches it), '
+        + 'stop probing selectors and stop guessing an index; fall back to the screenshot/coordinate tools: '
+        + 'call browser_screenshot, read the target\'s viewport pixel coordinates, then act with '
+        + 'browser_click_at(x, y), browser_hover_at(x, y) or browser_drag_at(fromX, fromY, toX, toY). The '
+        + 'coordinate path is the more direct and reliable locator for cards and dynamic elements that the '
+        + 'snapshot index never lists, so switch to it as soon as the index does not resolve. Do not blindly '
+        + 'repeat browser_get_text or browser_click to feel out an index; a coordinate read from the screenshot '
+        + 'is the faster and certain fix.',
+    }), 'bridge-browser: index-fallback system prompt section')
   }
 
   ctx.logger.info(

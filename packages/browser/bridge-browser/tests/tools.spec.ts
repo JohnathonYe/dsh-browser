@@ -49,6 +49,24 @@ describe('registerBrowserTools', () => {
     expect(result).toEqual({ text: 'ok' })
   })
 
+  it('executes browser_hover_at and browser_drag_at with mapped viewport coordinates', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const byName = new Map(registered.map((r) => [r.name, r.definition]))
+    const exec = { signal: new AbortController().signal }
+    const run = async (name: string, args: unknown): Promise<unknown> => {
+      return (byName.get(name)!.execute as (a: unknown, e: { signal: AbortSignal }) => Promise<unknown>)(args, exec)
+    }
+
+    const hover = await run('browser_hover_at', { x: 120, y: 310 })
+    expect(requestTool).toHaveBeenCalledWith('browser_hover_at', { x: 120, y: 310 }, exec.signal, 1_000)
+    expect(hover).toEqual({ text: 'ok' })
+
+    const drag = await run('browser_drag_at', { fromX: 40, fromY: 60, toX: 220, toY: 180 })
+    expect(requestTool).toHaveBeenCalledWith('browser_drag_at', { fromX: 40, fromY: 60, toX: 220, toY: 180 }, exec.signal, 1_000)
+    expect(drag).toEqual({ text: 'ok' })
+  })
+
   it('associates browser calls with the owning Agent session', async () => {
     const { ctx, bridge, requestTool, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
@@ -153,6 +171,26 @@ describe('registerBrowserTools', () => {
     expect(clickAt.properties.y).toBeDefined()
     expect(clickAt.required).toContain('x')
     expect(clickAt.required).toContain('y')
+    const hoverAt = registered.find(({ name }) => name === 'browser_hover_at')!.definition.parameters as {
+      properties: Record<string, unknown>
+      required?: string[]
+    }
+    expect(hoverAt.properties.x).toBeDefined()
+    expect(hoverAt.properties.y).toBeDefined()
+    expect(hoverAt.required).toContain('x')
+    expect(hoverAt.required).toContain('y')
+    const dragAt = registered.find(({ name }) => name === 'browser_drag_at')!.definition.parameters as {
+      properties: Record<string, unknown>
+      required?: string[]
+    }
+    expect(dragAt.properties.fromX).toBeDefined()
+    expect(dragAt.properties.fromY).toBeDefined()
+    expect(dragAt.properties.toX).toBeDefined()
+    expect(dragAt.properties.toY).toBeDefined()
+    expect(dragAt.required).toContain('fromX')
+    expect(dragAt.required).toContain('fromY')
+    expect(dragAt.required).toContain('toX')
+    expect(dragAt.required).toContain('toY')
   })
 
   it('declares cooperative timeoutMs on every tool', () => {
@@ -188,7 +226,7 @@ describe('registerBrowserTools', () => {
       const params = byName.get(name)!.parameters as { properties: { frame?: { type?: unknown } } }
       expect(params.properties.frame?.type).toBe('number')
     }
-    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_back', 'browser_forward', 'browser_reload', 'browser_click_at']) {
+    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_back', 'browser_forward', 'browser_reload', 'browser_click_at', 'browser_hover_at', 'browser_drag_at']) {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }

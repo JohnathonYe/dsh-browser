@@ -50,6 +50,8 @@ const CONTENT_SCRIPT_FILE = 'content.js'
 const ACTION_DELTA_TOOLS = new Set([
   'browser_click',
   'browser_click_at',
+  'browser_hover_at',
+  'browser_drag_at',
   'browser_hover',
   'browser_drag',
   'browser_type',

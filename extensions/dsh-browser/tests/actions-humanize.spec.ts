@@ -166,3 +166,62 @@ describe('coordinate click (browser_click_at)', () => {
     expect(pointerMock!.sendMessage).not.toHaveBeenCalled()
   })
 })
+
+describe('coordinate hover (browser_hover_at)', () => {
+  it('hovers at the confirmed viewport pixel with a moves-only cursor plan', async () => {
+    document.body.innerHTML = '<button style="position:absolute;top:100px;left:100px">悬停</button>'
+    const ids = new ElementIds()
+    await runAction('browser_snapshot', {}, { ids, budget: BUDGET })
+
+    const pending = runAction('browser_hover_at', { x: 150, y: 120 }, { ids, budget: BUDGET })
+    await vi.advanceTimersByTimeAsync(1_000)
+    const result = await pending
+
+    expect(result.text).toContain('Hovered at (150, 120)')
+    const plan = pointerMock!.captured[0]!
+    const types = plan.steps.map((step) => step.type)
+    expect(types).toContain('mouseMoved')
+    expect(types).not.toContain('mousePressed')
+    expect(types).not.toContain('mouseReleased')
+    const last = plan.steps[plan.steps.length - 1]!
+    expect(Math.abs(last.x - 150)).toBeLessThanOrEqual(4)
+    expect(Math.abs(last.y - 120)).toBeLessThanOrEqual(4)
+  })
+
+  it('rejects a non-finite coordinate', async () => {
+    const ids = new ElementIds()
+    await expect(runAction('browser_hover_at', { x: 50, y: 'top' }, { ids, budget: BUDGET })).rejects.toThrow()
+    expect(pointerMock!.sendMessage).not.toHaveBeenCalled()
+  })
+})
+
+describe('coordinate drag (browser_drag_at)', () => {
+  it('drags between two confirmed viewport pixels with a press/move/release plan', async () => {
+    document.body.innerHTML = '<div style="position:absolute;top:40px;left:40px">可拖</div>'
+    const ids = new ElementIds()
+    await runAction('browser_snapshot', {}, { ids, budget: BUDGET })
+
+    const pending = runAction('browser_drag_at', { fromX: 60, fromY: 80, toX: 240, toY: 200 }, { ids, budget: BUDGET })
+    await vi.advanceTimersByTimeAsync(1_000)
+    const result = await pending
+
+    expect(result.text).toContain('Dragged from (60, 80) to (240, 200)')
+    const plan = pointerMock!.captured[0]!
+    const types = plan.steps.map((step) => step.type)
+    expect(types).toContain('mousePressed')
+    expect(types).toContain('mouseMoved')
+    expect(types).toContain('mouseReleased')
+    const press = plan.steps.find((step) => step.type === 'mousePressed')!
+    const release = plan.steps.find((step) => step.type === 'mouseReleased')!
+    expect(Math.abs(press.x - 60)).toBeLessThanOrEqual(4)
+    expect(Math.abs(press.y - 80)).toBeLessThanOrEqual(4)
+    expect(Math.abs(release.x - 240)).toBeLessThanOrEqual(4)
+    expect(Math.abs(release.y - 200)).toBeLessThanOrEqual(4)
+  })
+
+  it('rejects a non-finite coordinate', async () => {
+    const ids = new ElementIds()
+    await expect(runAction('browser_drag_at', { fromX: 1, fromY: 2, toX: 3, toY: 'down' }, { ids, budget: BUDGET })).rejects.toThrow()
+    expect(pointerMock!.sendMessage).not.toHaveBeenCalled()
+  })
+})

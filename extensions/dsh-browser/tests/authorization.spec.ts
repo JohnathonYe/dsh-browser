@@ -75,6 +75,18 @@ describe('approvalPromptForCall', () => {
     expect(zhPrompt?.summary).toBe('点击坐标 (150, 300)')
   })
 
+  it('classifies a coordinate drag as a state-changing action scoped to its frame', () => {
+    const prompt = approvalPromptForCall(call('browser_drag_at', { fromX: 10, fromY: 20, toX: 210, toY: 120 }), 'auto', FRAMES, 'en')
+    expect(prompt).toMatchObject({ kind: 'action', origins: ['https://app.example'], canTrust: true })
+    expect(prompt?.summary).toBe('Drag from (10, 20) to (210, 120)')
+    const zhPrompt = approvalPromptForCall(call('browser_drag_at', { fromX: 10, fromY: 20, toX: 210, toY: 120 }), 'auto', FRAMES, 'zh')
+    expect(zhPrompt?.summary).toBe('从 (10, 20) 拖到 (210, 120)')
+  })
+
+  it('keeps a coordinate hover outside the approval path (matches browser_hover)', () => {
+    expect(approvalPromptForCall(call('browser_hover_at', { x: 120, y: 300 }), 'auto', FRAMES, 'zh')).toBeUndefined()
+  })
+
   it('renders approval summaries in English for non-Chinese browsers', () => {
     expect(approvalPromptForCall(call('browser_type', {
       index: 3,

@@ -266,6 +266,24 @@ export function buildHoverSteps(el: Element): MouseStep[] {
 }
 
 /**
+ * Build a hover plan AT a viewport CSS-pixel coordinate (no element
+ * reference): glide the cursor to a point perturbed around (x, y), then rest
+ * so `:hover`/tooltip affordances render. Mirrors `buildHoverSteps` but aims
+ * at the given pixel instead of an element's random interior point, so the
+ * model can confirm the exact point on a screenshot and hover it precisely.
+ */
+export function buildHoverAtSteps(x: number, y: number, opts: { points?: number; jitter?: number } = {}): MouseStep[] {
+  const to = jitterPoint(x, y, opts.jitter)
+  const from = startPoint(to)
+  const steps: MouseStep[] = [
+    ...moveSteps(from, to, { points: opts.points ?? 8 }),
+    movedStep(to, 0, randomPause(RHYTHM_PAUSE)),
+  ]
+  rememberMouse(to)
+  return steps
+}
+
+/**
  * Build a drag plan: press at `from`, trail along the curve to `to` (left
  * button held so the browser treats it as a real drag), then release.
  */
@@ -364,11 +382,21 @@ export function buildWheelSteps(totalDelta: number, opts: { segments?: number } 
 async function synthesizeMouseSteps(steps: MouseStep[], target?: Element): Promise<void> {
   let pressed = false
   let movedWhilePressed = false
+  let lastUnder: Element | undefined
   for (const step of steps) {
     const under = target ?? document.elementFromPoint?.(step.x, step.y) ?? document.body ?? document
     switch (step.type) {
       case 'mouseMoved':
         if (step.buttons !== undefined && step.buttons >= 1) movedWhilePressed = true
+        // Fire a `mouseover` when the pointer first enters a new element so a
+        // synthetic hover still signals the element under the cursor. Real CDP
+        // input is what produces `:hover`; this keeps the degrade path faithful.
+        if (under !== lastUnder) {
+          under.dispatchEvent(new MouseEvent('mouseover', {
+            clientX: step.x, clientY: step.y, bubbles: true, cancelable: true, composed: true, relatedTarget: lastUnder,
+          }))
+          lastUnder = under
+        }
         under.dispatchEvent(new MouseEvent('mousemove', {
           clientX: step.x, clientY: step.y, bubbles: true, cancelable: true, composed: true,
         }))
@@ -467,6 +495,47 @@ export async function dragFromTo(
   opts: { steps?: number } = {},
 ): Promise<void> {
   await dispatchMouseSteps(buildDragSteps(from, to, opts), el)
+}
+
+/**
+ * Real hover at a viewport CSS-pixel coordinate (glide + rest): `(x, y)` is
+ * the pixel the model confirmed on a screenshot (the same space the AI-cursor
+ * overlay and CDP Input use). The pointer glides to a small random
+ * perturbation of the point and rests so `:hover`/tooltips render. When CDP
+ * input is unavailable the plan degrades to synthetic DOM events on whatever
+ * element sits under the point (via `document.elementFromPoint`).
+ */
+export async function hoverAt(x: number, y: number, opts: { points?: number; jitter?: number } = {}): Promise<void> {
+  const to = jitterPoint(x, y, opts.jitter)
+  const under = typeof document !== 'undefined'
+    && typeof document.elementFromPoint === 'function'
+    ? document.elementFromPoint(to.x, to.y)
+    : null
+  await dispatchMouseSteps(buildHoverAtSteps(x, y, opts), under ?? undefined)
+}
+
+/**
+ * Real drag between two viewport CSS-pixel coordinates: `mousedown` at the
+ * perturbed `(fromX, fromY)`, several `mousemove` steps along the eased curve
+ * with the left button held, then `mouseup` at the perturbed `(toX, toY)`, all
+ * as real CDP events. Both endpoints are perturbed by a small random offset so
+ * the drag never lands on a dead pixel. When CDP input is unavailable the plan
+ * degrades to synthetic DOM events on whatever element sits under the point.
+ */
+export async function dragAt(
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+  opts: { steps?: number; jitter?: number } = {},
+): Promise<void> {
+  const from = jitterPoint(fromX, fromY, opts.jitter)
+  const to = jitterPoint(toX, toY, opts.jitter)
+  const under = typeof document !== 'undefined'
+    && typeof document.elementFromPoint === 'function'
+    ? document.elementFromPoint(to.x, to.y)
+    : null
+  await dispatchMouseSteps(buildDragSteps(from, to, { steps: opts.steps ?? 7 }), under ?? undefined)
 }
 
 /**

@@ -211,7 +211,22 @@ describe('real Loader composition', () => {
     expect(clickAtPrompt).toContain('browser_screenshot')
     expect(clickAtPrompt).toContain('browser_click_at(x, y)')
     expect(clickAtPrompt).toContain('viewport')
+    // Coordinate hover/drag share the same screenshot coordinate space.
+    expect(clickAtPrompt).toContain('browser_hover_at(x, y)')
+    expect(clickAtPrompt).toContain('browser_drag_at(fromX, fromY, toX, toY)')
     expect(clickAtPrompt).not.toMatch(/\p{Script=Han}/u)
+
+    // Index-location failure must tell the model to stop probing the index and
+    // fall back to the screenshot/coordinate tools. Keep it English (no Han).
+    const indexFallbackPrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:index-fallback')?.text
+    expect(indexFallbackPrompt).toBeDefined()
+    expect(indexFallbackPrompt).toContain('if the snapshot index')
+    expect(indexFallbackPrompt).toContain('fall back to the screenshot/coordinate tools')
+    expect(indexFallbackPrompt).toContain('browser_click_at(x, y)')
+    expect(indexFallbackPrompt).toContain('browser_hover_at(x, y)')
+    expect(indexFallbackPrompt).toContain('browser_drag_at(fromX, fromY, toX, toY)')
+    expect(indexFallbackPrompt).not.toMatch(/\p{Script=Han}/u)
 
     // Zero-config discovery endpoint answers with the bridge WebSocket URL.
     const configResponse = await fetch(`http://127.0.0.1:${port}/ext/bridge-config`)

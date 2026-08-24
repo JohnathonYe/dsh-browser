@@ -3,11 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildClickAtSteps,
   buildClickSteps,
+  buildHoverAtSteps,
   buildMoveToSteps,
   buildWheelSteps,
   clickAt,
   dispatchMouseSteps,
+  dragAt,
   ensureInViewport,
+  hoverAt,
   humanWheelScroll,
   jitterPoint,
 } from '../src/content/movement.ts'
@@ -159,6 +162,63 @@ describe('clickAt', () => {
     await pending
     const moves = dispatch.mock.calls.filter(([event]) => (event as MouseEvent).type === 'mousemove')
     expect(moves.length).toBeGreaterThan(5)
+  })
+})
+
+describe('buildHoverAtSteps', () => {
+  it('glides to a small perturbation of the requested viewport point and rests without pressing', () => {
+    const steps = buildHoverAtSteps(500, 300)
+    const moves = steps.filter((step) => step.type === 'mouseMoved')
+    expect(moves.length).toBeGreaterThan(5)
+    expect(steps.some((step) => step.type === 'mousePressed')).toBe(false)
+    expect(steps.some((step) => step.type === 'mouseReleased')).toBe(false)
+    expect(steps.every((step) => (step.pauseAfterMs ?? 0) > 0)).toBe(true)
+    const last = steps[steps.length - 1]!
+    expect(Math.abs(last.x - 500)).toBeLessThanOrEqual(4)
+    expect(Math.abs(last.y - 300)).toBeLessThanOrEqual(4)
+  })
+})
+
+describe('hoverAt / dragAt', () => {
+  it('sends a real CDP coordinate-hover plan (moves only, no press/release)', async () => {
+    await hoverAt(420, 260)
+    expect(pointerMock!.sendMessage).toHaveBeenCalled()
+    const plan = pointerMock!.captured[0]!
+    expect(plan.steps.some((step) => step.type === 'mouseMoved')).toBe(true)
+    expect(plan.steps.some((step) => step.type === 'mousePressed')).toBe(false)
+    expect(plan.steps.some((step) => step.type === 'mouseReleased')).toBe(false)
+    const last = plan.steps[plan.steps.length - 1]!
+    expect(Math.abs(last.x - 420)).toBeLessThanOrEqual(4)
+    expect(Math.abs(last.y - 260)).toBeLessThanOrEqual(4)
+  })
+
+  it('sends a real CDP coordinate-drag plan (press at from, move, release at to)', async () => {
+    await dragAt(100, 120, 300, 240)
+    expect(pointerMock!.sendMessage).toHaveBeenCalled()
+    const plan = pointerMock!.captured[0]!
+    const types = plan.steps.map((step) => step.type)
+    expect(types).toContain('mousePressed')
+    expect(types).toContain('mouseMoved')
+    expect(types).toContain('mouseReleased')
+    const press = plan.steps.find((step) => step.type === 'mousePressed')!
+    const release = plan.steps.find((step) => step.type === 'mouseReleased')!
+    // Both endpoints stay near the requested points (default ±4px jitter).
+    expect(Math.abs(press.x - 100)).toBeLessThanOrEqual(4)
+    expect(Math.abs(press.y - 120)).toBeLessThanOrEqual(4)
+    expect(Math.abs(release.x - 300)).toBeLessThanOrEqual(4)
+    expect(Math.abs(release.y - 240)).toBeLessThanOrEqual(4)
+  })
+
+  it('falls back to synthetic DOM events when CDP input is declined (hover)', async () => {
+    pointerMock!.setOk(false)
+    const dispatch = vi.spyOn(document.body, 'dispatchEvent')
+    const pending = hoverAt(200, 120)
+    await vi.advanceTimersByTimeAsync(5_000)
+    await pending
+    const moves = dispatch.mock.calls.filter(([event]) => (event as MouseEvent).type === 'mousemove')
+    const overs = dispatch.mock.calls.filter(([event]) => (event as MouseEvent).type === 'mouseover')
+    expect(moves.length).toBeGreaterThan(5)
+    expect(overs.length).toBeGreaterThan(0)
   })
 })
 

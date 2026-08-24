@@ -221,6 +221,29 @@ describe('dispatchToolCall', () => {
     }, { documentId: 'document-40' })
   })
 
+  it('routes a coordinate hover and drag without requiring a snapshot baseline', async () => {
+    const hoverCall: ToolCall = { id: 'tool-hover-at', name: 'browser_hover_at', args: { x: 150, y: 200 } }
+    const dragCall: ToolCall = { id: 'tool-drag-at', name: 'browser_drag_at', args: { fromX: 40, fromY: 60, toX: 220, toY: 180 } }
+    const chromeMock = mockChrome({
+      tab: { id: 41, url: 'https://app.example/' },
+      responses: [OK, OK],
+    })
+
+    await expect(dispatchToolCall(hoverCall, 'auto', undefined, async () => 'approved')).resolves.toEqual(OK)
+    expect(chromeMock.sendMessage).toHaveBeenCalledWith(41, {
+      type: 'DSH_ACTION',
+      action: 'browser_hover_at',
+      args: { x: 150, y: 200 },
+    }, { documentId: 'document-41' })
+
+    await expect(dispatchToolCall(dragCall, 'auto', undefined, async () => 'approved')).resolves.toEqual({ ok: true, result: { text: 'page' } })
+    expect(chromeMock.sendMessage).toHaveBeenLastCalledWith(41, {
+      type: 'DSH_ACTION',
+      action: 'browser_drag_at',
+      args: { fromX: 40, fromY: 60, toX: 220, toY: 180 },
+    }, { documentId: 'document-41' })
+  })
+
   it('returns automatic action deltas inside a fresh untrusted-content boundary', async () => {
     const call: ToolCall = { id: 'tool-delta', name: 'browser_click', args: { index: 3 } }
     const budget = { maxItems: 10, maxChars: 1_000 }

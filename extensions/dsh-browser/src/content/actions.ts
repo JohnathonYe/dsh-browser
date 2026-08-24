@@ -17,10 +17,12 @@ import { buildSnapshot, renderSnapshot } from './snapshot.ts'
 import {
   clickAt,
   clickElement,
+  dragAt,
   dragFromTo,
   elementCenter,
   elementRandomPoint,
   ensureInViewport,
+  hoverAt,
   hoverElement,
   humanWheelScroll,
   movePointerTo,
@@ -254,6 +256,10 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return clickAction(args, ctx)
     case 'browser_click_at':
       return clickAtAction(args, ctx)
+    case 'browser_hover_at':
+      return hoverAtAction(args, ctx)
+    case 'browser_drag_at':
+      return dragAtAction(args, ctx)
     case 'browser_hover':
       return hoverAction(args, ctx)
     case 'browser_drag':
@@ -476,6 +482,20 @@ async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): 
   return withPageDelta(`Scrolled ${direction}.`, ctx)
 }
 
+async function hoverAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const x = coordArg(args, 'x')
+  const y = coordArg(args, 'y')
+  // No element reference: hover precisely at the viewport CSS-pixel (x, y) the
+  // model confirmed on a screenshot, so :hover/tooltips on a target that is not
+  // in the interactive inventory (e.g. a video card) still render.
+  await hoverAt(x, y)
+  await waitForPageSettled(ACTION_SETTLE)
+  return withPageDelta(
+    `Hovered at (${x}, ${y}). The pointer is now over that point; call browser_snapshot to read any hover effect.`,
+    ctx,
+  )
+}
+
 async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const index = numberArg(args, 'index')
   const el = elementOrThrow(ctx.ids, index)
@@ -489,6 +509,19 @@ async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): P
     `Hovered [${index}]. The pointer is now over the element; call browser_snapshot to read any hover effect.`,
     ctx,
   )
+}
+
+async function dragAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const fromX = coordArg(args, 'fromX')
+  const fromY = coordArg(args, 'fromY')
+  const toX = coordArg(args, 'toX')
+  const toY = coordArg(args, 'toY')
+  // No element reference: drag precisely between two viewport CSS-pixels the
+  // model confirmed on a screenshot, so a target outside the index snapshot
+  // (e.g. a video card) can still be dragged by its on-screen coordinates.
+  await dragAt(fromX, fromY, toX, toY)
+  await waitForPageSettled(ACTION_SETTLE)
+  return withPageDelta(`Dragged from (${fromX}, ${fromY}) to (${toX}, ${toY}).`, ctx)
 }
 
 async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
