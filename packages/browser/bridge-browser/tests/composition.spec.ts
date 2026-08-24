@@ -180,6 +180,18 @@ describe('real Loader composition', () => {
     expect(multiBrowserPrompt).toContain('do not choose an instance on your own')
     expect(multiBrowserPrompt).not.toMatch(/\p{Script=Han}/u)
 
+    // No-authorized-group guidance must tell the model to establish a target
+    // page via browser_navigate/browser_new_tab (which auto-create the group)
+    // before any URL-less tool, and to never open with snapshot/click first.
+    // Keep it English (no Han characters).
+    const noAuthGroupPrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:no-auth-group')?.text
+    expect(noAuthGroupPrompt).toBeDefined()
+    expect(noAuthGroupPrompt).toContain('browser_navigate(<url>)')
+    expect(noAuthGroupPrompt).toContain('browser_new_tab(<url>)')
+    expect(noAuthGroupPrompt).toContain('do not lead with a URL-less tool')
+    expect(noAuthGroupPrompt).not.toMatch(/\p{Script=Han}/u)
+
     // Zero-config discovery endpoint answers with the bridge WebSocket URL.
     const configResponse = await fetch(`http://127.0.0.1:${port}/ext/bridge-config`)
     expect(configResponse.status).toBe(200)

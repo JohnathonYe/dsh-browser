@@ -217,6 +217,23 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         + 'browser_* action. If the user cancels or does not provide a selection, do not choose an instance on your own; '
         + 'tell the user a browser instance must be selected before proceeding.',
     }), 'bridge-browser: multi-instance system prompt section')
+
+    // No authorized group yet: every browser_* URL-less tool errors, while
+    // browser_navigate/browser_new_tab with a real URL auto-create a new tab
+    // and an authorized DSH- group. Guide the model to establish the target
+    // page first instead of calling a URL-less tool (snapshot/click/scroll/...)
+    // and tripping the error. English only (composition.spec asserts no Han).
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:no-auth-group',
+      order: 109,
+      text: 'If there is no authorized browser group yet (any browser_* tool returns "No authorized group. Open a target page '
+        + 'first with browser_navigate or browser_new_tab (a real URL)..."), do not lead with a URL-less tool such as '
+        + 'browser_snapshot, browser_click, browser_scroll, browser_hover or browser_get_text; they need an already-open '
+        + 'target page and will fail with that error. To work on a page, first open it with browser_navigate(<url>) or '
+        + 'browser_new_tab(<url>) — this opens the target in a new tab and creates an authorized group automatically, after '
+        + 'which the page is operable. Order: establish the target page with browser_navigate/browser_new_tab first, then '
+        + 'read it with browser_snapshot, then act with browser_click/browser_scroll/browser_type.',
+    }), 'bridge-browser: no-auth-group system prompt section')
   }
 
   ctx.logger.info(
