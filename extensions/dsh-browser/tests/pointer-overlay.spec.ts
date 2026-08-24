@@ -50,6 +50,20 @@ describe('pointerOverlay', () => {
     expect(shadow!.querySelector('.dsh-ai-cursor__pointer')).not.toBeNull()
   })
 
+  it('renders the pointer as a traditional black arrow with a white frame (never blue/purple)', () => {
+    pointerOverlay.show()
+    const host = document.getElementById('__dsh_ai_cursor__')!
+    const path = host.shadowRoot?.querySelector<SVGPathElement>('.dsh-ai-cursor__pointer path')
+    expect(path).not.toBeNull()
+    // Classic system-pointer contrast: black body, white outline, so a vision
+    // model reading a page screenshot recognises the cursor on any surface.
+    expect(path!.getAttribute('fill')).toBe('#000000')
+    expect(path!.getAttribute('stroke')).toBe('#ffffff')
+    expect(path!.getAttribute('stroke-width')).toBe('1.8')
+    // Guard against regressions back to the blue/purple AI styling.
+    expect(path!.getAttribute('fill')).not.toMatch(/#6d5ef5/i)
+  })
+
   it('tracks the step-plan coordinates and highlights press/release', async () => {
     const running = pointerOverlay.play(plan())
     // The cursor is shown synchronously (before the first awaited pause).

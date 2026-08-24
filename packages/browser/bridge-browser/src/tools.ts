@@ -41,6 +41,10 @@ interface TextResult {
 interface ScreenshotResult {
   text: string
   image?: { mediaType: string; data: string }
+  /** Model-visible image size (the pixels the model reads coordinates from). */
+  imageSize?: { width: number; height: number }
+  /** Raw captured PNG size (page/device pixels) before down-scaling. */
+  originalDimensions?: { width: number; height: number }
 }
 
 /** One screenshot execution's image-enriched projection, staged for finalizeContent. */
@@ -162,6 +166,24 @@ export function registerBrowserTools(
               data: { type: 'string', required: true },
             },
           },
+          imageSize: {
+            type: 'object',
+            additionalProperties: false,
+            description: 'Model-visible screenshot pixel size (the image you read coordinates from).',
+            properties: {
+              width: { type: 'number' },
+              height: { type: 'number' },
+            },
+          },
+          originalDimensions: {
+            type: 'object',
+            additionalProperties: false,
+            description: 'Raw captured PNG pixel size (page/device pixels) before down-scaling.',
+            properties: {
+              width: { type: 'number' },
+              height: { type: 'number' },
+            },
+          },
         },
       },
       render: (_args: unknown, value: unknown) => {
@@ -263,10 +285,10 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
 
   const clickAt = (): ToolDefinition => defineTool({
     name: 'browser_click_at',
-    description: 'Click at viewport CSS-pixel (x, y), same space as browser_screenshot; confirm on a screenshot first.',
+    description: 'Click at a screenshot pixel (x, y); the plugin maps it to page coords.',
     parameters: {
-      x: { type: 'number', required: true, description: 'Viewport CSS pixel X coordinate (same space as the screenshot).' },
-      y: { type: 'number', required: true, description: 'Viewport CSS pixel Y coordinate (same space as the screenshot).' },
+      x: { type: 'number', required: true, description: 'Screenshot pixel X coordinate you read from browser_screenshot.' },
+      y: { type: 'number', required: true, description: 'Screenshot pixel Y coordinate you read from browser_screenshot.' },
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
@@ -275,10 +297,10 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
 
   const hoverAt = (): ToolDefinition => defineTool({
     name: 'browser_hover_at',
-    description: 'Hover at viewport CSS-pixel (x, y), same space as browser_screenshot; confirm on a screenshot first.',
+    description: 'Hover at a screenshot pixel (x, y); the plugin maps it to page coords.',
     parameters: {
-      x: { type: 'number', required: true, description: 'Viewport CSS pixel X coordinate (same space as the screenshot).' },
-      y: { type: 'number', required: true, description: 'Viewport CSS pixel Y coordinate (same space as the screenshot).' },
+      x: { type: 'number', required: true, description: 'Screenshot pixel X coordinate you read from browser_screenshot.' },
+      y: { type: 'number', required: true, description: 'Screenshot pixel Y coordinate you read from browser_screenshot.' },
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
@@ -287,12 +309,12 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
 
   const dragAt = (): ToolDefinition => defineTool({
     name: 'browser_drag_at',
-    description: 'Drag from (fromX, fromY) to (toX, toY), same space as browser_screenshot; confirm both on a screenshot first.',
+    description: 'Drag between screenshot pixels (fromX, fromY) to (toX, toY); the plugin maps them to page coords.',
     parameters: {
-      fromX: { type: 'number', required: true, description: 'Viewport CSS pixel X of the drag start (same space as the screenshot).' },
-      fromY: { type: 'number', required: true, description: 'Viewport CSS pixel Y of the drag start (same space as the screenshot).' },
-      toX: { type: 'number', required: true, description: 'Viewport CSS pixel X of the drag end (same space as the screenshot).' },
-      toY: { type: 'number', required: true, description: 'Viewport CSS pixel Y of the drag end (same space as the screenshot).' },
+      fromX: { type: 'number', required: true, description: 'Screenshot pixel X of the drag start you read from browser_screenshot.' },
+      fromY: { type: 'number', required: true, description: 'Screenshot pixel Y of the drag start you read from browser_screenshot.' },
+      toX: { type: 'number', required: true, description: 'Screenshot pixel X of the drag end you read from browser_screenshot.' },
+      toY: { type: 'number', required: true, description: 'Screenshot pixel Y of the drag end you read from browser_screenshot.' },
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,

@@ -461,12 +461,13 @@ export async function clickElement(el: Element): Promise<void> {
 }
 
 /**
- * Real click at a viewport CSS-pixel coordinate (glide + press + release):
- * `(x, y)` is the pixel the model confirmed on a screenshot (the same space the
- * AI-cursor overlay and CDP Input use). The pointer glides to a small random
- * perturbation of the point, then press/release synthesizes a genuine click.
- * When CDP input is unavailable the plan degrades to synthetic DOM events on
- * whatever element sits under the tap point (via `document.elementFromPoint`).
+ * Real click at a viewport CSS-pixel coordinate (glide + press + release).
+ * `(x, y)` is a viewport CSS pixel; the caller maps the model's screenshot
+ * pixel to this space before calling (see `screenshotPointToCss`). The pointer
+ * glides to a small random perturbation of the point, then press/release
+ * synthesizes a genuine click. When CDP input is unavailable the plan degrades
+ * to synthetic DOM events on whatever element sits under the tap point (via
+ * `document.elementFromPoint`).
  */
 export async function clickAt(x: number, y: number, opts: { points?: number; jitter?: number } = {}): Promise<void> {
   const to = jitterPoint(x, y, opts.jitter)
@@ -498,12 +499,12 @@ export async function dragFromTo(
 }
 
 /**
- * Real hover at a viewport CSS-pixel coordinate (glide + rest): `(x, y)` is
- * the pixel the model confirmed on a screenshot (the same space the AI-cursor
- * overlay and CDP Input use). The pointer glides to a small random
- * perturbation of the point and rests so `:hover`/tooltips render. When CDP
- * input is unavailable the plan degrades to synthetic DOM events on whatever
- * element sits under the point (via `document.elementFromPoint`).
+ * Real hover at a viewport CSS-pixel coordinate (glide + rest): `(x, y)` is a
+ * viewport CSS pixel; the caller maps the model's screenshot pixel to this
+ * space before calling (see `screenshotPointToCss`). The pointer glides to a
+ * small random perturbation of the point and rests so `:hover`/tooltips render.
+ * When CDP input is unavailable the plan degrades to synthetic DOM events on
+ * whatever element sits under the point (via `document.elementFromPoint`).
  */
 export async function hoverAt(x: number, y: number, opts: { points?: number; jitter?: number } = {}): Promise<void> {
   const to = jitterPoint(x, y, opts.jitter)
@@ -518,9 +519,11 @@ export async function hoverAt(x: number, y: number, opts: { points?: number; jit
  * Real drag between two viewport CSS-pixel coordinates: `mousedown` at the
  * perturbed `(fromX, fromY)`, several `mousemove` steps along the eased curve
  * with the left button held, then `mouseup` at the perturbed `(toX, toY)`, all
- * as real CDP events. Both endpoints are perturbed by a small random offset so
- * the drag never lands on a dead pixel. When CDP input is unavailable the plan
- * degrades to synthetic DOM events on whatever element sits under the point.
+ * as real CDP events. Both endpoints are viewport CSS pixels; the caller maps
+ * the model's screenshot pixels to this space before calling (see
+ * `screenshotPointToCss`). Each endpoint is perturbed by a small random offset
+ * so the drag never lands on a dead pixel. When CDP input is unavailable the
+ * plan degrades to synthetic DOM events on whatever element sits under the point.
  */
 export async function dragAt(
   fromX: number,

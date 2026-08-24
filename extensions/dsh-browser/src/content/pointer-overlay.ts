@@ -46,11 +46,15 @@ const OVERLAY_Z_INDEX = 2147483647
 /** Duration of the transient click ripple. */
 const RIPPLE_MS = 520
 
-/** Pointer arrow with its tip at the track origin (0,0), so `translate(x,y)` pins the tip to (x,y). */
+/** Pointer arrow with its tip at the track origin (0,0), so `translate(x,y)` pins the tip to (x,y).
+ *  Rendered as a TRADITIONAL black arrow with a white frame (classic system-pointer
+ *  contrast) so a vision model reading a page screenshot can identify it as a
+ *  cursor on both light and dark surfaces. The small cyan `AI` badge still marks
+ *  it as an agent pointer, but the arrow body itself is never blue/purple. */
 const POINTER_SVG =
   '<svg class="dsh-ai-cursor__pointer" viewBox="0 0 26 26" xmlns="http://www.w3.org/2000/svg">' +
   '<path d="M0 0 L0 18 L5.2 13.8 L8.4 21.4 L11.6 20.1 L8.3 12.6 L15.2 12.6 Z" ' +
-  'fill="#6d5ef5" stroke="#0b1026" stroke-width="1.4" stroke-linejoin="round"/></svg>'
+  'fill="#000000" stroke="#ffffff" stroke-width="1.8" stroke-linejoin="round"/></svg>'
 
 const TRACK_TEMPLATE = `${POINTER_SVG}<span class="dsh-ai-cursor__badge">AI</span><span class="dsh-ai-cursor__ripple"></span>`
 
@@ -216,7 +220,7 @@ class AICursorOverlay {
     ripple.style.width = '36px'
     ripple.style.height = '36px'
     ripple.style.borderRadius = '50%'
-    ripple.style.border = '2px solid rgba(109,94,245,.8)'
+    ripple.style.border = '2px solid rgba(70,70,70,.7)'
     ripple.style.pointerEvents = 'none'
     ripple.style.transform = 'scale(.2)'
     ripple.style.opacity = '.85'

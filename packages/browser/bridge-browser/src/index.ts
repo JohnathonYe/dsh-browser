@@ -263,10 +263,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       name: 'tool:bridge-browser:click-at',
       order: 111,
       text: 'To act precisely, first call browser_screenshot. The AI cursor overlay is drawn into the screenshot at its '
-        + 'current CDP position, so the screenshot shows the exact viewport pixel where the pointer sits. Read the target\'s '
-        + 'viewport CSS-pixel coordinates from that screenshot, then act with browser_click_at(x, y), browser_hover_at(x, y) '
-        + 'or browser_drag_at(fromX, fromY, toX, toY), all in the same coordinate space as the screenshot so the action lands '
-        + 'where you see it. The index-based browser_click / browser_hover / browser_drag from a snapshot inventory remain '
+        + 'current CDP position, so the screenshot shows the exact pixel where the pointer sits. Read the target\'s '
+        + 'position as the pixel coordinates you see on that screenshot, then act with browser_click_at(x, y), '
+        + 'browser_hover_at(x, y) or browser_drag_at(fromX, fromY, toX, toY) by passing the screenshot pixels directly; '
+        + 'the plugin converts them into the page\'s viewport coordinates for you, so do not resize or rescale the '
+        + 'numbers yourself. The index-based browser_click / browser_hover / browser_drag from a snapshot inventory remain '
         + 'supported, but a coordinate you have confirmed on the screenshot is the more certain path and should be preferred '
         + 'when you can read an unambiguous point. After acting, take a screenshot again to confirm the result instead of '
         + 'assuming success.',
@@ -288,8 +289,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         + 'if the snapshot index cannot locate the target (the element is not in the interactive inventory, '
         + 'the index is stale or distorted, or you can see the target on a screenshot yet no index reaches it), '
         + 'stop probing selectors and stop guessing an index; fall back to the screenshot/coordinate tools: '
-        + 'call browser_screenshot, read the target\'s viewport pixel coordinates, then act with '
-        + 'browser_click_at(x, y), browser_hover_at(x, y) or browser_drag_at(fromX, fromY, toX, toY). The '
+        + 'call browser_screenshot, read the target\'s position as the pixel coordinates you see on that screenshot, '
+        + 'then act with browser_click_at(x, y), browser_hover_at(x, y) or browser_drag_at(fromX, fromY, toX, toY) by '
+        + 'passing those screenshot pixels directly (the plugin converts them to the page\'s viewport coordinates). The '
         + 'coordinate path is the more direct and reliable locator for cards and dynamic elements that the '
         + 'snapshot index never lists, so switch to it as soon as the index does not resolve. Do not blindly '
         + 'repeat browser_get_text or browser_click to feel out an index; a coordinate read from the screenshot '

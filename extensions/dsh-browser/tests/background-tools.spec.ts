@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { dispatchToolCall, type ToolAnswer, type ToolCall } from '../src/background/tools.ts'
+import { clearScreenshotMeta, recordScreenshotMeta } from '../src/background/screenshot-meta.ts'
 
 const CALL: ToolCall = { id: 'tool-1', name: 'browser_snapshot', args: {} }
 const OK: ToolAnswer = { ok: true, result: { text: 'page' } }
@@ -219,6 +220,43 @@ describe('dispatchToolCall', () => {
       action: 'browser_click_at',
       args: { x: 150, y: 300 },
     }, { documentId: 'document-40' })
+  })
+
+  it('attaches the screenshot image size to a coordinate call when a screenshot was taken', async () => {
+    const call: ToolCall = { id: 'tool-click-at-meta', name: 'browser_click_at', args: { x: 900, y: 500 } }
+    const chromeMock = mockChrome({ tab: { id: 50, url: 'https://app.example/' } })
+    recordScreenshotMeta(50, { width: 2048, height: 991 }, { width: 3840, height: 1858 })
+    try {
+      await dispatchToolCall(call, 'auto', undefined, async () => 'approved')
+      expect(chromeMock.sendMessage).toHaveBeenCalledWith(50, {
+        type: 'DSH_ACTION',
+        action: 'browser_click_at',
+        args: { x: 900, y: 500, imageSize: { width: 2048, height: 991 } },
+      }, { documentId: 'document-50' })
+    } finally {
+      clearScreenshotMeta(50)
+    }
+  })
+
+  it('attaches the capture-time viewport CSS to a coordinate call when recorded', async () => {
+    const call: ToolCall = { id: 'tool-click-at-vp', name: 'browser_click_at', args: { x: 470, y: 370 } }
+    const chromeMock = mockChrome({ tab: { id: 51, url: 'https://app.example/' } })
+    recordScreenshotMeta(51, { width: 2048, height: 971 }, { width: 3840, height: 1820 }, { width: 1920, height: 1073 })
+    try {
+      await dispatchToolCall(call, 'auto', undefined, async () => 'approved')
+      expect(chromeMock.sendMessage).toHaveBeenCalledWith(51, {
+        type: 'DSH_ACTION',
+        action: 'browser_click_at',
+        args: {
+          x: 470,
+          y: 370,
+          imageSize: { width: 2048, height: 971 },
+          viewportCss: { width: 1920, height: 1073 },
+        },
+      }, { documentId: 'document-51' })
+    } finally {
+      clearScreenshotMeta(51)
+    }
   })
 
   it('routes a coordinate hover and drag without requiring a snapshot baseline', async () => {

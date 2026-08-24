@@ -225,3 +225,46 @@ describe('coordinate drag (browser_drag_at)', () => {
     expect(pointerMock!.sendMessage).not.toHaveBeenCalled()
   })
 })
+
+describe('coordinate conversion (browser_*_at with screenshot imageSize)', () => {
+  const originalWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth')
+  const originalHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight')
+
+  function setViewport(width: number, height: number): void {
+    Object.defineProperty(window, 'innerWidth', { value: width, configurable: true })
+    Object.defineProperty(window, 'innerHeight', { value: height, configurable: true })
+  }
+
+  afterEach(() => {
+    if (originalWidth !== undefined) Object.defineProperty(window, 'innerWidth', originalWidth)
+    if (originalHeight !== undefined) Object.defineProperty(window, 'innerHeight', originalHeight)
+  })
+
+  it('maps a screenshot pixel to the viewport CSS pixel before jittering', async () => {
+    // The model reads x=900,y=500 on a 2048x991 screenshot (imageSize) that was
+    // down-scaled from a 3840x1858 capture. The plugin must convert those
+    // screenshot pixels into viewport CSS px before the humanized jitter/curve.
+    setViewport(3840, 1858)
+    document.body.innerHTML = '<button style="position:absolute;top:1000px;left:1600px">目标</button>'
+    const ids = new ElementIds()
+    await runAction('browser_snapshot', {}, { ids, budget: BUDGET })
+
+    const pending = runAction('browser_click_at', {
+      x: 900,
+      y: 500,
+      imageSize: { width: 2048, height: 991 },
+    }, { ids, budget: BUDGET })
+    await vi.advanceTimersByTimeAsync(1_000)
+    const result = await pending
+
+    expect(result.text).toContain('Clicked at (900, 500)')
+    const plan = pointerMock!.captured[0]!
+    const press = plan.steps.find((step) => step.type === 'mousePressed')!
+    // cssX = 900 * (3840/2048) = 1687.5; cssY = 500 * (1858/991) ≈ 937.4. The
+    // jitter is only ±4px around that CSS point, so the press stays near it.
+    const cssX = 900 * (3840 / 2048)
+    const cssY = 500 * (1858 / 991)
+    expect(Math.abs(press.x - cssX)).toBeLessThanOrEqual(4)
+    expect(Math.abs(press.y - cssY)).toBeLessThanOrEqual(4)
+  })
+})

@@ -403,10 +403,11 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
 async function clickAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const x = coordArg(args, 'x')
   const y = coordArg(args, 'y')
-  // No element reference: click precisely at the viewport CSS-pixel (x, y) the
-  // model confirmed on a screenshot. The humanized plan perturbs the point by
-  // a few px (avoiding dead pixels) and the renderer synthesizes a real click.
-  await clickAt(x, y)
+  // The model reads (x, y) as pixels on a browser_screenshot image; the
+  // background attaches the image size so we can map them into viewport CSS
+  // pixels before the humanized plan (jitter + curve + CDP) runs.
+  const css = screenshotPointToCss(x, y, imageSizeArg(args), viewportCssArg(args))
+  await clickAt(css.x, css.y)
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(`Clicked at (${x}, ${y}).`, ctx)
 }
@@ -485,10 +486,11 @@ async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): 
 async function hoverAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const x = coordArg(args, 'x')
   const y = coordArg(args, 'y')
-  // No element reference: hover precisely at the viewport CSS-pixel (x, y) the
-  // model confirmed on a screenshot, so :hover/tooltips on a target that is not
-  // in the interactive inventory (e.g. a video card) still render.
-  await hoverAt(x, y)
+  // The model reads (x, y) as pixels on a browser_screenshot image; the
+  // background attaches the image size so we can map them into viewport CSS
+  // pixels before the humanized plan (jitter + curve) runs.
+  const css = screenshotPointToCss(x, y, imageSizeArg(args), viewportCssArg(args))
+  await hoverAt(css.x, css.y)
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(
     `Hovered at (${x}, ${y}). The pointer is now over that point; call browser_snapshot to read any hover effect.`,
@@ -516,10 +518,14 @@ async function dragAtAction(args: Record<string, unknown>, ctx: ActionContext): 
   const fromY = coordArg(args, 'fromY')
   const toX = coordArg(args, 'toX')
   const toY = coordArg(args, 'toY')
-  // No element reference: drag precisely between two viewport CSS-pixels the
-  // model confirmed on a screenshot, so a target outside the index snapshot
-  // (e.g. a video card) can still be dragged by its on-screen coordinates.
-  await dragAt(fromX, fromY, toX, toY)
+  // The model reads all four as pixels on a browser_screenshot image; the
+  // background attaches the image size so we can map them into viewport CSS
+  // pixels before the humanized drag plan runs.
+  const imageSize = imageSizeArg(args)
+  const viewportCss = viewportCssArg(args)
+  const from = screenshotPointToCss(fromX, fromY, imageSize, viewportCss)
+  const to = screenshotPointToCss(toX, toY, imageSize, viewportCss)
+  await dragAt(from.x, from.y, to.x, to.y)
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(`Dragged from (${fromX}, ${fromY}) to (${toX}, ${toY}).`, ctx)
 }
@@ -615,6 +621,68 @@ function numberArg(args: Record<string, unknown>, name: string): number {
   return value
 }
 
+/** A screenshot's model-visible pixel dimensions (the image the model reads coords from). */
+export interface ScreenshotImageSize {
+  width: number
+  height: number
+}
+
+/** The capture-time viewport CSS size (the real coordinate space the model maps to). */
+export interface ScreenshotViewportCss {
+  width: number
+  height: number
+}
+
+function isPositiveSize(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+/**
+ * Map a coordinate the model read from a browser_screenshot image back to a
+ * viewport CSS pixel.
+ *
+ * The screenshot image spans the whole viewport, so a point at fraction
+ * `x / imageWidth` of the image width is at CSS `x * (viewportWidth / imageWidth)`.
+ * `imageSize` is the size of the image the model actually read: the raw
+ * capture is down-scaled before it reaches the model, so this is the
+ * model-visible size, not the raw PNG.
+ *
+ * The viewport basis is, in order of preference: the capture-time `viewportCss`
+ * injected by the background (the pixel-true basis, because the PNG's aspect
+ * ratio need NOT match the CSS viewport — a 3840×1820 PNG can come from a
+ * ~1.79-ratio CSS viewport when a devicePixelRatio/scrollbar shift skews the
+ * capture area); else a live `window.innerWidth`/`innerHeight`; else the image
+ * size itself (identity scale). With no imageSize the point is returned
+ * unchanged (the coordinate is already in viewport CSS px), so callers that
+ * never take a screenshot keep their original behaviour.
+ */
+export function screenshotPointToCss(
+  x: number,
+  y: number,
+  imageSize?: ScreenshotImageSize,
+  viewportCss?: ScreenshotViewportCss,
+): { x: number; y: number } {
+  const iw = imageSize?.width
+  const ih = imageSize?.height
+  if (!isPositiveSize(iw) || !isPositiveSize(ih)) {
+    return { x, y }
+  }
+  const vw = isPositiveSize(viewportCss?.width)
+    ? viewportCss!.width
+    : (typeof window !== 'undefined' && isPositiveSize(window.innerWidth)
+      ? window.innerWidth
+      : iw)
+  const vh = isPositiveSize(viewportCss?.height)
+    ? viewportCss!.height
+    : (typeof window !== 'undefined' && isPositiveSize(window.innerHeight)
+      ? window.innerHeight
+      : ih)
+  return {
+    x: x * (vw / iw),
+    y: y * (vh / ih),
+  }
+}
+
 /** A viewport coordinate: any finite number (CSS pixels, signed allowed). */
 function coordArg(args: Record<string, unknown>, name: string): number {
   const value = args[name]
@@ -622,4 +690,22 @@ function coordArg(args: Record<string, unknown>, name: string): number {
     throw new ActionError('bad-args', `${name} must be a finite number; received ${String(value)}.`)
   }
   return value
+}
+
+/** Read the screenshot image size the background attached to a coordinate call (optional). */
+function imageSizeArg(args: Record<string, unknown>): ScreenshotImageSize | undefined {
+  const value = args.imageSize
+  if (typeof value !== 'object' || value === null) return undefined
+  const { width, height } = value as { width?: unknown; height?: unknown }
+  if (typeof width !== 'number' || !(width > 0) || typeof height !== 'number' || !(height > 0)) return undefined
+  return { width, height }
+}
+
+/** Read the capture-time CSS viewport the background attached to a coordinate call (optional). */
+function viewportCssArg(args: Record<string, unknown>): ScreenshotViewportCss | undefined {
+  const value = args.viewportCss
+  if (typeof value !== 'object' || value === null) return undefined
+  const { width, height } = value as { width?: unknown; height?: unknown }
+  if (typeof width !== 'number' || !(width > 0) || typeof height !== 'number' || !(height > 0)) return undefined
+  return { width, height }
 }

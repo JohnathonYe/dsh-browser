@@ -20,6 +20,7 @@ import {
 import { wrapUntrustedContent } from './untrusted.ts'
 import { approvalPromptForCall } from './authorization.ts'
 import { waitForNextDocumentReady } from './navigation.ts'
+import { getScreenshotMeta } from './screenshot-meta.ts'
 import type { ApprovalAuthorization, ApprovalPrompt } from '../security/approval.ts'
 
 /** A tool call from the bridge. */
@@ -58,6 +59,14 @@ const ACTION_DELTA_TOOLS = new Set([
   'browser_press',
   'browser_scroll',
   'browser_wait',
+])
+/** Coordinate tools that accept screenshot-image pixels and need the screenshot
+ * coordinate basis (imageSize) to map them into viewport CSS pixels before the
+ * humanized plan runs. */
+const ACTION_COORD_TOOLS = new Set([
+  'browser_click_at',
+  'browser_hover_at',
+  'browser_drag_at',
 ])
 const ACTION_DELTA_GUIDANCE = 'The page settled and its current changes are included below. Continue from this state; take another snapshot only when broader page context is needed.'
 const NAVIGATION_CANDIDATE_TOOLS = new Set([
@@ -111,10 +120,25 @@ async function sendAction(
   budget?: ContentBudget,
   includePageDelta: boolean = false,
 ): Promise<unknown> {
+  const args = withoutFrame(call.args)
+  // Coordinate tools read pixels from the latest screenshot; attach the
+  // model-visible image size (and the capture-time CSS viewport) so the content
+  // script can map them to CSS px. `viewportCss` is the pixel-true basis: the
+  // model-visible PNG's aspect ratio need not match the CSS viewport, so mapping
+  // by the PNG against a live `window.innerWidth` read at dispatch time drifts.
+  if (ACTION_COORD_TOOLS.has(call.name)) {
+    const meta = getScreenshotMeta(tabId)
+    if (meta !== undefined) {
+      args.imageSize = meta.imageSize
+      if (meta.viewportCss !== undefined) {
+        args.viewportCss = meta.viewportCss
+      }
+    }
+  }
   return chrome.tabs.sendMessage(tabId, {
     type: 'DSH_ACTION',
     action: call.name,
-    args: withoutFrame(call.args),
+    args,
     ...budget === undefined ? {} : { budget },
     ...includePageDelta ? { includePageDelta: true } : {},
   }, frame.documentId === undefined ? { frameId: frame.frameId } : { documentId: frame.documentId })

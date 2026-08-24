@@ -13,6 +13,7 @@ describe('registerBrowserTools', () => {
           return () => {}
         }),
       },
+      get: vi.fn(() => undefined),
     } as unknown as Context
     const requestTool = vi.fn(async (_name: string, _args: Record<string, unknown>, _signal: AbortSignal, _timeoutMs?: number): Promise<unknown> => {
       return { text: 'ok' }
@@ -248,5 +249,31 @@ describe('registerBrowserTools', () => {
     const tool = registered.find((r) => r.name === 'browser_click')!
     const output = tool.definition.output as { render: (args: unknown, value: unknown) => unknown }
     expect(output.render({}, { text: 'hello' })).toEqual([{ type: 'text', text: 'hello' }])
+  })
+
+  it('passes the screenshot coordinate metadata through to the model result', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    requestTool.mockResolvedValueOnce({
+      text: 'Captured the controlled tab.',
+      image: { mediaType: 'image/png', data: 'iVBORw0KGgo=' },
+      imageSize: { width: 2048, height: 991 },
+      originalDimensions: { width: 3840, height: 1858 },
+    })
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_screenshot')!
+    const exec = { signal: new AbortController().signal }
+    const result = await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({}, exec)
+    expect(requestTool).toHaveBeenCalledWith('browser_screenshot', {}, exec.signal, 1_000)
+    expect(result).toMatchObject({
+      text: 'Captured the controlled tab.',
+      image: { mediaType: 'image/png', data: 'iVBORw0KGgo=' },
+      imageSize: { width: 2048, height: 991 },
+      originalDimensions: { width: 3840, height: 1858 },
+    })
+    // The model-facing schema exposes the coordinate basis so the model knows
+    // it reads pixels from a down-scaled image (not the raw capture).
+    const output = tool.definition.output as { schema: { properties: Record<string, unknown> } }
+    expect(output.schema.properties.imageSize).toBeDefined()
+    expect(output.schema.properties.originalDimensions).toBeDefined()
   })
 })

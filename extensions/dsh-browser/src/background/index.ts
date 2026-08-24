@@ -42,6 +42,13 @@ import { dispatchToolCall, resetTabSnapshot, type ToolAnswer, type ToolCall } fr
 import { debuggerSession } from './debugger-session.ts'
 import { replayMouseSteps, type MouseStep } from './input.ts'
 import {
+  clearScreenshotMeta,
+  modelVisibleImageSize,
+  pngSizeFromBase64,
+  recordScreenshotMeta,
+  type ScreenshotViewportCss,
+} from './screenshot-meta.ts'
+import {
   isApprovalDecision,
   type ApprovalAuthorization,
   type ApprovalPrompt,
@@ -831,6 +838,59 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: s
   }
 }
 
+function isValidCssSize(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+/**
+ * Read the viewport's CSS size at the *screenshot capture* moment via CDP.
+ *
+ * `Page.getLayoutMetrics` returns the authoritative current CSS viewport in the
+ * same debugger context (and at the same moment) as `Page.captureScreenshot`, so
+ * its `cssVisualViewport`/`cssLayoutViewport` `clientWidth`/`clientHeight` are a
+ * pixel-true basis. That matters because `Page.captureScreenshot` fills the PNG
+ * at device-pixel resolution and its aspect ratio is NOT guaranteed to match the
+ * CSS viewport (a scrollbar shift or a `devicePixelRatio` skew), so mapping a
+ * model-visible point by the PNG width against a *different-time*
+ * `window.innerWidth` drifts. This helper prefers layout metrics, then falls back
+ * to a `Runtime.evaluate` read of `window.innerWidth`/`innerHeight`, and returns
+ * undefined (letting the content script read them live) when both fail.
+ *
+ * @param tabId - the controlled tab (must be attached to the debugger session).
+ * @returns the capture-time CSS viewport size, or undefined when unreadable.
+ */
+async function captureViewportCss(tabId: number): Promise<ScreenshotViewportCss | undefined> {
+  try {
+    const metrics = await debuggerSession.sendCommand<{
+      cssVisualViewport?: { clientWidth?: unknown; clientHeight?: unknown }
+      cssLayoutViewport?: { clientWidth?: unknown; clientHeight?: unknown }
+    }>(tabId, 'Page.getLayoutMetrics')
+    for (const candidate of [metrics?.cssVisualViewport, metrics?.cssLayoutViewport]) {
+      if (candidate !== undefined && isValidCssSize(candidate.clientWidth) && isValidCssSize(candidate.clientHeight)) {
+        return { width: candidate.clientWidth, height: candidate.clientHeight }
+      }
+    }
+  } catch {
+    // Layout metrics unavailable; try a live window read below.
+  }
+  try {
+    const evaluated = await debuggerSession.sendCommand<{
+      result?: { value?: { innerWidth?: unknown; innerHeight?: unknown } }
+    }>(tabId, 'Runtime.evaluate', {
+      expression: '({ innerWidth: window.innerWidth, innerHeight: window.innerHeight })',
+      returnByValue: true,
+    })
+    const value = evaluated?.result?.value
+    if (value !== undefined && isValidCssSize(value.innerWidth) && isValidCssSize(value.innerHeight)) {
+      return { width: value.innerWidth, height: value.innerHeight }
+    }
+  } catch {
+    // Both reads failed; leave viewportCss undefined so the content script falls
+    // back to a live `window.innerWidth` read at dispatch time.
+  }
+  return undefined
+}
+
 /**
  * 冷启动建组：无授权组时，为「带目标 URL 的浏览器操作」自动新开一个标签页并建成 DSH- 授权组。
  * 只对新建的 tab 建组授权，绝不触碰当前活动页；dsh 自身页（dsh-web / 扩展页）不是合法目标。
@@ -984,11 +1044,26 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
         return { ok: false, error: { code: 'content-unavailable', message: 'Screenshot capture returned no image data.' } }
       }
       const title = (await chrome.tabs.get(tabId).catch(() => null))?.title ?? ''
+      // Record the screenshot's coordinate basis so the `_at` tools can map the
+      // model-visible capture pixels back to viewport CSS pixels. The model
+      // reads coordinates in the down-scaled `imageSize`, not the raw PNG
+      // (`originalDimensions`), so both are exposed here. `viewportCss` is the
+      // capture-time CSS viewport (via `Page.getLayoutMetrics`, falling back to
+      // a `window.innerWidth` read) — the only pixel-true basis, because the
+      // PNG's aspect ratio need not match the CSS viewport.
+      const originalDimensions = pngSizeFromBase64(data)
+      const imageSize = originalDimensions === undefined ? undefined : modelVisibleImageSize(originalDimensions)
+      const viewportCss = await captureViewportCss(tabId)
+      if (tabId !== undefined && imageSize !== undefined && originalDimensions !== undefined) {
+        recordScreenshotMeta(tabId, imageSize, originalDimensions, viewportCss)
+      }
       return {
         ok: true,
         result: {
           text: title === '' ? 'Captured the controlled tab.' : `Captured ${title}.`,
           image: { mediaType: 'image/png', data },
+          ...imageSize === undefined ? {} : { imageSize },
+          ...originalDimensions === undefined ? {} : { originalDimensions },
         },
       }
     } catch (error: unknown) {
@@ -1534,6 +1609,7 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void affinityReady.then(() => {
+    clearScreenshotMeta(tabId)
     // 组内单个 tab 关闭也必须同步撤销对应授权：即便旧亲和机制（tabAffinity）已
     // 弃用且 `tabAffinity.removeTab` 返回 false，也不能因此跳过授权清理，否则被
     // 关闭的 tab 会残留在授权组里，AI 拿到的授权/信息不准确。授权移除要放在
