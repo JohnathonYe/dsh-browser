@@ -8,6 +8,10 @@ const POLICY: PageSettlePolicy = {
   quietMs: 20,
   maxAfterReadyMs: 60,
   timeoutMs: 100,
+  // Absolute watchdog ceiling; larger than the post-readiness cap (60) and the
+  // not-ready timeout (100), so the fake-timer advancement windows below never
+  // reach it and the existing assertions stay valid.
+  maxSettleMs: 500,
 }
 
 afterEach(() => {
@@ -59,6 +63,30 @@ describe('waitForPageSettled', () => {
 
     await vi.advanceTimersByTimeAsync(60)
     clearInterval(mutations)
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(pending).resolves.toBe(true)
+  })
+
+  it('returns the current state when the absolute watchdog ceiling is reached', async () => {
+    // A policy whose normal escapes (quiet/maxAfterReady/timeout) all sit far
+    // above the watchdog so only the absolute ceiling can resolve it. This
+    // guards against a continuously-mutating page that keeps re-scheduling the
+    // quiet check and would otherwise hold the tool until the host budget.
+    vi.useFakeTimers()
+    vi.spyOn(document, 'readyState', 'get').mockReturnValue('complete')
+    const WATCHDOG_POLICY: PageSettlePolicy = {
+      minimumMs: 10_000,
+      quietMs: 10_000,
+      maxAfterReadyMs: 10_000,
+      timeoutMs: 10_000,
+      maxSettleMs: 40,
+    }
+    const pending = waitForPageSettled(WATCHDOG_POLICY)
+
+    await vi.advanceTimersByTimeAsync(39)
+    // Still pending: the quiet window has not even begun and the watchdog is
+    // the only escape still in the future.
+    await expect(Promise.race([pending, Promise.resolve('pending')])).resolves.toBe('pending')
     await vi.advanceTimersByTimeAsync(1)
     await expect(pending).resolves.toBe(true)
   })

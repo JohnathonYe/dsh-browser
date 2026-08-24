@@ -611,9 +611,9 @@ function affinityFailure(kind: 'lost' | 'missing'): ToolAnswer {
   return { ok: false, error: { code: 'no-active-tab', message: 'No active tab is available for browser operations.' } }
 }
 
-/** 无授权组时的引导错误：绝不把当前活动页复用/自建/导航为受控目标，指引 AI 走 browser_new_tab 开目标页。 */
+/** 无授权组时的引导错误：绝不把当前活动页复用/自建/导航为受控目标，指引 AI 先打开一个目标页（browser_navigate / browser_new_tab）再操作。 */
 function noAuthGroupError(): ToolAnswer {
-  return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Open a target tab first with browser_new_tab (a real URL), or authorize a group in the side panel.' } }
+  return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Open a target page first with browser_navigate or browser_new_tab (a real URL), or authorize a group in the side panel.' } }
 }
 
 /** 解析为不含 scheme 的 "host:port" 标识；非 http(s)/ws(s) 返回 null。 */
@@ -831,6 +831,62 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: s
   }
 }
 
+/**
+ * 冷启动建组：无授权组时，为「带目标 URL 的浏览器操作」自动新开一个标签页并建成 DSH- 授权组。
+ * 只对新建的 tab 建组授权，绝不触碰当前活动页；dsh 自身页（dsh-web / 扩展页）不是合法目标。
+ * @returns 成功时返回新开的 tab 与其 groupId；否则返回 ToolAnswer 错误。
+ */
+async function openColdStartAuthorizedTab(url: string): Promise<{ tab: chrome.tabs.Tab; groupId: number } | ToolAnswer> {
+  // dsh 自身页（dsh-web / 扩展页）绝不能成为受控目标。
+  if (isDshOwnPage(url)) {
+    return { ok: false, error: { code: 'no-active-tab', message: 'The target URL is a dsh page and cannot be an authorized target. Open a real third-party URL instead.' } }
+  }
+  if (!isTargetableHttpUrl(url)) {
+    return { ok: false, error: { code: 'no-active-tab', message: 'Open a real http(s) URL to start a new authorized target.' } }
+  }
+  if (!tabAuthorization.mayOpenTab()) {
+    return { ok: false, error: { code: 'action-failed', message: 'Open-tab policy is "ask"; switch it to allow in the panel, or allow once here.' } }
+  }
+  const tab = await chrome.tabs.create({ url, active: false }).catch(() => null)
+  if (tab === null || tab.id === undefined) {
+    return { ok: false, error: { code: 'action-failed', message: 'Could not open a new tab.' } }
+  }
+  const groupId = await chrome.tabs.group({ tabIds: [tab.id] }).catch(() => -1)
+  if (groupId < 0) {
+    return { ok: false, error: { code: 'action-failed', message: 'Could not group the new tab into a DSH- group.' } }
+  }
+  const shown = normalizeGroupTitle('AI')
+  await chrome.tabGroups.update(groupId, { title: shown }).catch(() => {})
+  tabAuthorization.authorizeGroup(groupId, shown, [tab.id])
+  tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
+  persistTabAuthorization()
+  broadcastTabAuthorization()
+  return { tab, groupId }
+}
+
+/**
+ * 冷启动导航：无授权组时，带目标 URL 的 browser_navigate 自动新开一个标签页打开该 URL，
+ * 并把它建成 DSH- 授权组后直接返回成功（新 tab 已被授权，可直接被后续 browser_* 使用）。
+ * 绝不触碰当前活动页，也绝不对 dsh 页建组。
+ */
+async function coldStartNavigate(call: ToolCall): Promise<ToolAnswer> {
+  await authorizationReady
+  const url = typeof (call.args as { url?: unknown })?.url === 'string'
+    ? (call.args as { url?: unknown }).url as string
+    : undefined
+  if (url === undefined) {
+    return noAuthGroupError()
+  }
+  const opened = await openColdStartAuthorizedTab(url)
+  if ('ok' in opened) return opened
+  return {
+    ok: true,
+    result: {
+      text: `Opened ${url} in a new authorized tab (id ${opened.tab.id}) and navigated it. Call browser_snapshot again after the page loads.`,
+    },
+  }
+}
+
 /** Run the authorization-level browser tools (list/switch/new tab) without content-script dispatch. */
 async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
   await authorizationReady
@@ -867,35 +923,28 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     if (url !== undefined && isDshOwnPage(url)) {
       return { ok: false, error: { code: 'no-active-tab', message: 'The target URL is a dsh page and cannot be an authorized target. Open a real third-party URL instead.' } }
     }
-    // 冷启动：完全没有任何授权组时，仅当 AI 明确打开一个真实 http(s) 目标时才建组
-    // （这正是「打开目标 tab」路径，绝不把 dsh-web / 扩展页作为目标）。
-    const hasRealUrl = url !== undefined && isTargetableHttpUrl(url)
-    if (groups.length === 0 && !hasRealUrl) {
-      return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Open a real URL, or authorize a group in the panel first.' } }
+    if (groups.length === 0) {
+      // 冷启动建组：仅当 AI 明确打开一个真实 http(s) 目标时才建组（这正是「打开目标 tab」路径）。
+      const hasRealUrl = url !== undefined && isTargetableHttpUrl(url)
+      if (!hasRealUrl) {
+        return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Open a real URL, or authorize a group in the panel first.' } }
+      }
+      const opened = await openColdStartAuthorizedTab(url!)
+      if ('ok' in opened) return opened
+      return { ok: true, result: { text: `Opened a new tab (id ${opened.tab.id}) in a new DSH- group.` } }
     }
     if (!tabAuthorization.mayOpenTab()) {
       return { ok: false, error: { code: 'action-failed', message: 'Open-tab policy is "ask"; switch it to allow in the panel, or allow once here.' } }
     }
     const tab = await chrome.tabs.create({ url: url || 'about:blank', active: false }).catch(() => null)
     if (tab && tab.id !== undefined) {
-      if (groups.length > 0) {
-        const groupId = groups[groups.length - 1].groupId
-        await chrome.tabs.group({ tabIds: [tab.id], groupId }).catch(() => {})
-        tabAuthorization.addTabsToGroup(groupId, [tab.id])
-      } else {
-        // 冷启动建组：把 AI 明确打开的真实目标 tab 直接建成 DSH- 授权组。
-        const groupId = await chrome.tabs.group({ tabIds: [tab.id] }).catch(() => -1)
-        if (groupId < 0) {
-          return { ok: false, error: { code: 'action-failed', message: 'Could not group the new tab into a DSH- group.' } }
-        }
-        const shown = normalizeGroupTitle('AI')
-        await chrome.tabGroups.update(groupId, { title: shown }).catch(() => {})
-        tabAuthorization.authorizeGroup(groupId, shown, [tab.id])
-      }
+      const groupId = groups[groups.length - 1].groupId
+      await chrome.tabs.group({ tabIds: [tab.id], groupId }).catch(() => {})
+      tabAuthorization.addTabsToGroup(groupId, [tab.id])
       tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
       persistTabAuthorization()
       broadcastTabAuthorization()
-      return { ok: true, result: { text: `Opened a new tab (id ${tab.id})${groups.length > 0 ? ` in group ${groups[groups.length - 1].groupId}` : ' in a new DSH- group'}.` } }
+      return { ok: true, result: { text: `Opened a new tab (id ${tab.id}) in group ${groupId}.` } }
     }
     return { ok: false, error: { code: 'action-failed', message: 'Could not open a new tab.' } }
   }
@@ -984,14 +1033,18 @@ function routeToolCall(call: ToolCall): void {
   const budget = caps === null
     ? undefined
     : { maxItems: caps.maxInteractiveItems, maxChars: caps.snapshotMaxChars }
-  // 无授权组时，绝不把当前活动页复用/导航/建组：唯一冷启动自建路径是 browser_new_tab。
-  // 其余 browser_* 工具在下方直接返回「请先打开目标标签页」引导，避免劫持用户当前页（尤其 dsh-web）。
+  // 无授权组时，绝不把当前活动页复用/导航/建组。带目标 URL 的 browser_navigate 走冷启动自建
+  //（自动新开 tab 建组授权）；其余 browser_* 工具在下方直接返回「请先打开目标页」引导，避免劫持用户当前页（尤其 dsh-web）。
   const hasAuthGroups = tabAuthorization.snapshot().groups.length > 0
-  const resolveTarget = hasAuthGroups ? resolveAuthorizedTab() : Promise.resolve(noAuthGroupError())
+  const resolveTarget = hasAuthGroups
+    ? resolveAuthorizedTab()
+    : call.name === 'browser_navigate'
+      ? coldStartNavigate(call)
+      : Promise.resolve(noAuthGroupError())
   void resolveTarget.then(async (target) => {
     if ('ok' in target) return target
-    // 只有 hasAuthGroups 为 true 才可能解析出 tab（否则上面已直接返回引导错误），
-    // 因此后续按授权组操作，不存在冷启动自建分支。
+    // 到达这里说明 hasAuthGroups 为 true，resolveAuthorizedTab() 解析到了受控 tab，
+    // 按授权组 dispatch；冷启动导航分支只会返回成功/错误 ToolAnswer，不会走到这里。
     const authorized = tabAuthorization.snapshot().groups.length > 0
     return dispatchToolCall(
       call,

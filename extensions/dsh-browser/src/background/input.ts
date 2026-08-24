@@ -18,8 +18,28 @@
 
 import { debuggerSession } from './debugger-session.ts'
 
+/** Cap (ms) for `chrome.debugger.attach` before the caller falls back to synthetic input. */
+const CDP_ATTACH_TIMEOUT_MS = 3_000
+/** Cap (ms) for one `Input.dispatchMouseEvent` round-trip. */
+const CDP_STEP_TIMEOUT_MS = 2_000
+/** Whole replay budget (ms); past this we stop dispatching and report failure. */
+const CDP_REPLAY_BUDGET_MS = 5_000
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms) })
+}
+
+/** Reject after `ms` without abandoning the underlying promise. */
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<T>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms)
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
 }
 
 /** One absolute mouse input step, in CSS pixels relative to the viewport. */
@@ -77,15 +97,31 @@ function toDispatchParams(step: MouseStep): Record<string, unknown> {
 export async function replayMouseSteps(tabId: number, steps: MouseStep[]): Promise<void> {
   // If attach fails (protected page, DevTools holds the target), we never hold
   // a reference, so there is nothing to release; the error propagates and the
-  // caller falls back to synthetic events.
-  await debuggerSession.acquire(tabId)
+  // caller falls back to synthetic events. If attach times out we also skip
+  // release so we never detach a debugger we did not acquire.
+  let acquired = false
   try {
+    await withTimeout(
+      debuggerSession.acquire(tabId),
+      CDP_ATTACH_TIMEOUT_MS,
+      'CDP attach timed out',
+    )
+    acquired = true
+    const deadline = Date.now() + CDP_REPLAY_BUDGET_MS
     for (const step of steps) {
-      await debuggerSession.sendCommand(tabId, 'Input.dispatchMouseEvent', toDispatchParams(step))
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error('CDP mouse replay budget exceeded')
+      await withTimeout(
+        debuggerSession.sendCommand(tabId, 'Input.dispatchMouseEvent', toDispatchParams(step)),
+        Math.min(remaining, CDP_STEP_TIMEOUT_MS),
+        'CDP mouse dispatch timed out',
+      )
       const pause = step.pauseAfterMs ?? 0
-      if (pause > 0) await sleep(pause)
+      if (pause > 0) await sleep(Math.min(pause, remaining))
     }
   } finally {
-    await debuggerSession.release(tabId)
+    if (acquired) {
+      await debuggerSession.release(tabId).catch(() => {})
+    }
   }
 }

@@ -187,7 +187,9 @@ describe('background bridge lifecycle', () => {
     socket.open()
     await Promise.resolve()
     socket.receive({ t: 'hello.ok', caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 } })
-    await Promise.resolve()
+    // Let the budget push (DSH_BUDGET) flush to the tab before we start observing.
+    await vi.waitFor(() => { expect(chrome.tabs.sendMessage).toHaveBeenCalled() })
+    vi.mocked(chrome.tabs.sendMessage).mockClear()
 
     socket.receive({
       t: 'tool.call',
@@ -200,14 +202,19 @@ describe('background bridge lifecycle', () => {
     await vi.waitFor(() => {
       expect(sent.some((s) => s.includes('tool.result'))).toBe(true)
     })
-    const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean; error?: { code?: string } })
+    const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean; error?: { code?: string }; result?: { text?: string } })
       .find((f) => f.t === 'tool.result')!
-    // dsh-web is not an operable target: refuse and go to the open-a-target path.
-    expect(sentFrame).toMatchObject({ t: 'tool.result', ok: false, error: { code: 'no-active-tab' } })
-    expect(chrome.tabs.group).not.toHaveBeenCalled()
+    // dsh-web must never become an authorized target: navigate auto-opens a FRESH tab instead,
+    // so the current dsh page is neither grouped nor navigated away.
+    expect(chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://news.baidu.com' }))
+    // The group is built on the NEW tab (id 42), never on the dsh-web tab (id 1).
+    expect(chrome.tabs.group).toHaveBeenCalledWith({ tabIds: [42] })
+    expect(chrome.tabs.group).not.toHaveBeenCalledWith({ tabIds: [1] })
+    expect(chrome.tabGroups.update).toHaveBeenCalledWith(1, { title: 'DSH-AI' })
+    expect(sentFrame).toMatchObject({ t: 'tool.result', ok: true })
   })
 
-  it('never self-groups/navigates the current regular page on browser_navigate when no group exists', async () => {
+  it('auto-opens a fresh tab for browser_navigate when no group exists, never the current page', async () => {
     mockChrome()
     // The active page is a real third-party page (NOT dsh-web): the worst case for the old bug,
     // where the current page was bound into DSH-AI and then navigated away from the user.
@@ -245,15 +252,108 @@ describe('background bridge lifecycle', () => {
     await vi.waitFor(() => {
       expect(sent.some((s) => s.includes('tool.result'))).toBe(true)
     })
+    const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean; result?: { text?: string } })
+      .find((f) => f.t === 'tool.result')!
+    // A brand-new tab is opened (id 42); the group is built on THAT new tab, never the current page (id 1).
+    expect(chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://news.baidu.com' }))
+    expect(chrome.tabs.group).toHaveBeenCalledWith({ tabIds: [42] })
+    expect(chrome.tabs.group).not.toHaveBeenCalledWith({ tabIds: [1] })
+    expect(chrome.tabGroups.update).toHaveBeenCalledWith(1, { title: 'DSH-AI' })
+    // The current page must never be navigated: no content-script dispatch reached tab 1.
+    expect(chrome.tabs.sendMessage).not.toHaveBeenCalled()
+    expect(sentFrame).toMatchObject({ t: 'tool.result', ok: true })
+    expect(sentFrame.result!.text).toContain('new authorized tab (id 42)')
+  })
+
+  it('still guides to open a target page for URL-less browser ops when no group exists', async () => {
+    mockChrome()
+    // The active page is a real third-party page; it must stay untouched.
+    vi.mocked(chrome.tabs.query).mockResolvedValue([
+      { id: 1, windowId: 1, title: 'Example', url: 'https://example.com/' } as chrome.tabs.Tab,
+    ])
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+
+    const socket = FakeWebSocket.instances[0]!
+    const sent: string[] = []
+    socket.send = vi.fn((frame?: string) => { if (frame) sent.push(frame) }) as unknown as typeof socket.send
+    socket.open()
+    await Promise.resolve()
+    socket.receive({ t: 'hello.ok', caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 } })
+    // Let the budget push (DSH_BUDGET) flush to the tab before we start observing.
+    await vi.waitFor(() => { expect(chrome.tabs.sendMessage).toHaveBeenCalled() })
+    vi.mocked(chrome.tabs.sendMessage).mockClear()
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'click1',
+      name: 'browser_click',
+      args: { index: 5 },
+      expiresAt: Date.now() + 90_000,
+      sessionId: 's1',
+    })
+    await vi.waitFor(() => {
+      expect(sent.some((s) => s.includes('tool.result'))).toBe(true)
+    })
     const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean; error?: { code?: string; message?: string } })
       .find((f) => f.t === 'tool.result')!
-    // No auth group: the current page must never be grouped (the old hijack is gone).
+    // No auth group: a URL-less op cannot auto-open a page, so it must NOT create/group a tab
+    // and must NOT dispatch onto the current page (no hijack).
+    expect(chrome.tabs.create).not.toHaveBeenCalled()
     expect(chrome.tabs.group).not.toHaveBeenCalled()
-    // Nor is it navigated: no content-script dispatch reached the tab.
     expect(chrome.tabs.sendMessage).not.toHaveBeenCalled()
-    // Guidance points the AI to browser_new_tab instead of reusing the current page.
     expect(sentFrame).toMatchObject({ t: 'tool.result', ok: false, error: { code: 'no-active-tab' } })
-    expect(sentFrame.error!.message).toContain('browser_new_tab')
+    // Wording points the AI to open a target page first.
+    expect(sentFrame.error!.message).toContain('Open a target page')
+  })
+
+  it('rejects browser_navigate to a dsh page URL when no group exists', async () => {
+    mockChrome()
+    // The active page is a normal third-party page; the target is the dsh host itself.
+    vi.mocked(chrome.tabs.query).mockResolvedValue([
+      { id: 1, windowId: 1, title: 'Example', url: 'https://example.com/' } as chrome.tabs.Tab,
+    ])
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+
+    const socket = FakeWebSocket.instances[0]!
+    const sent: string[] = []
+    socket.send = vi.fn((frame?: string) => { if (frame) sent.push(frame) }) as unknown as typeof socket.send
+    socket.open()
+    await Promise.resolve()
+    socket.receive({ t: 'hello.ok', caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 } })
+    // Let the budget push (DSH_BUDGET) flush to establish the bridge origin.
+    await vi.waitFor(() => { expect(chrome.tabs.sendMessage).toHaveBeenCalled() })
+    vi.mocked(chrome.tabs.sendMessage).mockClear()
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'navd',
+      name: 'browser_navigate',
+      args: { url: 'http://127.0.0.1:3080/' },
+      expiresAt: Date.now() + 90_000,
+      sessionId: 's1',
+    })
+    await vi.waitFor(() => {
+      expect(sent.some((s) => s.includes('tool.result'))).toBe(true)
+    })
+    const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean; error?: { code?: string; message?: string } })
+      .find((f) => f.t === 'tool.result')!
+    // A dsh page can never become an authorized target or be navigated: refuse without opening a tab.
+    expect(chrome.tabs.create).not.toHaveBeenCalled()
+    expect(chrome.tabs.group).not.toHaveBeenCalled()
+    expect(sentFrame).toMatchObject({ t: 'tool.result', ok: false, error: { code: 'no-active-tab' } })
+    expect(sentFrame.error!.message).toContain('dsh page')
   })
 
   it('cold-start builds a fresh DSH- group from browser_new_tab, never the current page', async () => {

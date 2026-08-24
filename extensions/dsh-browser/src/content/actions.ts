@@ -44,14 +44,23 @@ export interface PageSettlePolicy {
   maxAfterReadyMs: number
   /** Hard cap while waiting for document readiness. */
   timeoutMs: number
+  /** Absolute ceiling on the whole settle wait, independent of the observer.
+   *  Guards against a page whose mutations keep re-scheduling the quiet check
+   *  so no timer ever observes the `maxAfterReadyMs`/`timeoutMs` escapes; the
+   *  wait returns the current state instead of holding until the host tool
+   *  budget (90s) expires. */
+  maxSettleMs: number
 }
 
-const TYPE_SETTLE: PageSettlePolicy = { minimumMs: 32, quietMs: 32, maxAfterReadyMs: 100, timeoutMs: 5_000 }
-const ACTION_SETTLE: PageSettlePolicy = { minimumMs: 100, quietMs: 50, maxAfterReadyMs: 250, timeoutMs: 5_000 }
-const SCROLL_SETTLE: PageSettlePolicy = { minimumMs: 50, quietMs: 50, maxAfterReadyMs: 150, timeoutMs: 5_000 }
-const EXPLICIT_WAIT_SETTLE: PageSettlePolicy = { minimumMs: 100, quietMs: 100, maxAfterReadyMs: 1_000, timeoutMs: 5_000 }
+const TYPE_SETTLE: PageSettlePolicy = { minimumMs: 32, quietMs: 32, maxAfterReadyMs: 100, timeoutMs: 5_000, maxSettleMs: 12_000 }
+const ACTION_SETTLE: PageSettlePolicy = { minimumMs: 100, quietMs: 50, maxAfterReadyMs: 250, timeoutMs: 5_000, maxSettleMs: 12_000 }
+const SCROLL_SETTLE: PageSettlePolicy = { minimumMs: 50, quietMs: 50, maxAfterReadyMs: 150, timeoutMs: 5_000, maxSettleMs: 12_000 }
+const EXPLICIT_WAIT_SETTLE: PageSettlePolicy = { minimumMs: 100, quietMs: 100, maxAfterReadyMs: 1_000, timeoutMs: 5_000, maxSettleMs: 12_000 }
 /** Keep automatic action context focused while preserving the negotiated full snapshot budget. */
 const ACTION_DELTA_MAX_CHARS = 4_000
+
+/** Runtime fallback ceiling for a policy built without an explicit maxSettleMs. */
+const DEFAULT_MAX_SETTLE_MS = 12_000
 
 /**
  * Wait for document readiness and a mutation-free window. The old fixed delay
@@ -69,10 +78,18 @@ export function waitForPageSettled(policy: PageSettlePolicy = ACTION_SETTLE): Pr
   let observer: MutationObserver | undefined
 
   return new Promise((resolve) => {
+    // An absolute watchdog that is NOT clearable by `schedule`. The observer
+    // re-schedules `check` on every mutation, which on a continuously-updating
+    // page (an infinite feed, an animated dashboard) can keep `check` from ever
+    // observing the `maxAfterReadyMs`/`timeoutMs` escapes, stalling the action
+    // until the host tool budget. This timer is independent, so it always fires
+    // and returns the current state instead of spinning to the 90s cap.
+    let watchdog: ReturnType<typeof setTimeout> | undefined
     const finish = (settled: boolean): void => {
       if (finished) return
       finished = true
       if (timer !== undefined) clearTimeout(timer)
+      if (watchdog !== undefined) clearTimeout(watchdog)
       observer?.disconnect()
       document.removeEventListener('readystatechange', schedule)
       window.removeEventListener('load', schedule)
@@ -126,6 +143,7 @@ export function waitForPageSettled(policy: PageSettlePolicy = ACTION_SETTLE): Pr
     document.addEventListener('readystatechange', schedule)
     window.addEventListener('load', schedule)
     schedule()
+    watchdog = setTimeout(() => finish(true), policy.maxSettleMs ?? DEFAULT_MAX_SETTLE_MS)
   })
 }
 
