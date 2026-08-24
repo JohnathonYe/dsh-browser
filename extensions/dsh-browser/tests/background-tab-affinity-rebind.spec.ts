@@ -82,6 +82,8 @@ function mockChrome() {
       onUpdated: chromeEvent<[number, chrome.tabs.TabChangeInfo, chrome.tabs.Tab]>(),
       onReplaced: chromeEvent<[number, number]>(),
       onRemoved: chromeEvent<[number]>(),
+      onCreated: chromeEvent<[chrome.tabs.Tab]>(),
+      onDetached: chromeEvent<[number]>(),
     },
     windows: {
       WINDOW_ID_NONE: -1,

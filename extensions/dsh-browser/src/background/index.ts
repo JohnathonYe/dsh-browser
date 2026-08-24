@@ -384,22 +384,6 @@ function persistTabAffinity(): void {
   })
 }
 
-function observeActiveSummary(summary: AffinityTab): void {
-  const previousStatus = tabAffinity.snapshot().status
-  if (!tabAffinity.observeActive(summary)) return
-  if (previousStatus !== 'handoff' && tabAffinity.snapshot().status === 'handoff') {
-    activeFollowRefresh?.abort()
-    cancelPendingApprovals()
-  }
-  persistTabAffinity()
-  broadcastTabAffinity()
-}
-
-function observeActiveTab(tab: chrome.tabs.Tab): void {
-  const summary = summarizeTab(tab)
-  if (summary !== null) observeActiveSummary(summary)
-}
-
 async function syncActiveTab(windowId?: number, signal?: AbortSignal): Promise<chrome.tabs.Tab | undefined> {
   const queryRevision = focusedWindow.beginQuery()
   const query = windowId === undefined
@@ -412,7 +396,6 @@ async function syncActiveTab(windowId?: number, signal?: AbortSignal): Promise<c
     if (tab === undefined) return undefined
     if (!focusedWindow.commitQuery(tab.windowId, queryRevision)) return undefined
     if (signal !== undefined) throwIfRebindAborted(signal)
-    observeActiveTab(tab)
     return tab
   } catch {
     if (signal !== undefined && signal.aborted) throw rebindAbortReason(signal)
@@ -421,48 +404,9 @@ async function syncActiveTab(windowId?: number, signal?: AbortSignal): Promise<c
 }
 
 async function restoreTabAffinity(): Promise<void> {
-  let record: StoredTabAffinity | null = null
-  try {
-    const stored = await chrome.storage.session.get(TAB_AFFINITY_STORAGE_KEY)
-    const candidate = stored[TAB_AFFINITY_STORAGE_KEY] as Partial<StoredTabAffinity> | undefined
-    const controlledTabId = (candidate as { controlledTabId?: unknown } | undefined)?.controlledTabId
-    if (typeof controlledTabId === 'number' && Number.isInteger(controlledTabId) && controlledTabId >= 0) {
-      const keptActiveTabId = (candidate as { keptActiveTabId?: unknown }).keptActiveTabId
-      record = {
-        controlledTabId,
-        ...(typeof keptActiveTabId === 'number' && Number.isInteger(keptActiveTabId) && keptActiveTabId >= 0
-          ? { keptActiveTabId }
-          : {}),
-      }
-    } else if ((candidate as { lost?: unknown } | undefined)?.lost === true) {
-      record = { lost: true }
-    }
-    lastPersistedAffinity = candidate === undefined || record !== null
-      ? JSON.stringify(record)
-      : undefined
-  } catch {
-    // Session storage is a survival aid, not a reason to disable the bridge.
-  }
-
-  if (record !== null && 'controlledTabId' in record) {
-    try {
-      const controlled = summarizeTab(await chrome.tabs.get(record.controlledTabId))
-      if (controlled === null) tabAffinity.restoreLost()
-      else tabAffinity.restoreControlled(controlled)
-    } catch {
-      tabAffinity.restoreLost()
-    }
-  } else if (record?.lost === true) {
-    tabAffinity.restoreLost()
-  }
-
+  // 跟随页面的绑定机制已废弃：不再从会话存储恢复受控 tab / lost 状态。affinity 保持
+  // unbound，面板也不会因此弹出「跟随当前页」提示；浏览器操作只按授权组驱动。
   await syncActiveTab()
-  if (record !== null && 'keptActiveTabId' in record) {
-    const state = tabAffinity.snapshot()
-    if (state.status === 'handoff' && state.active?.tabId === record.keptActiveTabId) {
-      tabAffinity.decide('keep', state.revision)
-    }
-  }
   persistTabAffinity()
   broadcastTabAffinity()
 }
@@ -557,31 +501,14 @@ async function resolveAuthorizedTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url
   }
 }
 
-/** Bind at prompt submission so a switch while the model is thinking is visible. */
+/** 跟随页面的绑定能力已废弃：浏览器操作只按授权组 / 冷启动自建组驱动，不再把某个
+ * tab 当作「要跟随的当前页」。返回 true 让 session.prompt 照常放行。 */
 async function ensureInitialTabBinding(): Promise<boolean> {
   await affinityReady
-  if (tabAffinity.resolveTarget().kind !== 'initial') return true
-  try {
-    const tab = await syncActiveTab()
-    const summary = tab === undefined ? null : summarizeTab(tab)
-    if (summary === null) return false
-    if (tabAffinity.bindInitial(summary)) {
-      persistTabAffinity()
-      broadcastTabAffinity()
-    }
-    return true
-  } catch {
-    return false
-  }
+  return true
 }
 
-function affinityFailure(kind: 'handoff' | 'lost' | 'missing'): ToolAnswer {
-  if (kind === 'handoff') {
-    return {
-      ok: false,
-      error: { code: 'action-failed', message: 'The user switched tabs, so browser operations are paused. In the side panel, choose whether to keep the previous page or follow the current page.' },
-    }
-  }
+function affinityFailure(kind: 'lost' | 'missing'): ToolAnswer {
   if (kind === 'lost') {
     return {
       ok: false,
@@ -591,36 +518,19 @@ function affinityFailure(kind: 'handoff' | 'lost' | 'missing'): ToolAnswer {
   return { ok: false, error: { code: 'no-active-tab', message: 'No active tab is available for browser operations.' } }
 }
 
-/** Resolve one stable tab target without allowing a manual switch to drift it. */
+/** Resolve one stable tool tab. 无授权组时直接取当前活动页作为冷启动目标；不再借用
+ * affinity 的「跟随当前页 / keep-follow」绑定。用户切 tab 不再让操作暂停，也不弹
+ * 提示。后续由 routeToolCall 的冷启动逻辑把该 tab 建成 DSH- 授权组，从而进入
+ * 「只按授权组」的语义。 */
 async function resolveToolTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'> | ToolAnswer> {
-  await affinityReady
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const resolution = tabAffinity.resolveTarget()
-    if (resolution.kind === 'handoff') return affinityFailure('handoff')
-    if (resolution.kind === 'lost') return affinityFailure('lost')
-    if (resolution.kind === 'initial') {
-      if (!await ensureInitialTabBinding()) return affinityFailure('missing')
-      continue
-    }
-    try {
-      const tab = await chrome.tabs.get(resolution.tab.tabId)
-      const summary = summarizeTab(tab)
-      if (summary === null) return affinityFailure('missing')
-      if (tabAffinity.observeTab(summary)) broadcastTabAffinity()
-      const current = tabAffinity.resolveTarget()
-      if (current.kind === 'handoff') return affinityFailure('handoff')
-      if (current.kind === 'lost') return affinityFailure('lost')
-      if (current.kind === 'target' && current.tab.tabId === summary.tabId) return tab
-    } catch {
-      if (tabAffinity.removeTab(resolution.tab.tabId)) {
-        cancelPendingApprovals()
-        persistTabAffinity()
-        broadcastTabAffinity()
-      }
-      return affinityFailure('lost')
-    }
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    if (tab === undefined || tab.id === undefined) return affinityFailure('missing')
+    if (summarizeTab(tab) === null) return affinityFailure('missing')
+    return tab
+  } catch {
+    return affinityFailure('missing')
   }
-  return affinityFailure('handoff')
 }
 
 async function authorizeToolCall(
@@ -907,20 +817,33 @@ function routeToolCall(call: ToolCall): void {
   const budget = caps === null
     ? undefined
     : { maxItems: caps.maxInteractiveItems, maxChars: caps.snapshotMaxChars }
-  const authGroups = tabAuthorization.snapshot().groups
-  const resolveTarget = authGroups.length > 0 ? resolveAuthorizedTab() : resolveToolTab()
-  void resolveTarget.then((target) => 'ok' in target
-    ? target
-    : dispatchToolCall(
-        call,
-        authGroups.length > 0 ? 'auto' : settings.sharePageContent,
-        budget,
-        async (prompt) => authGroups.length > 0 ? 'approved' : authorizeToolCall(prompt, controller.signal, target.windowId, call.sessionId),
-        controller.signal,
-        target,
-        () => target.id !== undefined
-          && (authGroups.length > 0 ? tabAuthorization.isAuthorizedTab(target.id) : tabAffinity.allowsTarget(target.id)),
-      )).then(
+  const resolveTarget = tabAuthorization.snapshot().groups.length > 0 ? resolveAuthorizedTab() : resolveToolTab()
+  void resolveTarget.then(async (target) => {
+    if ('ok' in target) return target
+    // 冷启动授权：完全没有任何授权组时，允许 AI 把本次操作的 tab 自动建成 DSH- 组并授权；
+    // 这样 AI 从零开始也能自己创建授权组。一旦已有授权组，就不再自动乱建（守住授权边界）。
+    if (tabAuthorization.snapshot().groups.length === 0 && target.id !== undefined && target.windowId !== undefined) {
+      try {
+        const groupId = await chrome.tabs.group({ tabIds: [target.id] })
+        const shown = normalizeGroupTitle('AI')
+        await chrome.tabGroups.update(groupId, { title: shown }).catch(() => {})
+        tabAuthorization.authorizeGroup(groupId, shown, [target.id])
+      } catch {
+        // 建组失败则维持未授权态，走原审批路径
+      }
+    }
+    const authorized = tabAuthorization.snapshot().groups.length > 0
+    return dispatchToolCall(
+      call,
+      authorized ? 'auto' : settings.sharePageContent,
+      budget,
+      async (prompt) => authorized ? 'approved' : authorizeToolCall(prompt, controller.signal, target.windowId, call.sessionId),
+      controller.signal,
+      target,
+      () => target.id !== undefined
+        && (!authorized || tabAuthorization.isAuthorizedTab(target.id)),
+    )
+  }).then(
     (answer) => {
       if (controller.signal.aborted) return
       const socket = bridge
@@ -1305,18 +1228,8 @@ if (chrome.tabGroups && chrome.tabGroups.onRemoved) {
 
 // ---- Tab affinity ----
 
-chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
-  void affinityReady.then(() => {
-    const activationRevision = focusedWindow.acceptActivation(windowId)
-    if (activationRevision === null) return
-    // Mark the switch before awaiting metadata so an already-running trusted
-    // action cannot slip through the handoff boundary.
-    observeActiveSummary({ tabId, windowId, title: '', url: '' })
-    return chrome.tabs.get(tabId).then((tab) => {
-      if (focusedWindow.isCurrent(activationRevision)) observeActiveTab(tab)
-    }).catch(() => {})
-  })
-})
+// 用户切换标签页不再触发「是否跟随当前页」提示，也不再暂停浏览器操作；浏览器
+// 操作只按授权组 / 冷启动自建组驱动。onActivated 的 affinity 观察已移除。
 
 chrome.tabs.onUpdated.addListener((tabId, _changeInfo, tab) => {
   void affinityReady.then(() => {
