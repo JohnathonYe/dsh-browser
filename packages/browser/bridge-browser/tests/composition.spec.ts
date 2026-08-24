@@ -198,34 +198,34 @@ describe('real Loader composition', () => {
     const confirmBeforeClickPrompt = (await ctx.systemPrompt.assemble()).sections
       .find((section) => section.name === 'tool:bridge-browser:confirm-before-click')?.text
     expect(confirmBeforeClickPrompt).toBeDefined()
-    expect(confirmBeforeClickPrompt).toContain('browser_screenshot')
-    expect(confirmBeforeClickPrompt).toContain('confirm')
-    expect(confirmBeforeClickPrompt).toContain('do not click blindly')
+    expect(confirmBeforeClickPrompt).toContain('snapshot index')
+    expect(confirmBeforeClickPrompt).toContain('coordinate')
+    expect(confirmBeforeClickPrompt).toContain('blindly')
+    expect(confirmBeforeClickPrompt).not.toMatch(/browser_click_at|browser_hover_at|browser_drag_at/)
     expect(confirmBeforeClickPrompt).not.toMatch(/\p{Script=Han}/u)
 
-    // Coordinate clicking must be the preferred path after a screenshot
-    // confirms the target's exact viewport pixel. Keep it English (no Han).
+    // DOM-first acting: locate by snapshot index and confirm the landing element
+    // via the coordinate→element readback, never by screenshot pixels. Keep it
+    // English (no Han).
     const clickAtPrompt = (await ctx.systemPrompt.assemble()).sections
       .find((section) => section.name === 'tool:bridge-browser:click-at')?.text
     expect(clickAtPrompt).toBeDefined()
-    expect(clickAtPrompt).toContain('browser_screenshot')
-    expect(clickAtPrompt).toContain('browser_click_at(x, y)')
-    expect(clickAtPrompt).toContain('viewport')
-    // Coordinate hover/drag share the same screenshot coordinate space.
-    expect(clickAtPrompt).toContain('browser_hover_at(x, y)')
-    expect(clickAtPrompt).toContain('browser_drag_at(fromX, fromY, toX, toY)')
+    expect(clickAtPrompt).toContain('browser_click(index)')
+    expect(clickAtPrompt).toContain('snapshot index')
+    expect(clickAtPrompt).toContain('not a locator')
+    // The coordinate→element confirmation is DOM-driven, never screenshot pixels.
+    expect(clickAtPrompt).not.toMatch(/browser_click_at|browser_hover_at|browser_drag_at/)
     expect(clickAtPrompt).not.toMatch(/\p{Script=Han}/u)
 
-    // Index-location failure must tell the model to stop probing the index and
-    // fall back to the screenshot/coordinate tools. Keep it English (no Han).
+    // Index-location failure steers back to a fresh snapshot / re-index, never
+    // to coordinate tools. Keep it English (no Han).
     const indexFallbackPrompt = (await ctx.systemPrompt.assemble()).sections
       .find((section) => section.name === 'tool:bridge-browser:index-fallback')?.text
     expect(indexFallbackPrompt).toBeDefined()
-    expect(indexFallbackPrompt).toContain('if the snapshot index')
-    expect(indexFallbackPrompt).toContain('fall back to the screenshot/coordinate tools')
-    expect(indexFallbackPrompt).toContain('browser_click_at(x, y)')
-    expect(indexFallbackPrompt).toContain('browser_hover_at(x, y)')
-    expect(indexFallbackPrompt).toContain('browser_drag_at(fromX, fromY, toX, toY)')
+    expect(indexFallbackPrompt).toContain('snapshot index cannot locate the target')
+    expect(indexFallbackPrompt).toContain('browser_snapshot again')
+    expect(indexFallbackPrompt).toContain('coordinate')
+    expect(indexFallbackPrompt).not.toMatch(/browser_click_at|browser_hover_at|browser_drag_at/)
     expect(indexFallbackPrompt).not.toMatch(/\p{Script=Han}/u)
 
     // Over-confirmation guard must bound snapshot/screenshot to when they are

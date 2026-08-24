@@ -1,11 +1,8 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest'
 import {
-  clearScreenshotMeta,
-  getScreenshotMeta,
   modelVisibleImageSize,
   pngSizeFromBase64,
-  recordScreenshotMeta,
   SCREENSHOT_MODEL_MAX_DIMENSION,
 } from '../src/background/screenshot-meta.ts'
 
@@ -53,33 +50,5 @@ describe('modelVisibleImageSize', () => {
     expect(Math.max(size.width, size.height)).toBe(SCREENSHOT_MODEL_MAX_DIMENSION)
     expect(size.width).toBe(2048)
     expect(size.height).toBe(991)
-  })
-})
-
-describe('recordScreenshotMeta / getScreenshotMeta / clearScreenshotMeta', () => {
-  it('stores and reads the coordinate basis per tab', () => {
-    clearScreenshotMeta(9)
-    expect(getScreenshotMeta(9)).toBeUndefined()
-    recordScreenshotMeta(9, { width: 2048, height: 991 }, { width: 3840, height: 1858 })
-    const meta = getScreenshotMeta(9)
-    expect(meta?.imageSize).toEqual({ width: 2048, height: 991 })
-    expect(meta?.originalDimensions).toEqual({ width: 3840, height: 1858 })
-    // A capture recorded without layout metrics carries no viewportCss basis.
-    expect(meta?.viewportCss).toBeUndefined()
-    expect(meta?.capturedAt).toBeTypeOf('number')
-  })
-
-  it('stores the capture-time viewport CSS size when recorded', () => {
-    clearScreenshotMeta(11)
-    recordScreenshotMeta(11, { width: 2048, height: 971 }, { width: 3840, height: 1820 }, { width: 1920, height: 1073 })
-    const meta = getScreenshotMeta(11)
-    expect(meta?.imageSize).toEqual({ width: 2048, height: 971 })
-    expect(meta?.viewportCss).toEqual({ width: 1920, height: 1073 })
-  })
-
-  it('forgets a tab after clearScreenshotMeta', () => {
-    recordScreenshotMeta(10, { width: 1024, height: 768 }, { width: 1024, height: 768 })
-    clearScreenshotMeta(10)
-    expect(getScreenshotMeta(10)).toBeUndefined()
   })
 })

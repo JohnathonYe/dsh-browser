@@ -15,14 +15,13 @@ import type { ElementIds } from './ids.ts'
 import type { SnapshotBudget } from './snapshot.ts'
 import { buildSnapshot, renderSnapshot } from './snapshot.ts'
 import {
-  clickAt,
   clickElement,
-  dragAt,
+  confirmElementHit,
+  describeElementAt,
   dragFromTo,
   elementCenter,
   elementRandomPoint,
   ensureInViewport,
-  hoverAt,
   hoverElement,
   humanWheelScroll,
   movePointerTo,
@@ -254,12 +253,6 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return snapshotAction(args, ctx)
     case 'browser_click':
       return clickAction(args, ctx)
-    case 'browser_click_at':
-      return clickAtAction(args, ctx)
-    case 'browser_hover_at':
-      return hoverAtAction(args, ctx)
-    case 'browser_drag_at':
-      return dragAtAction(args, ctx)
     case 'browser_hover':
       return hoverAction(args, ctx)
     case 'browser_drag':
@@ -394,22 +387,16 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
   // Real pointer: glide to a random point on the element, press, release. The
   // renderer synthesizes a genuine click (and `:active`), which synthetic
   // dispatchEvent can never do. Falls back to synthetic events only when CDP
-  // input is unavailable.
-  await clickElement(el)
+  // input is unavailable. Before acting, confirm the landing coordinate hits the
+  // target element (via document.elementFromPoint); the result names the element
+  // under that point so the model can verify the pointer actually reached it.
+  const target = elementRandomPoint(el)
+  const hitInfo = confirmElementHit(el, target.x, target.y)
+  await clickElement(el, { at: target })
   await waitForPageSettled(ACTION_SETTLE)
-  return withPageDelta(`Clicked [${index}].`, ctx)
-}
-
-async function clickAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
-  const x = coordArg(args, 'x')
-  const y = coordArg(args, 'y')
-  // The model reads (x, y) as pixels on a browser_screenshot image; the
-  // background attaches the image size so we can map them into viewport CSS
-  // pixels before the humanized plan (jitter + curve + CDP) runs.
-  const css = screenshotPointToCss(x, y, imageSizeArg(args), viewportCssArg(args))
-  await clickAt(css.x, css.y)
-  await waitForPageSettled(ACTION_SETTLE)
-  return withPageDelta(`Clicked at (${x}, ${y}).`, ctx)
+  const at = describeElementAt(hitInfo.under)
+  const confirmNote = hitInfo.hit ? '' : ' Note: the coordinate did not resolve to the target element itself (it may be covered or mis-located).'
+  return withPageDelta(`Clicked [${index}]. The pointer landed at (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}.${confirmNote}`, ctx)
 }
 
 async function typeAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
@@ -483,51 +470,24 @@ async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): 
   return withPageDelta(`Scrolled ${direction}.`, ctx)
 }
 
-async function hoverAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
-  const x = coordArg(args, 'x')
-  const y = coordArg(args, 'y')
-  // The model reads (x, y) as pixels on a browser_screenshot image; the
-  // background attaches the image size so we can map them into viewport CSS
-  // pixels before the humanized plan (jitter + curve) runs.
-  const css = screenshotPointToCss(x, y, imageSizeArg(args), viewportCssArg(args))
-  await hoverAt(css.x, css.y)
-  await waitForPageSettled(ACTION_SETTLE)
-  return withPageDelta(
-    `Hovered at (${x}, ${y}). The pointer is now over that point; call browser_snapshot to read any hover effect.`,
-    ctx,
-  )
-}
-
 async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const index = numberArg(args, 'index')
   const el = elementOrThrow(ctx.ids, index)
   ensureInViewport(el)
   // Move the REAL pointer over a random point on the element and let
   // :hover-driven affordances (tooltips, dropdown previews) render before the
-  // model decides whether to click.
-  await hoverElement(el)
+  // model decides whether to click. Confirm the landing coordinate hits the
+  // target element and name the element under it so the model can verify.
+  const target = elementRandomPoint(el)
+  const hitInfo = confirmElementHit(el, target.x, target.y)
+  await hoverElement(el, { at: target })
   await waitForPageSettled(ACTION_SETTLE)
+  const at = describeElementAt(hitInfo.under)
+  const confirmNote = hitInfo.hit ? '' : ' Note: the coordinate did not resolve to the target element itself (it may be covered or mis-located).'
   return withPageDelta(
-    `Hovered [${index}]. The pointer is now over the element; call browser_snapshot to read any hover effect.`,
+    `Hovered [${index}]. The pointer is over (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}. Call browser_snapshot to read any hover effect.${confirmNote}`,
     ctx,
   )
-}
-
-async function dragAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
-  const fromX = coordArg(args, 'fromX')
-  const fromY = coordArg(args, 'fromY')
-  const toX = coordArg(args, 'toX')
-  const toY = coordArg(args, 'toY')
-  // The model reads all four as pixels on a browser_screenshot image; the
-  // background attaches the image size so we can map them into viewport CSS
-  // pixels before the humanized drag plan runs.
-  const imageSize = imageSizeArg(args)
-  const viewportCss = viewportCssArg(args)
-  const from = screenshotPointToCss(fromX, fromY, imageSize, viewportCss)
-  const to = screenshotPointToCss(toX, toY, imageSize, viewportCss)
-  await dragAt(from.x, from.y, to.x, to.y)
-  await waitForPageSettled(ACTION_SETTLE)
-  return withPageDelta(`Dragged from (${fromX}, ${fromY}) to (${toX}, ${toY}).`, ctx)
 }
 
 async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
@@ -619,93 +579,4 @@ function numberArg(args: Record<string, unknown>, name: string): number {
     throw new ActionError('bad-args', `${name} must be a non-negative integer; received ${String(value)}.`)
   }
   return value
-}
-
-/** A screenshot's model-visible pixel dimensions (the image the model reads coords from). */
-export interface ScreenshotImageSize {
-  width: number
-  height: number
-}
-
-/** The capture-time viewport CSS size (the real coordinate space the model maps to). */
-export interface ScreenshotViewportCss {
-  width: number
-  height: number
-}
-
-function isPositiveSize(value: number | undefined): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
-}
-
-/**
- * Map a coordinate the model read from a browser_screenshot image back to a
- * viewport CSS pixel.
- *
- * The screenshot image spans the whole viewport, so a point at fraction
- * `x / imageWidth` of the image width is at CSS `x * (viewportWidth / imageWidth)`.
- * `imageSize` is the size of the image the model actually read: the raw
- * capture is down-scaled before it reaches the model, so this is the
- * model-visible size, not the raw PNG.
- *
- * The viewport basis is, in order of preference: the capture-time `viewportCss`
- * injected by the background (the pixel-true basis, because the PNG's aspect
- * ratio need NOT match the CSS viewport — a 3840×1820 PNG can come from a
- * ~1.79-ratio CSS viewport when a devicePixelRatio/scrollbar shift skews the
- * capture area); else a live `window.innerWidth`/`innerHeight`; else the image
- * size itself (identity scale). With no imageSize the point is returned
- * unchanged (the coordinate is already in viewport CSS px), so callers that
- * never take a screenshot keep their original behaviour.
- */
-export function screenshotPointToCss(
-  x: number,
-  y: number,
-  imageSize?: ScreenshotImageSize,
-  viewportCss?: ScreenshotViewportCss,
-): { x: number; y: number } {
-  const iw = imageSize?.width
-  const ih = imageSize?.height
-  if (!isPositiveSize(iw) || !isPositiveSize(ih)) {
-    return { x, y }
-  }
-  const vw = isPositiveSize(viewportCss?.width)
-    ? viewportCss!.width
-    : (typeof window !== 'undefined' && isPositiveSize(window.innerWidth)
-      ? window.innerWidth
-      : iw)
-  const vh = isPositiveSize(viewportCss?.height)
-    ? viewportCss!.height
-    : (typeof window !== 'undefined' && isPositiveSize(window.innerHeight)
-      ? window.innerHeight
-      : ih)
-  return {
-    x: x * (vw / iw),
-    y: y * (vh / ih),
-  }
-}
-
-/** A viewport coordinate: any finite number (CSS pixels, signed allowed). */
-function coordArg(args: Record<string, unknown>, name: string): number {
-  const value = args[name]
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new ActionError('bad-args', `${name} must be a finite number; received ${String(value)}.`)
-  }
-  return value
-}
-
-/** Read the screenshot image size the background attached to a coordinate call (optional). */
-function imageSizeArg(args: Record<string, unknown>): ScreenshotImageSize | undefined {
-  const value = args.imageSize
-  if (typeof value !== 'object' || value === null) return undefined
-  const { width, height } = value as { width?: unknown; height?: unknown }
-  if (typeof width !== 'number' || !(width > 0) || typeof height !== 'number' || !(height > 0)) return undefined
-  return { width, height }
-}
-
-/** Read the capture-time CSS viewport the background attached to a coordinate call (optional). */
-function viewportCssArg(args: Record<string, unknown>): ScreenshotViewportCss | undefined {
-  const value = args.viewportCss
-  if (typeof value !== 'object' || value === null) return undefined
-  const { width, height } = value as { width?: unknown; height?: unknown }
-  if (typeof width !== 'number' || !(width > 0) || typeof height !== 'number' || !(height > 0)) return undefined
-  return { width, height }
 }

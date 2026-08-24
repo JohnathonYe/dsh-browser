@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { dispatchToolCall, type ToolAnswer, type ToolCall } from '../src/background/tools.ts'
-import { clearScreenshotMeta, recordScreenshotMeta } from '../src/background/screenshot-meta.ts'
 
 const CALL: ToolCall = { id: 'tool-1', name: 'browser_snapshot', args: {} }
 const OK: ToolAnswer = { ok: true, result: { text: 'page' } }
@@ -205,81 +204,6 @@ describe('dispatchToolCall', () => {
       budget: expect.objectContaining({ maxItems: 60 }),
       includePageDelta: true,
     }, { documentId: 'child-doc' })
-  })
-
-  it('routes a coordinate click without requiring a snapshot baseline', async () => {
-    const call: ToolCall = { id: 'tool-click-at', name: 'browser_click_at', args: { x: 150, y: 300 } }
-    const chromeMock = mockChrome({ tab: { id: 40, url: 'https://app.example/' } })
-
-    const answer = await dispatchToolCall(call, 'auto', undefined, async () => 'approved')
-    expect(answer).toEqual({ ok: true, result: { text: 'page' } })
-    // Unlike index-based clicks, a coordinate click does not need a prior
-    // snapshot baseline, so it is dispatched cleanly with just x/y.
-    expect(chromeMock.sendMessage).toHaveBeenCalledWith(40, {
-      type: 'DSH_ACTION',
-      action: 'browser_click_at',
-      args: { x: 150, y: 300 },
-    }, { documentId: 'document-40' })
-  })
-
-  it('attaches the screenshot image size to a coordinate call when a screenshot was taken', async () => {
-    const call: ToolCall = { id: 'tool-click-at-meta', name: 'browser_click_at', args: { x: 900, y: 500 } }
-    const chromeMock = mockChrome({ tab: { id: 50, url: 'https://app.example/' } })
-    recordScreenshotMeta(50, { width: 2048, height: 991 }, { width: 3840, height: 1858 })
-    try {
-      await dispatchToolCall(call, 'auto', undefined, async () => 'approved')
-      expect(chromeMock.sendMessage).toHaveBeenCalledWith(50, {
-        type: 'DSH_ACTION',
-        action: 'browser_click_at',
-        args: { x: 900, y: 500, imageSize: { width: 2048, height: 991 } },
-      }, { documentId: 'document-50' })
-    } finally {
-      clearScreenshotMeta(50)
-    }
-  })
-
-  it('attaches the capture-time viewport CSS to a coordinate call when recorded', async () => {
-    const call: ToolCall = { id: 'tool-click-at-vp', name: 'browser_click_at', args: { x: 470, y: 370 } }
-    const chromeMock = mockChrome({ tab: { id: 51, url: 'https://app.example/' } })
-    recordScreenshotMeta(51, { width: 2048, height: 971 }, { width: 3840, height: 1820 }, { width: 1920, height: 1073 })
-    try {
-      await dispatchToolCall(call, 'auto', undefined, async () => 'approved')
-      expect(chromeMock.sendMessage).toHaveBeenCalledWith(51, {
-        type: 'DSH_ACTION',
-        action: 'browser_click_at',
-        args: {
-          x: 470,
-          y: 370,
-          imageSize: { width: 2048, height: 971 },
-          viewportCss: { width: 1920, height: 1073 },
-        },
-      }, { documentId: 'document-51' })
-    } finally {
-      clearScreenshotMeta(51)
-    }
-  })
-
-  it('routes a coordinate hover and drag without requiring a snapshot baseline', async () => {
-    const hoverCall: ToolCall = { id: 'tool-hover-at', name: 'browser_hover_at', args: { x: 150, y: 200 } }
-    const dragCall: ToolCall = { id: 'tool-drag-at', name: 'browser_drag_at', args: { fromX: 40, fromY: 60, toX: 220, toY: 180 } }
-    const chromeMock = mockChrome({
-      tab: { id: 41, url: 'https://app.example/' },
-      responses: [OK, OK],
-    })
-
-    await expect(dispatchToolCall(hoverCall, 'auto', undefined, async () => 'approved')).resolves.toEqual(OK)
-    expect(chromeMock.sendMessage).toHaveBeenCalledWith(41, {
-      type: 'DSH_ACTION',
-      action: 'browser_hover_at',
-      args: { x: 150, y: 200 },
-    }, { documentId: 'document-41' })
-
-    await expect(dispatchToolCall(dragCall, 'auto', undefined, async () => 'approved')).resolves.toEqual({ ok: true, result: { text: 'page' } })
-    expect(chromeMock.sendMessage).toHaveBeenLastCalledWith(41, {
-      type: 'DSH_ACTION',
-      action: 'browser_drag_at',
-      args: { fromX: 40, fromY: 60, toX: 220, toY: 180 },
-    }, { documentId: 'document-41' })
   })
 
   it('returns automatic action deltas inside a fresh untrusted-content boundary', async () => {

@@ -195,7 +195,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       order: 107,
       text: 'A browser bridge may be connected. To read or operate the user\'s active browser page, call browser_snapshot '
         + '(text-only; numbered items are the click/type targets), unless the current turn already includes a plugin-provided '
-        + 'followed-page browser_snapshot. Reuse that injected snapshot and its indices directly. Never assume page content you have not snapshotted.',
+        + 'followed-page browser_snapshot. Reuse that injected snapshot and its indices directly. Locate every target by its '
+        + 'snapshot index; never guess absolute coordinates on a screenshot. Never assume page content you have not snapshotted.',
     }), 'bridge-browser: system prompt section')
 
     // Multi-instance selection is model-driven. When several browser instances
@@ -235,88 +236,80 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         + 'read it with browser_snapshot, then act with browser_click/browser_scroll/browser_type.',
     }), 'bridge-browser: no-auth-group system prompt section')
 
-    // Click/drag precision is model-driven. The AI cursor overlay is rendered
-    // into the screenshot pixels, so the model can see exactly where the
-    // pointer sits before it acts. Require a screenshot before every
-    // click/hover/drag so the model verifies the cursor is on the intended
-    // target instead of acting by inventory index alone. English only
-    // (composition.spec asserts no Han characters).
+    // Locating is DOM-driven. The numbered snapshot inventory is the locator:
+    // read it with browser_snapshot and act by index. The AI cursor overlay is
+    // still a pure visual (the real pointer position), but the model must NOT
+    // read coordinates off a screenshot to pick a target — it should locate by
+    // snapshot index and use the coordinate→element confirmation the click /
+    // hover tools return to verify the pointer landed where it intended.
+    // English only (composition.spec asserts no Han characters).
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser:confirm-before-click',
       order: 110,
-      text: 'Before every browser_click, browser_hover, or browser_drag, first call browser_screenshot. The AI cursor '
-        + 'overlay is drawn into the screenshot at its current CDP position, so it shows exactly where the pointer sits. '
-        + 'Confirm the cursor is on the intended element/point and that the target is in view. If it is not (wrong element, '
-        + 'off-screen, or the cursor has not reached the target), fix it first: browser_scroll to bring the target into view, '
-        + 'or browser_hover to the correct index so the cursor lands on it, then screenshot again. Only click or drag once '
-        + 'the screenshot shows the cursor on the intended target; if you cannot confirm, do not click blindly.',
+      text: 'Locate every target by its numbered snapshot index from browser_snapshot, then act with browser_click(index), '
+        + 'browser_hover(index) or browser_drag(index). After a browser_click or browser_hover the result reports the '
+        + 'pointer\'s landing coordinate and the element at that coordinate (e.g. "the element at that coordinate is '
+        + '<button>Submit</button>"); confirm that element is the intended target before assuming the action worked. If it '
+        + 'names a different element (an overlay, a parent, or page background), the target is covered or mis-located: '
+        + 'fix it first (scroll it into view, re-snapshot for a fresh index, or click a different index) rather than '
+        + 'clicking blindly. Do not guess absolute coordinates from a screenshot to pick a target; the screenshot is only '
+        + 'a visual, the snapshot index is the locator.',
     }), 'bridge-browser: confirm-before-click system prompt section')
 
-    // Coordinate-acting is the more certain path: the model confirms the
-    // target's exact viewport pixel(s) on a screenshot (the AI-cursor overlay
-    // and CDP Input share that coordinate space), then clicks, hovers or drags
-    // with browser_click_at / browser_hover_at / browser_drag_at instead of
-    // acting by inventory index alone. The index-based browser_click /
-    // browser_hover / browser_drag stay supported for backward compatibility.
+    // DOM-first, and coordinate→element confirmation is the certain path: the
+    // model reads the target\'snapshot index and lets the click/hover result
+    // confirm the landing element at that coordinate. There is no screenshot-
+    // pixel coordinate tool; the model never converts screenshot pixels itself.
     // English only (composition.spec asserts no Han characters).
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser:click-at',
       order: 111,
-      text: 'To act precisely, first call browser_screenshot. The AI cursor overlay is drawn into the screenshot at its '
-        + 'current CDP position, so the screenshot shows the exact pixel where the pointer sits. Read the target\'s '
-        + 'position as the pixel coordinates you see on that screenshot, then act with browser_click_at(x, y), '
-        + 'browser_hover_at(x, y) or browser_drag_at(fromX, fromY, toX, toY) by passing the screenshot pixels directly; '
-        + 'the plugin converts them into the page\'s viewport coordinates for you, so do not resize or rescale the '
-        + 'numbers yourself. The index-based browser_click / browser_hover / browser_drag from a snapshot inventory remain '
-        + 'supported, but a coordinate you have confirmed on the screenshot is the more certain path and should be preferred '
-        + 'when you can read an unambiguous point. After acting, take a screenshot again to confirm the result instead of '
-        + 'assuming success.',
+      text: 'To act precisely on an element, use the snapshot index: browser_click(index), browser_hover(index) and '
+        + 'browser_drag(index) act on the numbered inventory from browser_snapshot. Each click or hover result confirms '
+        + 'the pointer\'s landing coordinate and names the element at that coordinate, so you can verify the point hit the '
+        + 'intended target. browser_screenshot is available when you need a visual of the whole page, but it is not a '
+        + 'locator: do not read a pixel position off it and do not try to convert screenshot coordinates yourself. After '
+        + 'acting, use the returned coordinate→element confirmation, and only re-snapshot when the page or target changed.',
     }), 'bridge-browser: click-at system prompt section')
 
-    // Index-locate failure is model-driven too. The numbered snapshot inventory
-    // is the first choice when it reliably matches the target, but cards and
-    // dynamic elements often never appear in that inventory, so a model that
-    // keeps probing selectors / guessing an index spins instead of acting.
-    // Guidance: prefer the index when it resolves, and the moment it does not,
-    // stop probing and fall back to a coordinate read from a screenshot (the
-    // same coordinate space as the AI cursor overlay and the CDP Input).
+    // Index-locate failure is DOM-driven too: when the snapshot index cannot
+    // locate the target it never means "switch to coordinates"; it means the
+    // index is stale, off-screen, or the element is not in the inventory. The
+    // fix is to re-snapshot for current indices, scroll the target into view,
+    // or read the target\'s region — not to guess a screenshot point.
     // English only (composition.spec asserts no Han characters).
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser:index-fallback',
       order: 112,
-      text: 'Use the snapshot index first when it reliably matches the target: browser_click(index), '
-        + 'browser_hover(index) and browser_drag(index) act on the numbered inventory from browser_snapshot; '
-        + 'if the snapshot index cannot locate the target (the element is not in the interactive inventory, '
-        + 'the index is stale or distorted, or you can see the target on a screenshot yet no index reaches it), '
-        + 'stop probing selectors and stop guessing an index; fall back to the screenshot/coordinate tools: '
-        + 'call browser_screenshot, read the target\'s position as the pixel coordinates you see on that screenshot, '
-        + 'then act with browser_click_at(x, y), browser_hover_at(x, y) or browser_drag_at(fromX, fromY, toX, toY) by '
-        + 'passing those screenshot pixels directly (the plugin converts them to the page\'s viewport coordinates). The '
-        + 'coordinate path is the more direct and reliable locator for cards and dynamic elements that the '
-        + 'snapshot index never lists, so switch to it as soon as the index does not resolve. Do not blindly '
-        + 'repeat browser_get_text or browser_click to feel out an index; a coordinate read from the screenshot '
-        + 'is the faster and certain fix.',
+      text: 'Use the snapshot index first: browser_click(index), browser_hover(index) and browser_drag(index) act on the '
+        + 'numbered inventory from browser_snapshot. If the snapshot index cannot locate the target (the element is not in '
+        + 'the interactive inventory, the index is stale or distorted, or the page changed), stop guessing an index and '
+        + 'fix the locator instead of probing blindly: call browser_snapshot again (or browser_snapshot with delta:true to '
+        + 'read only the changes) to get current indices, browser_scroll to bring the target into view, or browser_get_text '
+        + 'with a selector to find the element\'s region and re-snapshot. Do not read a coordinate off a screenshot to '
+        + 'act; the snapshot index is the only locator, and the click/hover result\'s coordinate→element confirmation tells '
+        + 'you whether the pointer actually reached the intended element.',
     }), 'bridge-browser: index-fallback system prompt section')
 
     // Over-confirmation blooms: a model that re-snapshots or re-screenshots
     // the same view on every step turns a short locate into a long loop. This
     // is a soft constraint on TOP of the guidance above (confirm-before-click
-    // / index-fallback / click-at still require one confirm screenshot before
-    // an action) — it says: confirm once, then act, do not re-confirm the
-    // same region repeatedly. English only (composition.spec asserts no Han).
+    // / index-fallback still want one confirm before an action) — it says:
+    // confirm once, then act, do not re-confirm the same region repeatedly.
+    // English only (composition.spec asserts no Han).
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser:reduce-reconfirm',
       order: 113,
       text: 'Do not take snapshots or screenshots unless you actually need them. Use browser_snapshot to read page '
-        + 'context or its changes, and browser_screenshot only to confirm a target\'s coordinates/landing point '
-        + 'before an action or when the visual state cannot be judged from the snapshot. Do not re-capture on every '
-        + 'step. If you already know the target position or already saw that region and the page has not changed, '
-        + 'do not re-snapshot or re-screenshot the same region; with delta:true take only the changes instead of a '
-        + 'full capture. Re-capture only when navigation, scroll, or a click changed the view, or when you need a '
-        + 'new target; in a single locating flow do not repeatedly snapshot/screenshot the same region. The confirm '
-        + 'screenshot from the confirm-before-click, click-at and index-fallback guidance is one check right before '
-        + 'an action, not part of a repeating snapshot -> screenshot -> judge -> snapshot -> screenshot loop; if one '
-        + 'screenshot already gives readable coordinates, act directly.',
+        + 'context or its changes, and browser_screenshot only when the visual state cannot be judged from the snapshot '
+        + '(it is a visual aid, never a locator). Do not re-capture on every step. If you already know the target index '
+        + 'or already saw that region and the page has not changed, do not re-snapshot or re-screenshot the same '
+        + 'region; with delta:true take only the changes instead of a full capture. Re-capture only when navigation, '
+        + 'scroll, or a click changed the view, or when you need a new target; in a single locating flow do not '
+        + 'repeatedly snapshot/screenshot the same region. The coordinate→element confirmation returned by '
+        + 'browser_click / browser_hover is one check right before an action, not part of a repeating snapshot -> '
+        + 'screenshot -> judge -> snapshot -> screenshot loop; if one click result already names the intended element, act '
+        + 'directly.',
     }), 'bridge-browser: reduce-reconfirm system prompt section')
   }
 

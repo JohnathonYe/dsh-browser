@@ -8,9 +8,7 @@ import { getUiLocale, type UiLocale } from '../i18n.ts'
 const PAGE_READS = new Set(['browser_snapshot', 'browser_get_text'])
 const STATE_CHANGING_ACTIONS = new Set([
   'browser_click',
-  'browser_click_at',
   'browser_drag',
-  'browser_drag_at',
   'browser_type',
   'browser_press',
   'browser_navigate',
@@ -104,28 +102,7 @@ function summarizeAction(call: ToolCall, locale: UiLocale): string {
   const index = typeof call.args.index === 'number' ? call.args.index : '?'
   switch (call.name) {
     case 'browser_click': return localized(locale, `Click element [${index}]${frame}`, `点击元素 [${index}]${frame}`)
-    case 'browser_click_at': {
-      const x = typeof call.args.x === 'number' ? call.args.x : '?'
-      const y = typeof call.args.y === 'number' ? call.args.y : '?'
-      return localized(locale, `Click at (${x}, ${y})${frame}`, `点击坐标 (${x}, ${y})${frame}`)
-    }
     case 'browser_drag': return localized(locale, `Drag element [${index}]${frame}`, `拖动元素 [${index}]${frame}`)
-    case 'browser_drag_at': {
-      const fromX = typeof call.args.fromX === 'number' ? call.args.fromX : '?'
-      const fromY = typeof call.args.fromY === 'number' ? call.args.fromY : '?'
-      const toX = typeof call.args.toX === 'number' ? call.args.toX : '?'
-      const toY = typeof call.args.toY === 'number' ? call.args.toY : '?'
-      return localized(
-        locale,
-        `Drag from (${fromX}, ${fromY}) to (${toX}, ${toY})${frame}`,
-        `从 (${fromX}, ${fromY}) 拖到 (${toX}, ${toY})${frame}`,
-      )
-    }
-    case 'browser_hover_at': {
-      const x = typeof call.args.x === 'number' ? call.args.x : '?'
-      const y = typeof call.args.y === 'number' ? call.args.y : '?'
-      return localized(locale, `Hover at (${x}, ${y})${frame}`, `悬停坐标 (${x}, ${y})${frame}`)
-    }
     case 'browser_type': {
       const length = typeof call.args.text === 'string' ? call.args.text.length : 0
       return localized(

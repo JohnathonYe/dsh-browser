@@ -120,6 +120,40 @@ export function elementRandomPoint(el: Element, opts: { insetRatio?: number } = 
   return randomPointInRect(el.getBoundingClientRect(), opts)
 }
 
+/** The element at a viewport coordinate, or null when unavailable (no layout / jsdom). */
+export function elementAtPoint(x: number, y: number): Element | null {
+  if (typeof document === 'undefined' || typeof document.elementFromPoint !== 'function') return null
+  return document.elementFromPoint(x, y)
+}
+
+/** A short, model-readable description of the element under a coordinate. */
+export function describeElementAt(el: Element | null): string {
+  if (el === null) return 'nothing'
+  if (el === document.body || el === document.documentElement) return 'page background'
+  const tag = el.tagName.toLowerCase()
+  const text = (el.textContent ?? '').trim().replace(/\s+/g, ' ')
+  const snippet = text === '' ? '' : `>${text.slice(0, 40)}</${tag}>`
+  return `<${tag}${snippet}`
+}
+
+/** The outcome of confirming that a coordinate hits the target element. */
+export interface ElementHit {
+  x: number
+  y: number
+  hit: boolean
+  under: Element | null
+}
+
+/** Confirm whether a viewport coordinate resolves to (or is inside) the target
+ * element via `document.elementFromPoint`. `hit` is true when the element under
+ * the point is the target or one of its descendants; a fixed overlay elsewhere
+ * (or jsdom\'s null layout) makes it false so the caller can warn the model. */
+export function confirmElementHit(el: Element, x: number, y: number): ElementHit {
+  const under = elementAtPoint(x, y)
+  const hit = under !== null && (under === el || el.contains(under))
+  return { x, y, hit, under }
+}
+
 /** Cubic Bezier interpolation. */
 function bezier(t: number, p0: number, c1: number, c2: number, p1: number): number {
   const u = 1 - t
@@ -208,7 +242,11 @@ export function buildMoveToSteps(el: Element, opts: { points?: number } = {}): M
 
 /** Build a plan that clicks a random point on the element: glide, press, release. */
 export function buildClickSteps(el: Element): MouseStep[] {
-  const to = elementRandomPoint(el)
+  return buildClickStepsAt(elementRandomPoint(el))
+}
+
+/** Build a plan that glides to a given point, presses, and releases (one click). */
+function buildClickStepsAt(to: Point): MouseStep[] {
   const from = startPoint(to)
   const steps: MouseStep[] = [
     ...moveSteps(from, to, { points: 9 }),
@@ -220,63 +258,16 @@ export function buildClickSteps(el: Element): MouseStep[] {
   return steps
 }
 
-/**
- * Perturb a requested viewport coordinate by a small random offset so the tap
- * never lands on the exact (possibly dead) pixel but stays on the intended
- * target. The offset is symmetric around the point and bounded by `jitter` px.
- */
-export function jitterPoint(x: number, y: number, jitter?: number): Point {
-  const j = jitter ?? 4
-  return {
-    x: x + (Math.random() - 0.5) * 2 * j,
-    y: y + (Math.random() - 0.5) * 2 * j,
-  }
-}
-
-/**
- * Build a plan that clicks AT a viewport CSS-pixel coordinate (no element
- * reference): glide the cursor to a point perturbed around (x, y), press, and
- * release. Mirrors `buildClickSteps` but aims at the given point instead of an
- * element's random interior point, so the model can confirm the exact pixel on
- * a screenshot and click it precisely.
- */
-export function buildClickAtSteps(x: number, y: number, opts: { points?: number; jitter?: number } = {}): MouseStep[] {
-  const to = jitterPoint(x, y, opts.jitter)
-  const from = startPoint(to)
-  const steps: MouseStep[] = [
-    ...moveSteps(from, to, { points: opts.points ?? 9 }),
-    movedStep(to, 0, randomPause(RHYTHM_PAUSE)),
-    { type: 'mousePressed', x: to.x, y: to.y, button: 'left', buttons: 1, clickCount: 1, pauseAfterMs: randomPause(RHYTHM_PAUSE) },
-    { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1, pauseAfterMs: randomPause(RHYTHM_PAUSE) },
-  ]
-  rememberMouse(to)
-  return steps
-}
-
 /** Build a hover plan: glide to a random point, then rest so `:hover` renders. */
 export function buildHoverSteps(el: Element): MouseStep[] {
-  const to = elementRandomPoint(el)
+  return buildHoverStepsAt(elementRandomPoint(el))
+}
+
+/** Build a hover plan: glide to a given point, then rest so `:hover` renders. */
+function buildHoverStepsAt(to: Point): MouseStep[] {
   const from = startPoint(to)
   const steps: MouseStep[] = [
     ...moveSteps(from, to, { points: 8 }),
-    movedStep(to, 0, randomPause(RHYTHM_PAUSE)),
-  ]
-  rememberMouse(to)
-  return steps
-}
-
-/**
- * Build a hover plan AT a viewport CSS-pixel coordinate (no element
- * reference): glide the cursor to a point perturbed around (x, y), then rest
- * so `:hover`/tooltip affordances render. Mirrors `buildHoverSteps` but aims
- * at the given pixel instead of an element's random interior point, so the
- * model can confirm the exact point on a screenshot and hover it precisely.
- */
-export function buildHoverAtSteps(x: number, y: number, opts: { points?: number; jitter?: number } = {}): MouseStep[] {
-  const to = jitterPoint(x, y, opts.jitter)
-  const from = startPoint(to)
-  const steps: MouseStep[] = [
-    ...moveSteps(from, to, { points: opts.points ?? 8 }),
     movedStep(to, 0, randomPause(RHYTHM_PAUSE)),
   ]
   rememberMouse(to)
@@ -455,32 +446,23 @@ export async function movePointerTo(el: Element, opts: { points?: number } = {})
   await dispatchMouseSteps(buildMoveToSteps(el, opts))
 }
 
-/** Real click a random point on the element (glide + press + release). */
-export async function clickElement(el: Element): Promise<void> {
-  await dispatchMouseSteps(buildClickSteps(el), el)
+/** Real click a random point on the element (glide + press + release).
+ * @returns the viewport point that was actually clicked, so the caller can
+ *   confirm the coordinate→element readback. `opts.at` pins the tap to an
+ *   explicit point (used by the DOM/coordinate→element confirmation flow). */
+export async function clickElement(el: Element, opts: { at?: Point } = {}): Promise<Point> {
+  const to = opts.at ?? elementRandomPoint(el)
+  await dispatchMouseSteps(buildClickStepsAt(to), el)
+  return to
 }
 
-/**
- * Real click at a viewport CSS-pixel coordinate (glide + press + release).
- * `(x, y)` is a viewport CSS pixel; the caller maps the model's screenshot
- * pixel to this space before calling (see `screenshotPointToCss`). The pointer
- * glides to a small random perturbation of the point, then press/release
- * synthesizes a genuine click. When CDP input is unavailable the plan degrades
- * to synthetic DOM events on whatever element sits under the tap point (via
- * `document.elementFromPoint`).
- */
-export async function clickAt(x: number, y: number, opts: { points?: number; jitter?: number } = {}): Promise<void> {
-  const to = jitterPoint(x, y, opts.jitter)
-  const under = typeof document !== 'undefined'
-    && typeof document.elementFromPoint === 'function'
-    ? document.elementFromPoint(to.x, to.y)
-    : null
-  await dispatchMouseSteps(buildClickAtSteps(x, y, opts), under ?? undefined)
-}
-
-/** Real hover a random point on the element (glide + rest). */
-export async function hoverElement(el: Element): Promise<void> {
-  await dispatchMouseSteps(buildHoverSteps(el), el)
+/** Real hover a random point on the element (glide + rest).
+ * @returns the viewport point actually hovered, so the caller can confirm the
+ *   coordinate→element readback. `opts.at` pins the hover to an explicit point. */
+export async function hoverElement(el: Element, opts: { at?: Point } = {}): Promise<Point> {
+  const to = opts.at ?? elementRandomPoint(el)
+  await dispatchMouseSteps(buildHoverStepsAt(to), el)
+  return to
 }
 
 /**
@@ -496,49 +478,6 @@ export async function dragFromTo(
   opts: { steps?: number } = {},
 ): Promise<void> {
   await dispatchMouseSteps(buildDragSteps(from, to, opts), el)
-}
-
-/**
- * Real hover at a viewport CSS-pixel coordinate (glide + rest): `(x, y)` is a
- * viewport CSS pixel; the caller maps the model's screenshot pixel to this
- * space before calling (see `screenshotPointToCss`). The pointer glides to a
- * small random perturbation of the point and rests so `:hover`/tooltips render.
- * When CDP input is unavailable the plan degrades to synthetic DOM events on
- * whatever element sits under the point (via `document.elementFromPoint`).
- */
-export async function hoverAt(x: number, y: number, opts: { points?: number; jitter?: number } = {}): Promise<void> {
-  const to = jitterPoint(x, y, opts.jitter)
-  const under = typeof document !== 'undefined'
-    && typeof document.elementFromPoint === 'function'
-    ? document.elementFromPoint(to.x, to.y)
-    : null
-  await dispatchMouseSteps(buildHoverAtSteps(x, y, opts), under ?? undefined)
-}
-
-/**
- * Real drag between two viewport CSS-pixel coordinates: `mousedown` at the
- * perturbed `(fromX, fromY)`, several `mousemove` steps along the eased curve
- * with the left button held, then `mouseup` at the perturbed `(toX, toY)`, all
- * as real CDP events. Both endpoints are viewport CSS pixels; the caller maps
- * the model's screenshot pixels to this space before calling (see
- * `screenshotPointToCss`). Each endpoint is perturbed by a small random offset
- * so the drag never lands on a dead pixel. When CDP input is unavailable the
- * plan degrades to synthetic DOM events on whatever element sits under the point.
- */
-export async function dragAt(
-  fromX: number,
-  fromY: number,
-  toX: number,
-  toY: number,
-  opts: { steps?: number; jitter?: number } = {},
-): Promise<void> {
-  const from = jitterPoint(fromX, fromY, opts.jitter)
-  const to = jitterPoint(toX, toY, opts.jitter)
-  const under = typeof document !== 'undefined'
-    && typeof document.elementFromPoint === 'function'
-    ? document.elementFromPoint(to.x, to.y)
-    : null
-  await dispatchMouseSteps(buildDragSteps(from, to, { steps: opts.steps ?? 7 }), under ?? undefined)
 }
 
 /**

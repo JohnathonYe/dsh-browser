@@ -188,9 +188,6 @@ const EN: PanelCopy = {
     labels: {
       browser_snapshot: 'Read page',
       browser_click: 'Click element',
-      browser_click_at: 'Click at point',
-      browser_hover_at: 'Hover at point',
-      browser_drag_at: 'Drag between points',
       browser_type: 'Enter text',
       browser_press: 'Press key',
       browser_scroll: 'Scroll page',
@@ -364,9 +361,6 @@ const ZH: PanelCopy = {
     labels: {
       browser_snapshot: '读取页面',
       browser_click: '点击元素',
-      browser_click_at: '点击坐标',
-      browser_hover_at: '悬停坐标',
-      browser_drag_at: '拖拽坐标',
       browser_type: '填写内容',
       browser_press: '按下按键',
       browser_scroll: '滚动页面',

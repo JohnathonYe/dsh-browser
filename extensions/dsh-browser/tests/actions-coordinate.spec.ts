@@ -1,77 +1,76 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { screenshotPointToCss } from '../src/content/actions.ts'
+import {
+  confirmElementHit,
+  describeElementAt,
+  elementAtPoint,
+} from '../src/content/movement.ts'
 
 /**
- * Coordinate-conversion unit tests: the `_at` tools accept pixels the model read
- * from a browser_screenshot image and must map them into viewport CSS pixels
- * (the coordinate space CDP Input and the humanized plan use). The conversion is
- * `cssX = x * (viewportCss.width / imageSize.width)` — the screenshot image spans
- * the whole viewport, so a fraction of the image equals the same fraction of the
- * CSS viewport. The viewport basis is the injected capture-time `viewportCss`
- * (preferred, because the PNG's aspect ratio need not match the CSS viewport),
- * else a live `window.innerWidth` read, else identity.
+ * Coordinate→element confirmation unit tests. Locating is DOM-driven: the model
+ * locates a target by snapshot index, and the click/hover tools confirm the
+ * landing coordinate resolves back to the intended element via
+ * `document.elementFromPoint`. These tests cover that hit-test readback.
+ *
+ * jsdom has no layout engine and does not define `document.elementFromPoint`, so
+ * the hit-check degrades to `hit:false` with a warning; the resolution and
+ * hit-check logic are exercised directly by stubbing the property.
  */
-describe('screenshotPointToCss', () => {
-  const originalWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth')
-  const originalHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight')
-
-  function setViewport(width: number, height: number): void {
-    Object.defineProperty(window, 'innerWidth', { value: width, configurable: true })
-    Object.defineProperty(window, 'innerHeight', { value: height, configurable: true })
+describe('coordinate→element confirmation (DOM-first)', () => {
+  /** jsdom lacks `document.elementFromPoint`; define it per-test and remove after. */
+  function stubElementFromPoint(returnValue: Element | null): () => void {
+    const mock = vi.fn().mockReturnValue(returnValue)
+    Object.defineProperty(document, 'elementFromPoint', { value: mock, configurable: true })
+    return () => { delete (document as unknown as Record<string, unknown>).elementFromPoint }
   }
 
   afterEach(() => {
-    if (originalWidth !== undefined) Object.defineProperty(window, 'innerWidth', originalWidth)
-    if (originalHeight !== undefined) Object.defineProperty(window, 'innerHeight', originalHeight)
-    vi.restoreAllMocks()
+    delete (document as unknown as Record<string, unknown>).elementFromPoint
   })
 
-  it('maps a screenshot pixel to CSS px using the injected capture-time viewport (preferred over a stale window read)', () => {
-    // The model reads a 2048x971 image down-scaled from a capture whose CSS
-    // viewport is 1920x1073 (aspect ~1.79). The PNG aspect ratio (~2.11) does
-    // NOT match the CSS viewport, so a stale dispatch-time window read (set to a
-    // different 3840x1858) would drift; the injected viewportCss is authoritative.
-    setViewport(3840, 1858)
-    expect(screenshotPointToCss(470, 370, { width: 2048, height: 971 }, { width: 1920, height: 1073 })).toEqual({
-      // 470 * (1920/2048) = 440.625 ; 370 * (1073/971) ≈ 408.86
-      x: 470 * (1920 / 2048),
-      y: 370 * (1073 / 971),
-    })
+  it('names a target element at a coordinate via elementFromPoint', () => {
+    document.body.innerHTML = '<button id="submit">Submit</button>'
+    const button = document.getElementById('submit')!
+    stubElementFromPoint(button)
+    expect(elementAtPoint(120, 20)).toBe(button)
+    // The readback describes the element under the coordinate so the model can
+    // verify the pointer reached the intended target.
+    expect(describeElementAt(elementAtPoint(120, 20))).toBe('<button>Submit</button>')
   })
 
-  it('falls back to a live window.innerWidth/innerHeight read when no viewport was injected', () => {
-    setViewport(3840, 1858)
-    const imageSize = { width: 2048, height: 991 }
-    expect(screenshotPointToCss(900, 500, imageSize)).toEqual({
-      x: 900 * (3840 / 2048),
-      y: 500 * (1858 / 991),
-    })
+  it('describes the page background and a null hit', () => {
+    expect(describeElementAt(document.body)).toBe('page background')
+    expect(describeElementAt(document.documentElement)).toBe('page background')
+    expect(describeElementAt(null)).toBe('nothing')
   })
 
-  it('falls back to an identity scale when neither the viewport nor the window basis is available', () => {
-    // Make the viewport unreadable and supply no viewportCss, so the helper falls
-    // back to the image size itself (scale = 1 -> identity).
-    Object.defineProperty(window, 'innerWidth', { value: undefined, configurable: true })
-    Object.defineProperty(window, 'innerHeight', { value: undefined, configurable: true })
-    try {
-      expect(screenshotPointToCss(900, 500, { width: 2048, height: 991 })).toEqual({ x: 900, y: 500 })
-    } finally {
-      if (originalWidth !== undefined) Object.defineProperty(window, 'innerWidth', originalWidth)
-      if (originalHeight !== undefined) Object.defineProperty(window, 'innerHeight', originalHeight)
-    }
+  it('reports hit:true when the point resolves to the target or one of its descendants', () => {
+    document.body.innerHTML = '<div id="card"><button id="inner">OK</button></div>'
+    const card = document.getElementById('card')!
+    const inner = document.getElementById('inner')!
+    stubElementFromPoint(inner)
+    // The tap point is inside the card's subtree, so it counts as a hit.
+    expect(confirmElementHit(card, 12, 40)).toMatchObject({ x: 12, y: 40, hit: true, under: inner })
   })
 
-  it('keeps a coordinate unchanged when no image size is supplied (no screenshot basis)', () => {
-    setViewport(3840, 1858)
-    expect(screenshotPointToCss(150, 120)).toEqual({ x: 150, y: 120 })
+  it('reports hit:false when elementFromPoint resolves to a different element (covered/mislocated)', () => {
+    document.body.innerHTML = '<div id="target">Target</div><div id="overlay">Overlay</div>'
+    const target = document.getElementById('target')!
+    const overlay = document.getElementById('overlay')!
+    stubElementFromPoint(overlay)
+    const hit = confirmElementHit(target, 12, 40)
+    expect(hit.hit).toBe(false)
+    expect(hit.under).toBe(overlay)
   })
 
-  it('keeps a coordinate unchanged when the image size is missing or invalid', () => {
-    setViewport(3840, 1858)
-    expect(screenshotPointToCss(150, 120, undefined)).toEqual({ x: 150, y: 120 })
-    expect(screenshotPointToCss(150, 120, { width: 0, height: 991 })).toEqual({ x: 150, y: 120 })
-    expect(screenshotPointToCss(150, 120, { width: NaN, height: 991 })).toEqual({ x: 150, y: 120 })
-    expect(screenshotPointToCss(150, 120, { width: 2048, height: -5 })).toEqual({ x: 150, y: 120 })
+  it('reports hit:false when jsdom has no layout engine (elementFromPoint unavailable)', () => {
+    // A real jsdom elementFromPoint is undefined; the confirmation must degrade
+    // to hit:false (a warning to the model) rather than throwing, and the
+    // click/hover action still proceeds (the humanized CDP plan is the executor).
+    document.body.innerHTML = '<button id="submit">Submit</button>'
+    const button = document.getElementById('submit')!
+    const hit = confirmElementHit(button, 120, 20)
+    expect(hit.hit).toBe(false)
+    expect(hit.under).toBeNull()
   })
 })
