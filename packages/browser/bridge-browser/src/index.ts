@@ -295,6 +295,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         + 'repeat browser_get_text or browser_click to feel out an index; a coordinate read from the screenshot '
         + 'is the faster and certain fix.',
     }), 'bridge-browser: index-fallback system prompt section')
+
+    // Over-confirmation blooms: a model that re-snapshots or re-screenshots
+    // the same view on every step turns a short locate into a long loop. This
+    // is a soft constraint on TOP of the guidance above (confirm-before-click
+    // / index-fallback / click-at still require one confirm screenshot before
+    // an action) — it says: confirm once, then act, do not re-confirm the
+    // same region repeatedly. English only (composition.spec asserts no Han).
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:reduce-reconfirm',
+      order: 113,
+      text: 'Do not take snapshots or screenshots unless you actually need them. Use browser_snapshot to read page '
+        + 'context or its changes, and browser_screenshot only to confirm a target\'s coordinates/landing point '
+        + 'before an action or when the visual state cannot be judged from the snapshot. Do not re-capture on every '
+        + 'step. If you already know the target position or already saw that region and the page has not changed, '
+        + 'do not re-snapshot or re-screenshot the same region; with delta:true take only the changes instead of a '
+        + 'full capture. Re-capture only when navigation, scroll, or a click changed the view, or when you need a '
+        + 'new target; in a single locating flow do not repeatedly snapshot/screenshot the same region. The confirm '
+        + 'screenshot from the confirm-before-click, click-at and index-fallback guidance is one check right before '
+        + 'an action, not part of a repeating snapshot -> screenshot -> judge -> snapshot -> screenshot loop; if one '
+        + 'screenshot already gives readable coordinates, act directly.',
+    }), 'bridge-browser: reduce-reconfirm system prompt section')
   }
 
   ctx.logger.info(

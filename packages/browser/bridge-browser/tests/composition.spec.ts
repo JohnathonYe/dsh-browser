@@ -228,6 +228,18 @@ describe('real Loader composition', () => {
     expect(indexFallbackPrompt).toContain('browser_drag_at(fromX, fromY, toX, toY)')
     expect(indexFallbackPrompt).not.toMatch(/\p{Script=Han}/u)
 
+    // Over-confirmation guard must bound snapshot/screenshot to when they are
+    // needed, steer delta:true to fetch only changes, and forbid re-confirming
+    // the same region in a single locating flow. Keep it English (no Han).
+    const reduceReconfirmPrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:reduce-reconfirm')?.text
+    expect(reduceReconfirmPrompt).toBeDefined()
+    expect(reduceReconfirmPrompt).toContain('Do not take snapshots or screenshots unless you actually need them')
+    expect(reduceReconfirmPrompt).toContain('delta:true')
+    expect(reduceReconfirmPrompt).toContain('Do not re-capture on every step')
+    expect(reduceReconfirmPrompt).toContain('do not repeatedly snapshot/screenshot the same region')
+    expect(reduceReconfirmPrompt).not.toMatch(/\p{Script=Han}/u)
+
     // Zero-config discovery endpoint answers with the bridge WebSocket URL.
     const configResponse = await fetch(`http://127.0.0.1:${port}/ext/bridge-config`)
     expect(configResponse.status).toBe(200)
