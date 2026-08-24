@@ -1,12 +1,24 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  buildClickSteps,
+  buildMoveToSteps,
+  buildWheelSteps,
+  dispatchMouseSteps,
   ensureInViewport,
   humanWheelScroll,
-  moveMouseSynchronous,
 } from '../src/content/movement.ts'
+import { installPointerCdpMock, type PointerCdpMock } from './pointer-mock.ts'
+
+let pointerMock: PointerCdpMock | undefined
+
+beforeEach(() => {
+  vi.useFakeTimers()
+  pointerMock = installPointerCdpMock(true)
+})
 
 afterEach(() => {
+  pointerMock?.restore()
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -34,38 +46,115 @@ describe('ensureInViewport', () => {
   })
 })
 
-describe('moveMouseSynchronous', () => {
-  it('glides a curved path of mousemove events toward the element (no teleport)', () => {
+describe('buildClickSteps', () => {
+  it('glides a curved path, presses and releases at a random point inside the element', () => {
     const el = document.createElement('button')
     el.getBoundingClientRect = () => ({
-      top: 100, left: 100, right: 200, bottom: 140, width: 100, height: 40, x: 100, y: 100,
+      top: 100, left: 100, right: 200, bottom: 160, width: 100, height: 60, x: 100, y: 100,
       toJSON: () => ({}),
     }) as DOMRect
-    const dispatch = vi.spyOn(document.body, 'dispatchEvent')
-    // A single synthetic click would be one event; a human move must be many.
-    moveMouseSynchronous(el)
-    const moves = dispatch.mock.calls.filter(([event]) => (event as MouseEvent).type === 'mousemove')
+
+    const steps = buildClickSteps(el)
+    const moves = steps.filter((step) => step.type === 'mouseMoved')
+    // A single synthetic click would be one event; a human click must be many.
     expect(moves.length).toBeGreaterThan(5)
     // Intermediate positions are distinct, so the pointer is not teleported.
-    const xs = moves.map(([event]) => (event as MouseEvent).clientX)
+    const xs = moves.map((step) => step.x)
     expect(new Set(xs).size).toBeGreaterThan(2)
+
+    // Every step carries a real random pause => non-robotic rhythm.
+    expect(steps.every((step) => (step.pauseAfterMs ?? 0) > 0)).toBe(true)
+
+    // A press and a release close the plan, each at the target point.
+    expect(steps.some((step) => step.type === 'mousePressed' && step.button === 'left' && step.buttons === 1)).toBe(true)
+    expect(steps.some((step) => step.type === 'mouseReleased' && step.buttons === 0)).toBe(true)
+    const press = steps.find((step) => step.type === 'mousePressed')!
+    // The tap point sits inside the element rect.
+    expect(press.x).toBeGreaterThanOrEqual(100)
+    expect(press.x).toBeLessThanOrEqual(200)
+    expect(press.y).toBeGreaterThanOrEqual(100)
+    expect(press.y).toBeLessThanOrEqual(160)
+  })
+
+  it('does not always tap the exact centroid (dead center)', () => {
+    const el = document.createElement('button')
+    const rect = { top: 100, left: 100, right: 200, bottom: 160, width: 100, height: 60, x: 100, y: 100, toJSON: () => ({}) } as DOMRect
+    el.getBoundingClientRect = () => rect
+    const points = new Set<string>()
+    for (let i = 0; i < 40; i += 1) {
+      const press = buildClickSteps(el).find((step) => step.type === 'mousePressed')!
+      points.add(`${press.x},${press.y}`)
+    }
+    // The tap points vary across many samples and never all collapse to the
+    // geometric center (150, 130).
+    expect(points.size).toBeGreaterThan(5)
+    expect(points.has('150,130')).toBe(false)
   })
 })
 
-describe('humanWheelScroll', () => {
-  it('applies the scroll as several wheel segments with pauses', async () => {
-    vi.useFakeTimers()
-    const scrollBy = vi.fn()
-    vi.spyOn(window, 'scrollBy').mockImplementation(scrollBy)
-    const dispatch = vi.spyOn(window, 'dispatchEvent')
+describe('dispatchMouseSteps', () => {
+  it('sends the pointer plan to the background as a real CDP plan', async () => {
+    const el = document.createElement('button')
+    el.getBoundingClientRect = () => ({
+      top: 100, left: 100, right: 200, bottom: 160, width: 100, height: 60, x: 100, y: 100,
+      toJSON: () => ({}),
+    }) as DOMRect
 
-    const pending = humanWheelScroll(400, { segments: 4, stepMs: 10 })
-    await vi.advanceTimersByTimeAsync(200)
+    await dispatchMouseSteps(buildClickSteps(el))
+    expect(pointerMock!.sendMessage).toHaveBeenCalled()
+    const plan = pointerMock!.captured[0]!
+    expect(plan.steps.some((step) => step.type === 'mouseMoved')).toBe(true)
+    expect(plan.steps.some((step) => step.type === 'mousePressed')).toBe(true)
+    expect(plan.steps.some((step) => step.type === 'mouseReleased')).toBe(true)
+  })
 
+  it('falls back to synthetic DOM events when CDP input is declined', async () => {
+    pointerMock!.setOk(false)
+    const el = document.createElement('button')
+    el.getBoundingClientRect = () => ({
+      top: 100, left: 100, right: 200, bottom: 160, width: 100, height: 60, x: 100, y: 100,
+      toJSON: () => ({}),
+    }) as DOMRect
+    const dispatch = vi.spyOn(document.body, 'dispatchEvent')
+
+    const pending = dispatchMouseSteps(buildClickSteps(el))
+    // The synthetic fallback sleeps between steps; drive the fake clock.
+    await vi.advanceTimersByTimeAsync(5_000)
     await pending
-    expect(scrollBy).toHaveBeenCalled()
-    expect(scrollBy.mock.calls.length).toBeGreaterThanOrEqual(4)
-    const wheel = dispatch.mock.calls.filter(([event]) => (event as Event).type === 'wheel')
-    expect(wheel.length).toBeGreaterThanOrEqual(4)
+    // Synthetic fallback re-dispatches the events on the page.
+    const moves = dispatch.mock.calls.filter(([event]) => (event as MouseEvent).type === 'mousemove')
+    expect(moves.length).toBeGreaterThan(5)
+  })
+})
+
+describe('buildWheelSteps / humanWheelScroll', () => {
+  it('splits the scroll into several real wheel ticks that sum to the delta', async () => {
+    const steps = buildWheelSteps(400, { segments: 4 })
+    const wheels = steps.filter((step) => step.type === 'mouseWheel')
+    expect(wheels.length).toBe(4)
+    const total = wheels.reduce((sum, step) => sum + (step.deltaY ?? 0), 0)
+    expect(total).toBe(400)
+    expect(steps[0]!.type).toBe('mouseMoved')
+  })
+
+  it('dispatches real wheel steps via the CDP plan', async () => {
+    await humanWheelScroll(400, { segments: 6 })
+    const plan = pointerMock!.captured[0]!
+    const wheels = plan.steps.filter((step) => step.type === 'mouseWheel')
+    expect(wheels.length).toBeGreaterThanOrEqual(6)
+  })
+})
+
+describe('buildMoveToSteps', () => {
+  it('glides to a random point without pressing (for link activation)', () => {
+    const el = document.createElement('a')
+    el.getBoundingClientRect = () => ({
+      top: 30, left: 40, right: 240, bottom: 70, width: 200, height: 40, x: 40, y: 30,
+      toJSON: () => ({}),
+    }) as DOMRect
+    const steps = buildMoveToSteps(el)
+    expect(steps.every((step) => step.type === 'mouseMoved')).toBe(true)
+    expect(steps.some((step) => step.type === 'mousePressed')).toBe(false)
+    expect(steps.length).toBeGreaterThan(5)
   })
 })

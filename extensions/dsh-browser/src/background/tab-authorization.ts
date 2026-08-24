@@ -186,6 +186,12 @@ export class TabAuthorizationController {
         changed = true
       }
     }
+    // Chrome 不允许空标签组：组内最后一个 tab 关闭后该组即消失（通常触发
+    // tabGroups.onRemoved）。这里顺手清理已变空的授权 group record，避免
+    // isAuthorizedGroup 对「组还在但已空」的残留组继续返回 true。
+    if (changed && record.tabIds.size === 0) {
+      this.groups.delete(groupId)
+    }
     if (changed) this.bump()
     return changed
   }

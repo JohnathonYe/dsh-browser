@@ -15,12 +15,14 @@ import type { ElementIds } from './ids.ts'
 import type { SnapshotBudget } from './snapshot.ts'
 import { buildSnapshot, renderSnapshot } from './snapshot.ts'
 import {
+  clickElement,
   dragFromTo,
   elementCenter,
+  elementRandomPoint,
   ensureInViewport,
+  hoverElement,
   humanWheelScroll,
-  moveMouseHuman,
-  moveMouseSynchronous,
+  movePointerTo,
 } from './movement.ts'
 
 /** A settled action result. */
@@ -207,9 +209,12 @@ function rangeValueToX(input: HTMLInputElement, value: number): number {
 async function dragRangeTo(input: HTMLInputElement, targetValue: number): Promise<void> {
   const target = clampRangeValue(input, targetValue)
   const center = elementCenter(input)
-  const from = { x: rangeValueToX(input, Number(input.value) || 0), y: center.y }
-  const to = { x: rangeValueToX(input, target), y: center.y }
-  await dragFromTo(input, from, to, { stepMs: 12, steps: 7 })
+  // Small vertical jitter keeps the thumb press inside the track while never
+  // landing on the exact midline every time.
+  const yJitter = (Math.random() - 0.5) * input.getBoundingClientRect().height * 0.4
+  const from = { x: rangeValueToX(input, Number(input.value) || 0), y: center.y + yJitter }
+  const to = { x: rangeValueToX(input, target), y: center.y + yJitter }
+  await dragFromTo(input, from, to, { steps: 7 })
   setNativeValue(input, String(target))
 }
 
@@ -289,8 +294,11 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
   // Never operate on an off-screen target: bring it into the viewport first.
   ensureInViewport(el)
   if (el instanceof HTMLAnchorElement) {
-    // Humanized pointer: glide along a curve to the link before activating it.
-    moveMouseSynchronous(el)
+    // Humanized pointer: glide the REAL cursor along a curve to a random point
+    // on the link so the page sees the arrival + `:hover`. Activation stays on
+    // the existing logic below (a cross-document CDP press/release would race
+    // the content script unload, and the link semantics are preserved here).
+    await movePointerTo(el)
     const target = el.target.trim().toLowerCase()
     const sameFrameTarget = target === '' || target === '_self'
     let href: URL | undefined
@@ -349,16 +357,18 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
     throw new ActionError('action-failed', `Button [${index}] is disabled.`)
   }
   if (isRangeElement(el)) {
-    // A slider/range is driven by dragging, not by a plain click: glide the
-    // pointer there, then drag the thumb toward where the cursor landed.
-    moveMouseSynchronous(el)
+    // A slider/range is driven by dragging, not by a plain click: the drag
+    // plan itself glides the real pointer to the thumb and drags it.
     const value = rangeClickValue(el)
     await dragRangeTo(el, value)
     await waitForPageSettled(ACTION_SETTLE)
     return withPageDelta(`Dragged slider [${index}] to ${value}.`, ctx)
   }
-  moveMouseSynchronous(el)
-  ;(el as HTMLElement).click()
+  // Real pointer: glide to a random point on the element, press, release. The
+  // renderer synthesizes a genuine click (and `:active`), which synthetic
+  // dispatchEvent can never do. Falls back to synthetic events only when CDP
+  // input is unavailable.
+  await clickElement(el)
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(`Clicked [${index}].`, ctx)
 }
@@ -374,11 +384,13 @@ async function typeAction(args: Record<string, unknown>, ctx: ActionContext): Pr
   if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || contentEditable)) {
     throw new ActionError('action-failed', `Element [${index}] is not editable (${el.tagName.toLowerCase()}).`)
   }
-  // Focus the field before writing so the page sees a real (and focused)
-  // cursor rather than only a value mutation.
-  if (contentEditable || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-    try { (el as HTMLElement).focus() } catch { /* some fields refuse focus; value write still applies */ }
-  }
+  // Focus the field before writing so the page sees a REAL focused caret
+  // rather than only a value mutation. A real CDP click focuses the control,
+  // places the caret and fires focus handlers; the value write below is then
+  // applied on top. Synthetic `.focus()` is kept only as the CDP fallback.
+  const field = el as HTMLInputElement | HTMLTextAreaElement | HTMLElement
+  try { await clickElement(el) } catch { /* focus via CDP failed; fall through */ }
+  try { (field as HTMLElement).focus() } catch { /* some fields refuse focus; value write still applies */ }
   if (contentEditable) {
     if (replace) el.textContent = ''
     el.textContent = `${el.textContent ?? ''}${text}`
@@ -424,9 +436,10 @@ async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): 
     default:
       throw new ActionError('bad-args', `direction must be up, down, top, or bottom; received "${direction}".`)
   }
-  // Split the scroll into several wheel ticks with small pauses instead of
-  // jumping the page in one instant move, so the motion reads as a hand.
-  await humanWheelScroll(delta, { segments: 6, stepMs: 14 })
+  // Split the scroll into several REAL wheel ticks with small random pauses
+  // instead of jumping the page in one instant move, so the motion reads as
+  // a hand (and the page actually receives wheel events).
+  await humanWheelScroll(delta, { segments: 6 })
   await waitForPageSettled(SCROLL_SETTLE)
   return withPageDelta(`Scrolled ${direction}.`, ctx)
 }
@@ -435,10 +448,10 @@ async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): P
   const index = numberArg(args, 'index')
   const el = elementOrThrow(ctx.ids, index)
   ensureInViewport(el)
-  // Move the pointer over the element and let JS-driven hover affordances
-  // (tooltips, dropdown previews) render before the model decides whether to
-  // click. The returned delta carries whatever a hover revealed.
-  await moveMouseHuman(el, { stepMs: 12, settleMs: 150 })
+  // Move the REAL pointer over a random point on the element and let
+  // :hover-driven affordances (tooltips, dropdown previews) render before the
+  // model decides whether to click.
+  await hoverElement(el)
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(
     `Hovered [${index}]. The pointer is now over the element; call browser_snapshot to read any hover effect.`,
@@ -455,7 +468,6 @@ async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Pr
     if (value === undefined) {
       throw new ActionError('bad-args', 'value is required to drag a slider/range element.')
     }
-    moveMouseSynchronous(el)
     await dragRangeTo(el, value)
     await waitForPageSettled(ACTION_SETTLE)
     return withPageDelta(`Dragged slider [${index}] to ${clampRangeValue(el, value)}.`, ctx)
@@ -465,9 +477,10 @@ async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Pr
   if (dx === 0 && dy === 0) {
     throw new ActionError('bad-args', 'Provide value (for a slider/range) or dx/dy (for a generic drag).')
   }
-  moveMouseSynchronous(el)
-  const center = elementCenter(el)
-  await dragFromTo(el, center, { x: center.x + dx, y: center.y + dy }, { stepMs: 12, steps: 7 })
+  // Grab a random point on the element (a hand never takes the exact centre),
+  // then drag by the requested delta with the real pointer.
+  const from = elementRandomPoint(el)
+  await dragFromTo(el, from, { x: from.x + dx, y: from.y + dy }, { steps: 7 })
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(`Dragged [${index}] by (${dx}, ${dy}).`, ctx)
 }

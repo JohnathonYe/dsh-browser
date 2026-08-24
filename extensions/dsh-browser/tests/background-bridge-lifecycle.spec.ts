@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi, type Mock } from 'vitest'
 
 class FakeWebSocket extends EventTarget {
   static readonly CONNECTING = 0
@@ -93,6 +93,7 @@ function mockChrome(options: {
       get: vi.fn(async (tabId: number) => ({ id: tabId, windowId: 1, title: 'Tab', url: 'https://example.com/' })),
       query: vi.fn(async () => [{ id: 1, windowId: 1, title: 'Tab', url: 'https://example.com/' }]),
       sendMessage: vi.fn(async () => {}),
+      create: vi.fn(async (props: chrome.tabs.CreateProperties) => ({ id: 42, windowId: 1, title: 'New Tab', url: props.url ?? '' }) as chrome.tabs.Tab),
       group: vi.fn(async () => 1),
       onActivated: chromeEvent<[{ tabId: number; windowId: number }]>(),
       onUpdated: chromeEvent<[number, chrome.tabs.TabChangeInfo, chrome.tabs.Tab]>(),
@@ -206,6 +207,97 @@ describe('background bridge lifecycle', () => {
     expect(chrome.tabs.group).not.toHaveBeenCalled()
   })
 
+  it('never self-groups/navigates the current regular page on browser_navigate when no group exists', async () => {
+    mockChrome()
+    // The active page is a real third-party page (NOT dsh-web): the worst case for the old bug,
+    // where the current page was bound into DSH-AI and then navigated away from the user.
+    vi.mocked(chrome.tabs.query).mockResolvedValue([
+      { id: 1, windowId: 1, title: 'Example', url: 'https://example.com/' } as chrome.tabs.Tab,
+    ])
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+
+    const socket = FakeWebSocket.instances[0]!
+    const sent: string[] = []
+    socket.send = vi.fn((frame?: string) => { if (frame) sent.push(frame) }) as unknown as typeof socket.send
+    socket.open()
+    await Promise.resolve()
+    socket.receive({ t: 'hello.ok', caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 } })
+    // Let the budget push (DSH_BUDGET) flush to the tab before we start observing.
+    await vi.waitFor(() => { expect(chrome.tabs.sendMessage).toHaveBeenCalled() })
+
+    // Drop any bridge-init message so we can prove the current page is never dispatched/navigated.
+    vi.mocked(chrome.tabs.sendMessage).mockClear()
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'nav1',
+      name: 'browser_navigate',
+      args: { url: 'https://news.baidu.com' },
+      expiresAt: Date.now() + 90_000,
+      sessionId: 's1',
+    })
+    await vi.waitFor(() => {
+      expect(sent.some((s) => s.includes('tool.result'))).toBe(true)
+    })
+    const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean; error?: { code?: string; message?: string } })
+      .find((f) => f.t === 'tool.result')!
+    // No auth group: the current page must never be grouped (the old hijack is gone).
+    expect(chrome.tabs.group).not.toHaveBeenCalled()
+    // Nor is it navigated: no content-script dispatch reached the tab.
+    expect(chrome.tabs.sendMessage).not.toHaveBeenCalled()
+    // Guidance points the AI to browser_new_tab instead of reusing the current page.
+    expect(sentFrame).toMatchObject({ t: 'tool.result', ok: false, error: { code: 'no-active-tab' } })
+    expect(sentFrame.error!.message).toContain('browser_new_tab')
+  })
+
+  it('cold-start builds a fresh DSH- group from browser_new_tab, never the current page', async () => {
+    mockChrome()
+    // The current page the user is viewing is a real page; it must stay untouched.
+    vi.mocked(chrome.tabs.query).mockResolvedValue([
+      { id: 1, windowId: 1, title: 'Example', url: 'https://example.com/' } as chrome.tabs.Tab,
+    ])
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+
+    const socket = FakeWebSocket.instances[0]!
+    const sent: string[] = []
+    socket.send = vi.fn((frame?: string) => { if (frame) sent.push(frame) }) as unknown as typeof socket.send
+    socket.open()
+    await Promise.resolve()
+    socket.receive({ t: 'hello.ok', caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 } })
+    await Promise.resolve()
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'new1',
+      name: 'browser_new_tab',
+      args: { url: 'https://news.baidu.com/' },
+      expiresAt: Date.now() + 90_000,
+      sessionId: 's1',
+    })
+    await vi.waitFor(() => {
+      expect(sent.some((s) => s.includes('tool.result'))).toBe(true)
+    })
+    // A brand-new tab is opened; the group is built on that NEW tab (id 42), never the current page (id 1).
+    expect(chrome.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://news.baidu.com/' }))
+    expect(chrome.tabs.group).toHaveBeenCalledWith({ tabIds: [42] })
+    expect(chrome.tabGroups.update).toHaveBeenCalledWith(1, { title: 'DSH-AI' })
+    const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean })
+      .find((f) => f.t === 'tool.result')!
+    expect(sentFrame).toMatchObject({ t: 'tool.result', ok: true })
+  })
+
   it('does not let keepalive reclaim a bridge that replaced this client (4000)', async () => {
     const chromeMock = mockChrome()
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
@@ -262,5 +354,94 @@ describe('background bridge lifecycle', () => {
     await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(2) })
     expect(FakeWebSocket.instances[1]!.url).toBe('ws://127.0.0.1:3081/ext/bridge')
     expect(originalSocket.readyState).toBe(FakeWebSocket.CLOSED)
+  })
+
+  it('revokes authorization when a single tab in an authorized group closes', async () => {
+    const chromeMock = mockChrome()
+    const sessionGet = chrome.storage.session.get as unknown as Mock
+    // Seed a stored authorization for group 5 containing two tabs.
+    sessionGet.mockResolvedValue({ 'dshTabAuthorization': { groupIds: [5] } })
+    vi.mocked(chrome.tabs.query).mockImplementation(async (queryInfo: chrome.tabs.QueryInfo) => {
+      if ('groupId' in queryInfo && queryInfo.groupId === 5) {
+        return [
+          { id: 1, windowId: 1, title: 'A', url: 'https://a.example/' } as chrome.tabs.Tab,
+          { id: 2, windowId: 1, title: 'B', url: 'https://b.example/' } as chrome.tabs.Tab,
+        ]
+      }
+      return [{ id: 1, windowId: 1, title: 'Tab', url: 'https://example.com/' } as chrome.tabs.Tab]
+    })
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    // Wait for the stored authorization (group 5) to be restored + persisted.
+    await vi.waitFor(() => {
+      expect(chrome.storage.session.set).toHaveBeenCalledWith({ 'dshTabAuthorization': { groupIds: [5] } })
+    })
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+
+    // Close tab 1; group 5 still holds tab 2. The affinity mechanism is unbound so
+    // `tabAffinity.removeTab(1)` returns false, which must NOT skip the auth cleanup.
+    ;(chrome.tabs.onRemoved as unknown as { emit: (tabId: number) => void }).emit(1)
+    await vi.waitFor(() => {
+      expect(panel.port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'tab-authorization' }))
+    })
+
+    type AuthFrame = { type: string; state?: { groups: { groupId: number; tabIds: number[] }[] } }
+    const lastAuth = vi.mocked(panel.port.postMessage).mock.calls
+      .map(([msg]) => msg as AuthFrame)
+      .filter((m) => m.type === 'tab-authorization')
+      .at(-1)!
+    // The closed tab is removed from the authorized group; the sibling tab remains.
+    expect(lastAuth.state!.groups.find((g) => g.groupId === 5)?.tabIds).toEqual([2])
+    // No authorized group still holds tab 1.
+    expect(lastAuth.state!.groups.some((g) => g.tabIds.includes(1))).toBe(false)
+  })
+
+  it('cleans up an authorized group record when its last tab closes', async () => {
+    const chromeMock = mockChrome()
+    const sessionGet = chrome.storage.session.get as unknown as Mock
+    // Seed a stored authorization for group 6 containing only one tab.
+    sessionGet.mockResolvedValue({ 'dshTabAuthorization': { groupIds: [6] } })
+    vi.mocked(chrome.tabs.query).mockImplementation(async (queryInfo: chrome.tabs.QueryInfo) => {
+      if ('groupId' in queryInfo && queryInfo.groupId === 6) {
+        return [{ id: 3, windowId: 1, title: 'C', url: 'https://c.example/' } as chrome.tabs.Tab]
+      }
+      return [{ id: 3, windowId: 1, title: 'Tab', url: 'https://example.com/' } as chrome.tabs.Tab]
+    })
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    await vi.waitFor(() => {
+      expect(chrome.storage.session.set).toHaveBeenCalledWith({ 'dshTabAuthorization': { groupIds: [6] } })
+    })
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+
+    // Close the only remaining tab in group 6.
+    ;(chrome.tabs.onRemoved as unknown as { emit: (tabId: number) => void }).emit(3)
+    await vi.waitFor(() => {
+      expect(panel.port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'tab-authorization' }))
+    })
+
+    type AuthFrame = { type: string; state?: { groups: { groupId: number }[] } }
+    const lastAuth = vi.mocked(panel.port.postMessage).mock.calls
+      .map(([msg]) => msg as AuthFrame)
+      .filter((m) => m.type === 'tab-authorization')
+      .at(-1)!
+    // The now-empty group must disappear from the authorized snapshot.
+    expect(lastAuth.state!.groups.some((g) => g.groupId === 6)).toBe(false)
   })
 })

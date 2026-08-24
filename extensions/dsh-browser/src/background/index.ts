@@ -39,6 +39,8 @@ import { BRIDGE_CONFIG_PATH, BRIDGE_PATH } from '@yuxianglin/dsh-bridge-browser/
 import { BridgeClient, type BridgeState } from './bridge.ts'
 import { createRpc } from './rpc.ts'
 import { dispatchToolCall, resetTabSnapshot, type ToolAnswer, type ToolCall } from './tools.ts'
+import { debuggerSession } from './debugger-session.ts'
+import { replayMouseSteps, type MouseStep } from './input.ts'
 import {
   isApprovalDecision,
   type ApprovalAuthorization,
@@ -609,6 +611,11 @@ function affinityFailure(kind: 'lost' | 'missing'): ToolAnswer {
   return { ok: false, error: { code: 'no-active-tab', message: 'No active tab is available for browser operations.' } }
 }
 
+/** 无授权组时的引导错误：绝不把当前活动页复用/自建/导航为受控目标，指引 AI 走 browser_new_tab 开目标页。 */
+function noAuthGroupError(): ToolAnswer {
+  return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Open a target tab first with browser_new_tab (a real URL), or authorize a group in the side panel.' } }
+}
+
 /** 解析为不含 scheme 的 "host:port" 标识；非 http(s)/ws(s) 返回 null。 */
 function httpOriginKey(url: string): string | null {
   try {
@@ -617,6 +624,20 @@ function httpOriginKey(url: string): string | null {
     return u.host
   } catch {
     return null
+  }
+}
+
+/** 把回环地址的常见写法归一（localhost / 127.0.0.1 / [::1]），避免同一 dsh 实例因主机写法不同被误判为第三方页。 */
+function canonicalOriginKey(originKey: string): string {
+  try {
+    const u = new URL(`http://${originKey}/`)
+    const host = u.hostname.toLowerCase()
+    const loopback = host === 'localhost' || host === '127.0.0.1' || host === '[::1]'
+    const port = u.port
+    const hostKey = loopback ? '127.0.0.1' : host
+    return port !== '' ? `${hostKey}:${port}` : hostKey
+  } catch {
+    return originKey.toLowerCase()
   }
 }
 
@@ -633,12 +654,7 @@ function isDshOwnPage(url: string): boolean {
   if (originKey === null) return false
   const bridgeKey = httpOriginKey(lastResolvedBridgeUrl ?? '')
   if (bridgeKey === null) return false
-  return originKey === bridgeKey
-}
-
-/** 冷启动可自建的受控目标必须是真实可操作的 Web 页面。 */
-function isSelfBuildTarget(tab: Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'>): boolean {
-  return !isDshOwnPage(tab.url ?? '')
+  return canonicalOriginKey(originKey) === canonicalOriginKey(bridgeKey)
 }
 
 /** 是否为真实可操作的 http(s) URL（可用于 browser_new_tab 冷启动建组）。 */
@@ -651,11 +667,10 @@ function isTargetableHttpUrl(url: string): boolean {
   }
 }
 
-/** Resolve one stable tool tab. 无授权组时直接取当前活动页作为冷启动目标；不再借用
- * affinity 的「跟随当前页 / keep-follow」绑定。用户切 tab 不再让操作暂停，也不弹
- * 提示。后续由 routeToolCall 的冷启动逻辑把该 tab 建成 DSH- 授权组，从而进入
- * 「只按授权组」的语义。若当前活动页是 DSH 自身页（dsh-web / 扩展页），则判定为
- * 无可用目标，跳过冷启动自建，交由模型走「打开目标 tab」路径。 */
+/** Resolve one stable tool tab. 仅用于「已废弃」的跟随页面（keep-follow）刷新快照路径，
+ * 不再作为冷启动自建目标：无授权组时 routeToolCall 已不经过这里，而是直接返回
+ * noAuthGroupError 引导 AI 走 browser_new_tab。若当前活动页是 DSH 自身页（dsh-web /
+ * 扩展页），则判定为无可用目标。 */
 async function resolveToolTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'> | ToolAnswer> {
   try {
     const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
@@ -847,6 +862,11 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
   if (call.name === 'browser_new_tab') {
     const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
     const groups = tabAuthorization.snapshot().groups
+    // dsh 自身页（dsh-web / 扩展页）绝不能成为受控目标：无论冷启动还是已有授权组下，
+    // browser_new_tab 都不把 dsh 页建成授权组，只应打开真实第三方页。
+    if (url !== undefined && isDshOwnPage(url)) {
+      return { ok: false, error: { code: 'no-active-tab', message: 'The target URL is a dsh page and cannot be an authorized target. Open a real third-party URL instead.' } }
+    }
     // 冷启动：完全没有任何授权组时，仅当 AI 明确打开一个真实 http(s) 目标时才建组
     // （这正是「打开目标 tab」路径，绝不把 dsh-web / 扩展页作为目标）。
     const hasRealUrl = url !== undefined && isTargetableHttpUrl(url)
@@ -884,6 +904,7 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     if (settings.sharePageContent === 'off') {
       return { ok: false, error: { code: 'action-failed', message: 'Page content sharing is disabled in Settings > Page content sharing.' } }
     }
+    if (tabAuthorization.snapshot().groups.length === 0) return noAuthGroupError()
     const target = await resolveAuthorizedTab()
     if ('ok' in target) return target
     const tabId = target.id
@@ -894,17 +915,16 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     // cannot hit a background tab the model targeted. The chrome.debugger
     // transport captures the exact tab regardless of what is on screen and
     // reports failures (e.g. "Another debugger is already attached") as errors.
-    let attached = false
+    // It shares one reference-counted debugger session with CDP pointer input.
     try {
-      await chrome.debugger.attach({ tabId }, '1.3')
-      attached = true
+      await debuggerSession.acquire(tabId)
       await withTimeout(
-        chrome.debugger.sendCommand({ tabId }, 'Page.enable'),
+        debuggerSession.sendCommand(tabId, 'Page.enable'),
         SCREENSHOT_TIMEOUT_MS,
         'Enabling the page domain timed out',
       )
       const capture = await withTimeout(
-        chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', { format: 'png' }),
+        debuggerSession.sendCommand(tabId, 'Page.captureScreenshot', { format: 'png' }),
         SCREENSHOT_TIMEOUT_MS,
         'Capturing the screenshot timed out',
       )
@@ -928,9 +948,7 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     } finally {
       // Detach only our own session so a failed attach cannot tear down a
       // debugger owned by someone else (e.g. an open DevTools window).
-      if (attached) {
-        await chrome.debugger.detach({ tabId }).catch(() => {})
-      }
+      await debuggerSession.release(tabId)
     }
   }
   return { ok: false, error: { code: 'action-failed', message: 'Unknown browser control tool.' } }
@@ -966,25 +984,14 @@ function routeToolCall(call: ToolCall): void {
   const budget = caps === null
     ? undefined
     : { maxItems: caps.maxInteractiveItems, maxChars: caps.snapshotMaxChars }
-  const resolveTarget = tabAuthorization.snapshot().groups.length > 0 ? resolveAuthorizedTab() : resolveToolTab()
+  // 无授权组时，绝不把当前活动页复用/导航/建组：唯一冷启动自建路径是 browser_new_tab。
+  // 其余 browser_* 工具在下方直接返回「请先打开目标标签页」引导，避免劫持用户当前页（尤其 dsh-web）。
+  const hasAuthGroups = tabAuthorization.snapshot().groups.length > 0
+  const resolveTarget = hasAuthGroups ? resolveAuthorizedTab() : Promise.resolve(noAuthGroupError())
   void resolveTarget.then(async (target) => {
     if ('ok' in target) return target
-    // 冷启动授权：完全没有任何授权组时，允许 AI 把本次操作的 tab 自动建成 DSH- 组并授权；
-    // 这样 AI 从零开始也能自己创建授权组。一旦已有授权组，就不再自动乱建（守住授权边界）。
-    // 目标必须是真实可操作的非 DSH 自身页，绝不能把 dsh-web / 扩展页绑进组。
-    if (tabAuthorization.snapshot().groups.length === 0
-      && target.id !== undefined
-      && target.windowId !== undefined
-      && isSelfBuildTarget(target)) {
-      try {
-        const groupId = await chrome.tabs.group({ tabIds: [target.id] })
-        const shown = normalizeGroupTitle('AI')
-        await chrome.tabGroups.update(groupId, { title: shown }).catch(() => {})
-        tabAuthorization.authorizeGroup(groupId, shown, [target.id])
-      } catch {
-        // 建组失败则维持未授权态，走原审批路径
-      }
-    }
+    // 只有 hasAuthGroups 为 true 才可能解析出 tab（否则上面已直接返回引导错误），
+    // 因此后续按授权组操作，不存在冷启动自建分支。
     const authorized = tabAuthorization.snapshot().groups.length > 0
     return dispatchToolCall(
       call,
@@ -1355,6 +1362,46 @@ chrome.notifications.onClicked.addListener((notificationId) => {
   openAssistantPanel(windowId)
 })
 
+// ---- CDP pointer input from the content script ----
+// The content script computes a humanized pointer plan (curve movement, random
+// in-element tap point, random pauses) and hands it to the background, which
+// replays it as REAL cursor events via `Input.dispatchMouseEvent`. This is the
+// only way the page sees an actual pointer and reacts to `:hover`/tooltips.
+// Only the top frame (frameId 0) drives CDP input; subframe coordinates are
+// frame-relative and cannot be addressed by a top-level Input dispatch, so a
+// subframe request is declined and the content script falls back to synthetic
+// events. The pointer plan is replayed to the tab that sent it, reusing the
+// same debugger session as screenshots.
+if (chrome.runtime.onMessage !== undefined) {
+  chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+    if (typeof message !== 'object' || message === null) return
+    const msg = message as { type?: unknown }
+    if (msg.type !== 'DSH_INPUT_MOUSE') return
+    const payload = message as { steps?: unknown }
+    const tabId = sender.tab?.id
+    if (tabId === undefined || !Array.isArray(payload.steps) || payload.steps.length === 0) {
+      sendResponse({ ok: false, error: 'no-tab' })
+      return
+    }
+    // Only the root frame produces viewport coordinates usable by CDP Input.
+    if ((sender as { frameId?: number }).frameId !== 0) {
+      sendResponse({ ok: false, error: 'subframe' })
+      return
+    }
+    const steps = payload.steps as MouseStep[]
+    // Reply immediately on the same message channel; the CDP replay runs in the
+    // worker but must not hold the content script's action hostage on failure.
+    void replayMouseSteps(tabId, steps).then(
+      () => { sendResponse({ ok: true }) },
+      (error: unknown) => {
+        const messageText = error instanceof Error ? error.message : String(error)
+        sendResponse({ ok: false, error: messageText })
+      },
+    )
+    return true // async response
+  })
+}
+
 // ---- Tab authorization event wiring ----
 chrome.tabs.onUpdated.addListener((tabId, _changeInfo, tab) => {
   void authorizationReady.then(async () => {
@@ -1434,6 +1481,15 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void affinityReady.then(() => {
+    // 组内单个 tab 关闭也必须同步撤销对应授权：即便旧亲和机制（tabAffinity）已
+    // 弃用且 `tabAffinity.removeTab` 返回 false，也不能因此跳过授权清理，否则被
+    // 关闭的 tab 会残留在授权组里，AI 拿到的授权/信息不准确。授权移除要放在
+    // affinity 的提前返回之前，保证一定会执行。
+    if (tabAuthorization.isAuthorizedTab(tabId)) {
+      tabAuthorization.removeTab(tabId)
+      persistTabAuthorization()
+      broadcastTabAuthorization()
+    }
     if (!tabAffinity.removeTab(tabId)) return
     activeFollowRefresh?.abort()
     cancelPendingApprovals()
