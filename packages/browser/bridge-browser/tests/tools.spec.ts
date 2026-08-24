@@ -39,6 +39,16 @@ describe('registerBrowserTools', () => {
     expect(result).toEqual({ text: 'ok' })
   })
 
+  it('executes browser_click_at with mapped viewport coordinates', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_click_at')!
+    const exec = { signal: new AbortController().signal }
+    const result = await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({ x: 120, y: 310 }, exec)
+    expect(requestTool).toHaveBeenCalledWith('browser_click_at', { x: 120, y: 310 }, exec.signal, 1_000)
+    expect(result).toEqual({ text: 'ok' })
+  })
+
   it('associates browser calls with the owning Agent session', async () => {
     const { ctx, bridge, requestTool, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
@@ -135,6 +145,14 @@ describe('registerBrowserTools', () => {
     }
     expect(click.properties.index).toBeDefined()
     expect(click.required).toContain('index')
+    const clickAt = registered.find(({ name }) => name === 'browser_click_at')!.definition.parameters as {
+      properties: Record<string, unknown>
+      required?: string[]
+    }
+    expect(clickAt.properties.x).toBeDefined()
+    expect(clickAt.properties.y).toBeDefined()
+    expect(clickAt.required).toContain('x')
+    expect(clickAt.required).toContain('y')
   })
 
   it('declares cooperative timeoutMs on every tool', () => {
@@ -170,7 +188,7 @@ describe('registerBrowserTools', () => {
       const params = byName.get(name)!.parameters as { properties: { frame?: { type?: unknown } } }
       expect(params.properties.frame?.type).toBe('number')
     }
-    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_back', 'browser_forward', 'browser_reload']) {
+    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_back', 'browser_forward', 'browser_reload', 'browser_click_at']) {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }

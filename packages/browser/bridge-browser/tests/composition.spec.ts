@@ -192,6 +192,27 @@ describe('real Loader composition', () => {
     expect(noAuthGroupPrompt).toContain('do not lead with a URL-less tool')
     expect(noAuthGroupPrompt).not.toMatch(/\p{Script=Han}/u)
 
+    // Confirm-before-click guidance must require a screenshot before every
+    // click/hover/drag so the model verifies the AI cursor overlay is on the
+    // intended target instead of acting by index alone. Keep it English (no Han).
+    const confirmBeforeClickPrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:confirm-before-click')?.text
+    expect(confirmBeforeClickPrompt).toBeDefined()
+    expect(confirmBeforeClickPrompt).toContain('browser_screenshot')
+    expect(confirmBeforeClickPrompt).toContain('confirm')
+    expect(confirmBeforeClickPrompt).toContain('do not click blindly')
+    expect(confirmBeforeClickPrompt).not.toMatch(/\p{Script=Han}/u)
+
+    // Coordinate clicking must be the preferred path after a screenshot
+    // confirms the target's exact viewport pixel. Keep it English (no Han).
+    const clickAtPrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:click-at')?.text
+    expect(clickAtPrompt).toBeDefined()
+    expect(clickAtPrompt).toContain('browser_screenshot')
+    expect(clickAtPrompt).toContain('browser_click_at(x, y)')
+    expect(clickAtPrompt).toContain('viewport')
+    expect(clickAtPrompt).not.toMatch(/\p{Script=Han}/u)
+
     // Zero-config discovery endpoint answers with the bridge WebSocket URL.
     const configResponse = await fetch(`http://127.0.0.1:${port}/ext/bridge-config`)
     expect(configResponse.status).toBe(200)

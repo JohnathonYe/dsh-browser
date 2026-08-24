@@ -1,12 +1,15 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  buildClickAtSteps,
   buildClickSteps,
   buildMoveToSteps,
   buildWheelSteps,
+  clickAt,
   dispatchMouseSteps,
   ensureInViewport,
   humanWheelScroll,
+  jitterPoint,
 } from '../src/content/movement.ts'
 import { installPointerCdpMock, type PointerCdpMock } from './pointer-mock.ts'
 
@@ -92,6 +95,85 @@ describe('buildClickSteps', () => {
   })
 })
 
+describe('buildClickAtSteps', () => {
+  it('glides to a small perturbation of the requested viewport point, then presses and releases there', () => {
+    const steps = buildClickAtSteps(500, 300)
+    const moves = steps.filter((step) => step.type === 'mouseMoved')
+    // A coordinate click is still a humanized glide with many steps, not a teleport.
+    expect(moves.length).toBeGreaterThan(5)
+    expect(steps.every((step) => (step.pauseAfterMs ?? 0) > 0)).toBe(true)
+
+    const press = steps.find((step) => step.type === 'mousePressed')!
+    const release = steps.find((step) => step.type === 'mouseReleased')!
+    expect(press.button).toBe('left')
+    expect(press.buttons).toBe(1)
+    expect(release.buttons).toBe(0)
+    // The tap lands within the default jitter (±4 CSS px) of the confirmed point.
+    expect(Math.abs(press.x - 500)).toBeLessThanOrEqual(4)
+    expect(Math.abs(press.y - 300)).toBeLessThanOrEqual(4)
+    // Press and release share the same tap point so the renderer synthesizes a click.
+    expect(press.x).toBe(release.x)
+    expect(press.y).toBe(release.y)
+  })
+
+  it('honours an explicit jitter radius', () => {
+    const steps = buildClickAtSteps(100, 100, { jitter: 12 })
+    const press = steps.find((step) => step.type === 'mousePressed')!
+    expect(Math.abs(press.x - 100)).toBeLessThanOrEqual(12)
+    expect(Math.abs(press.y - 100)).toBeLessThanOrEqual(12)
+  })
+
+  it('does not always land on the exact confirmed pixel (dead-point avoidance)', () => {
+    const points = new Set<string>()
+    for (let i = 0; i < 40; i += 1) {
+      const press = buildClickAtSteps(500, 300).find((step) => step.type === 'mousePressed')!
+      points.add(`${press.x},${press.y}`)
+    }
+    expect(points.size).toBeGreaterThan(5)
+    expect(points.has('500,300')).toBe(false)
+  })
+})
+
+describe('clickAt', () => {
+  it('sends a real CDP coordinate-click plan (moves, press, release) to the background', async () => {
+    await clickAt(420, 260)
+    expect(pointerMock!.sendMessage).toHaveBeenCalled()
+    const plan = pointerMock!.captured[0]!
+    expect(plan.steps.some((step) => step.type === 'mouseMoved')).toBe(true)
+    expect(plan.steps.some((step) => step.type === 'mousePressed')).toBe(true)
+    expect(plan.steps.some((step) => step.type === 'mouseReleased')).toBe(true)
+    // The press/release tap lands at (or a few px from) the confirmed point.
+    const press = plan.steps.find((step) => step.type === 'mousePressed')!
+    const release = plan.steps.find((step) => step.type === 'mouseReleased')!
+    expect(Math.abs(press.x - 420)).toBeLessThanOrEqual(10)
+    expect(Math.abs(press.y - 260)).toBeLessThanOrEqual(10)
+    expect(press.x).toBe(release.x)
+    expect(press.y).toBe(release.y)
+  })
+
+  it('falls back to synthetic DOM events when CDP input is declined', async () => {
+    pointerMock!.setOk(false)
+    const dispatch = vi.spyOn(document.body, 'dispatchEvent')
+    const pending = clickAt(200, 120)
+    await vi.advanceTimersByTimeAsync(5_000)
+    await pending
+    const moves = dispatch.mock.calls.filter(([event]) => (event as MouseEvent).type === 'mousemove')
+    expect(moves.length).toBeGreaterThan(5)
+  })
+})
+
+describe('jitterPoint', () => {
+  it('perturbs a coordinate within the requested radius', () => {
+    for (let i = 0; i < 50; i += 1) {
+      const p = jitterPoint(50, 70, 6)
+      expect(p.x).toBeGreaterThanOrEqual(44)
+      expect(p.x).toBeLessThanOrEqual(56)
+      expect(p.y).toBeGreaterThanOrEqual(64)
+      expect(p.y).toBeLessThanOrEqual(76)
+    }
+  })
+})
+
 describe('dispatchMouseSteps', () => {
   it('sends the pointer plan to the background as a real CDP plan', async () => {
     const el = document.createElement('button')
@@ -142,6 +224,47 @@ describe('buildWheelSteps / humanWheelScroll', () => {
     const plan = pointerMock!.captured[0]!
     const wheels = plan.steps.filter((step) => step.type === 'mouseWheel')
     expect(wheels.length).toBeGreaterThanOrEqual(6)
+  })
+
+  it('parks the cursor on a non-center, lower/side point before wheeling (never the viewport dead-center)', () => {
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    for (let i = 0; i < 40; i += 1) {
+      const steps = buildWheelSteps(300, { segments: 4 })
+      const firstWheel = steps.find((step) => step.type === 'mouseWheel')!
+      const ax = firstWheel.x
+      const ay = firstWheel.y
+      // Neither axis may sit on the midpoint, so the anchor is never (w/2, h/2).
+      expect(Math.abs(ax - vw / 2) > 1).toBe(true)
+      expect(Math.abs(ay - vh / 2) > 1).toBe(true)
+      // x avoids the vertical center column (a hand side/track, never the midpoint).
+      const inLeftBand = ax >= vw * 0.35 && ax <= vw * 0.47
+      const inRightBand = ax >= vw * 0.53 && ax <= vw * 0.68
+      expect(inLeftBand || inRightBand).toBe(true)
+      // y is biased toward the lower half.
+      expect(ay).toBeGreaterThanOrEqual(vh * 0.55)
+      expect(ay).toBeLessThanOrEqual(vh * 0.85)
+    }
+  })
+
+  it('glides the real cursor to the anchor (several moves + a settle) before the first wheel tick', async () => {
+    await humanWheelScroll(300, { segments: 4 })
+    const plan = pointerMock!.captured[0]!
+    const firstWheelIndex = plan.steps.findIndex((step) => step.type === 'mouseWheel')
+    expect(firstWheelIndex).toBeGreaterThan(-1)
+    // A hand glides to the anchor first, not a single teleport: many moves precede the first tick.
+    const movesBeforeWheel = plan.steps.slice(0, firstWheelIndex).filter((step) => step.type === 'mouseMoved')
+    expect(movesBeforeWheel.length).toBeGreaterThan(5)
+    // The cursor parks exactly where it will wheel (glide's last point == first wheel anchor).
+    const moves = plan.steps.filter((step) => step.type === 'mouseMoved')
+    const lastMove = moves[moves.length - 1]!
+    const firstWheel = plan.steps[firstWheelIndex]!
+    expect(Math.abs(lastMove.x - firstWheel.x)).toBeLessThanOrEqual(0.001)
+    expect(Math.abs(lastMove.y - firstWheel.y)).toBeLessThanOrEqual(0.001)
+    // And that anchor is not the viewport dead-center.
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    expect(Math.abs(firstWheel.x - vw / 2) > 1 && Math.abs(firstWheel.y - vh / 2) > 1).toBe(true)
   })
 })
 

@@ -234,6 +234,41 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         + 'which the page is operable. Order: establish the target page with browser_navigate/browser_new_tab first, then '
         + 'read it with browser_snapshot, then act with browser_click/browser_scroll/browser_type.',
     }), 'bridge-browser: no-auth-group system prompt section')
+
+    // Click/drag precision is model-driven. The AI cursor overlay is rendered
+    // into the screenshot pixels, so the model can see exactly where the
+    // pointer sits before it acts. Require a screenshot before every
+    // click/hover/drag so the model verifies the cursor is on the intended
+    // target instead of acting by inventory index alone. English only
+    // (composition.spec asserts no Han characters).
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:confirm-before-click',
+      order: 110,
+      text: 'Before every browser_click, browser_hover, or browser_drag, first call browser_screenshot. The AI cursor '
+        + 'overlay is drawn into the screenshot at its current CDP position, so it shows exactly where the pointer sits. '
+        + 'Confirm the cursor is on the intended element/point and that the target is in view. If it is not (wrong element, '
+        + 'off-screen, or the cursor has not reached the target), fix it first: browser_scroll to bring the target into view, '
+        + 'or browser_hover to the correct index so the cursor lands on it, then screenshot again. Only click or drag once '
+        + 'the screenshot shows the cursor on the intended target; if you cannot confirm, do not click blindly.',
+    }), 'bridge-browser: confirm-before-click system prompt section')
+
+    // Coordinate clicking is the more certain path: the model confirms the
+    // target's exact viewport pixel on a screenshot (the AI-cursor overlay and
+    // CDP Input share that coordinate space), then clicks it with
+    // browser_click_at(x, y) instead of acting by inventory index alone. The
+    // index-based browser_click stays supported for backward compatibility.
+    // English only (composition.spec asserts no Han characters).
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:click-at',
+      order: 111,
+      text: 'To click precisely, first call browser_screenshot. The AI cursor overlay is drawn into the screenshot at its '
+        + 'current CDP position, so the screenshot shows the exact viewport pixel where the pointer sits. Read the target '
+        + 'element\'s viewport CSS-pixel coordinates from that screenshot, then call browser_click_at(x, y) with those pixels '
+        + '(the same coordinate space as the screenshot, so the click lands where you see it). browser_click(index) from a '
+        + 'snapshot inventory remains supported, but a coordinate you have confirmed on the screenshot is the more certain '
+        + 'path and should be preferred when you can read an unambiguous point. After clicking, take a screenshot again to '
+        + 'confirm the result instead of assuming success.',
+    }), 'bridge-browser: click-at system prompt section')
   }
 
   ctx.logger.info(

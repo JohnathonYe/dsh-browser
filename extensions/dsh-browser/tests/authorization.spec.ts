@@ -67,6 +67,14 @@ describe('approvalPromptForCall', () => {
     expect(approvalPromptForCall(call('browser_wait'), 'auto', FRAMES, 'zh')).toBeUndefined()
   })
 
+  it('classifies a coordinate click as a state-changing action scoped to its frame', () => {
+    const prompt = approvalPromptForCall(call('browser_click_at', { x: 150, y: 300 }), 'auto', FRAMES, 'en')
+    expect(prompt).toMatchObject({ kind: 'action', origins: ['https://app.example'], canTrust: true })
+    expect(prompt?.summary).toBe('Click at (150, 300)')
+    const zhPrompt = approvalPromptForCall(call('browser_click_at', { x: 150, y: 300 }), 'auto', FRAMES, 'zh')
+    expect(zhPrompt?.summary).toBe('点击坐标 (150, 300)')
+  })
+
   it('renders approval summaries in English for non-Chinese browsers', () => {
     expect(approvalPromptForCall(call('browser_type', {
       index: 3,

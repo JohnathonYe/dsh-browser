@@ -137,3 +137,32 @@ describe('humanized click', () => {
     expect(types).toContain('mouseReleased')
   })
 })
+
+describe('coordinate click (browser_click_at)', () => {
+  it('clicks at the confirmed viewport pixel with a real press/release cursor plan', async () => {
+    document.body.innerHTML = '<button style="position:absolute;top:100px;left:100px">坐标</button>'
+    const ids = new ElementIds()
+    await runAction('browser_snapshot', {}, { ids, budget: BUDGET })
+
+    const pending = runAction('browser_click_at', { x: 150, y: 120 }, { ids, budget: BUDGET })
+    await vi.advanceTimersByTimeAsync(1_000)
+    const result = await pending
+
+    expect(result.text).toContain('Clicked at (150, 120)')
+    const plan = pointerMock!.captured[0]!
+    const types = plan.steps.map((step) => step.type)
+    expect(types).toContain('mouseMoved')
+    expect(types).toContain('mousePressed')
+    expect(types).toContain('mouseReleased')
+    // The tap stays near the requested pixel (default ±4px jitter).
+    const press = plan.steps.find((step) => step.type === 'mousePressed')!
+    expect(Math.abs(press.x - 150)).toBeLessThanOrEqual(4)
+    expect(Math.abs(press.y - 120)).toBeLessThanOrEqual(4)
+  })
+
+  it('rejects a non-finite coordinate', async () => {
+    const ids = new ElementIds()
+    await expect(runAction('browser_click_at', { x: 'left', y: 120 }, { ids, budget: BUDGET })).rejects.toThrow()
+    expect(pointerMock!.sendMessage).not.toHaveBeenCalled()
+  })
+})

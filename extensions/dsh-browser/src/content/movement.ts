@@ -220,6 +220,39 @@ export function buildClickSteps(el: Element): MouseStep[] {
   return steps
 }
 
+/**
+ * Perturb a requested viewport coordinate by a small random offset so the tap
+ * never lands on the exact (possibly dead) pixel but stays on the intended
+ * target. The offset is symmetric around the point and bounded by `jitter` px.
+ */
+export function jitterPoint(x: number, y: number, jitter?: number): Point {
+  const j = jitter ?? 4
+  return {
+    x: x + (Math.random() - 0.5) * 2 * j,
+    y: y + (Math.random() - 0.5) * 2 * j,
+  }
+}
+
+/**
+ * Build a plan that clicks AT a viewport CSS-pixel coordinate (no element
+ * reference): glide the cursor to a point perturbed around (x, y), press, and
+ * release. Mirrors `buildClickSteps` but aims at the given point instead of an
+ * element's random interior point, so the model can confirm the exact pixel on
+ * a screenshot and click it precisely.
+ */
+export function buildClickAtSteps(x: number, y: number, opts: { points?: number; jitter?: number } = {}): MouseStep[] {
+  const to = jitterPoint(x, y, opts.jitter)
+  const from = startPoint(to)
+  const steps: MouseStep[] = [
+    ...moveSteps(from, to, { points: opts.points ?? 9 }),
+    movedStep(to, 0, randomPause(RHYTHM_PAUSE)),
+    { type: 'mousePressed', x: to.x, y: to.y, button: 'left', buttons: 1, clickCount: 1, pauseAfterMs: randomPause(RHYTHM_PAUSE) },
+    { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1, pauseAfterMs: randomPause(RHYTHM_PAUSE) },
+  ]
+  rememberMouse(to)
+  return steps
+}
+
 /** Build a hover plan: glide to a random point, then rest so `:hover` renders. */
 export function buildHoverSteps(el: Element): MouseStep[] {
   const to = elementRandomPoint(el)
@@ -251,18 +284,52 @@ export function buildDragSteps(from: Point, to: Point, opts: { steps?: number } 
 }
 
 /**
- * Build a wheel-scroll plan: split the total delta into a few random
- * sub-deltas (a "grab" can rest on a zero segment) applied at the current
- * cursor so the page scrolls the container under the pointer.
+ * A humanized resting point for a wheel-scroll: a point INSIDE the viewport
+ * but NOT on its dead center, biased to where a hand naturally scrolls from
+ * (the lower content area, or near a side track by the scrollbar). x splits
+ * around the vertical center line into a left band [35%, 47%) or a right band
+ * [53%, 68%), so the cursor never sits on the `w/2` column; y is biased toward
+ * the lower half [55%, 85%]. A small hand jitter perturbs each axis, then the
+ * axis is clamped back inside its band so the anchor is always a deterministic
+ * non-center, lower/side point regardless of the viewport size. A hand resting
+ * on the viewport midpoint reads as \"AI\", so the midpoint is unreachable here.
+ */
+function humanizedScrollAnchor(): Point {
+  const vw = Math.max(1, window.innerWidth)
+  const vh = Math.max(1, window.innerHeight)
+  const jitter = 6
+  // Slightly favour the right track (near the scrollbar) like a real hand.
+  const isRight = Math.random() < 0.55
+  const band: [number, number] = isRight ? [0.53, 0.68] : [0.35, 0.47]
+  const jitteredX = vw * (band[0] + Math.random() * (band[1] - band[0])) + (Math.random() - 0.5) * 2 * jitter
+  const x = Math.max(vw * band[0], Math.min(vw * band[1], jitteredX))
+  const jitteredY = vh * (0.55 + Math.random() * 0.30) + (Math.random() - 0.5) * 2 * jitter
+  const y = Math.max(vh * 0.55, Math.min(vh * 0.85, jitteredY))
+  return { x, y }
+}
+
+/**
+ * Build a wheel-scroll plan: FIRST park the real cursor on a humanized
+ * non-center point (an eased glide + a settle beat) so the wheel ticks land on
+ * a hand-like anchor under the pointer instead of the viewport dead-center,
+ * then split the total delta into a few random sub-deltas (a "grab" can rest
+ * on a zero segment) applied at that anchor so the page scrolls the container
+ * under the pointer.
  */
 export function buildWheelSteps(totalDelta: number, opts: { segments?: number } = {}): MouseStep[] {
   const segments = opts.segments ?? 6
-  const anchor = lastMouse ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 }
+  const anchor = humanizedScrollAnchor()
+  const from = startPoint(anchor)
   const weights = Array.from({ length: segments }, () => 0.25 + Math.random())
   const totalWeight = weights.reduce((sum, value) => sum + value, 0)
   let remaining = totalDelta
 
-  const steps: MouseStep[] = [movedStep(anchor, 0, randomPause(GLIDE_PAUSE))]
+  const steps: MouseStep[] = [
+    // Glide to the humanized anchor along the eased, bowed curve, then rest a
+    // beat so the page sees the pointer arrive before it starts wheeling.
+    ...moveSteps(from, anchor, { points: 9 }),
+    movedStep(anchor, 0, randomPause(RHYTHM_PAUSE)),
+  ]
   for (let i = 0; i < segments; i += 1) {
     const fraction = i === segments - 1 ? 1 : weights[i]! / totalWeight
     const delta = i === segments - 1
@@ -279,6 +346,7 @@ export function buildWheelSteps(totalDelta: number, opts: { segments?: number } 
       pauseAfterMs: randomPause(RHYTHM_PAUSE),
     })
   }
+  rememberMouse(anchor)
   return steps
 }
 
@@ -362,6 +430,23 @@ export async function movePointerTo(el: Element, opts: { points?: number } = {})
 /** Real click a random point on the element (glide + press + release). */
 export async function clickElement(el: Element): Promise<void> {
   await dispatchMouseSteps(buildClickSteps(el), el)
+}
+
+/**
+ * Real click at a viewport CSS-pixel coordinate (glide + press + release):
+ * `(x, y)` is the pixel the model confirmed on a screenshot (the same space the
+ * AI-cursor overlay and CDP Input use). The pointer glides to a small random
+ * perturbation of the point, then press/release synthesizes a genuine click.
+ * When CDP input is unavailable the plan degrades to synthetic DOM events on
+ * whatever element sits under the tap point (via `document.elementFromPoint`).
+ */
+export async function clickAt(x: number, y: number, opts: { points?: number; jitter?: number } = {}): Promise<void> {
+  const to = jitterPoint(x, y, opts.jitter)
+  const under = typeof document !== 'undefined'
+    && typeof document.elementFromPoint === 'function'
+    ? document.elementFromPoint(to.x, to.y)
+    : null
+  await dispatchMouseSteps(buildClickAtSteps(x, y, opts), under ?? undefined)
 }
 
 /** Real hover a random point on the element (glide + rest). */

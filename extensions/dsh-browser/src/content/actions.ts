@@ -15,6 +15,7 @@ import type { ElementIds } from './ids.ts'
 import type { SnapshotBudget } from './snapshot.ts'
 import { buildSnapshot, renderSnapshot } from './snapshot.ts'
 import {
+  clickAt,
   clickElement,
   dragFromTo,
   elementCenter,
@@ -251,6 +252,8 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return snapshotAction(args, ctx)
     case 'browser_click':
       return clickAction(args, ctx)
+    case 'browser_click_at':
+      return clickAtAction(args, ctx)
     case 'browser_hover':
       return hoverAction(args, ctx)
     case 'browser_drag':
@@ -389,6 +392,17 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
   await clickElement(el)
   await waitForPageSettled(ACTION_SETTLE)
   return withPageDelta(`Clicked [${index}].`, ctx)
+}
+
+async function clickAtAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const x = coordArg(args, 'x')
+  const y = coordArg(args, 'y')
+  // No element reference: click precisely at the viewport CSS-pixel (x, y) the
+  // model confirmed on a screenshot. The humanized plan perturbs the point by
+  // a few px (avoiding dead pixels) and the renderer synthesizes a real click.
+  await clickAt(x, y)
+  await waitForPageSettled(ACTION_SETTLE)
+  return withPageDelta(`Clicked at (${x}, ${y}).`, ctx)
 }
 
 async function typeAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
@@ -564,6 +578,15 @@ function numberArg(args: Record<string, unknown>, name: string): number {
   const value = args[name]
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw new ActionError('bad-args', `${name} must be a non-negative integer; received ${String(value)}.`)
+  }
+  return value
+}
+
+/** A viewport coordinate: any finite number (CSS pixels, signed allowed). */
+function coordArg(args: Record<string, unknown>, name: string): number {
+  const value = args[name]
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new ActionError('bad-args', `${name} must be a finite number; received ${String(value)}.`)
   }
   return value
 }

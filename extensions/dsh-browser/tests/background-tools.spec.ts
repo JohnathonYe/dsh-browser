@@ -206,6 +206,21 @@ describe('dispatchToolCall', () => {
     }, { documentId: 'child-doc' })
   })
 
+  it('routes a coordinate click without requiring a snapshot baseline', async () => {
+    const call: ToolCall = { id: 'tool-click-at', name: 'browser_click_at', args: { x: 150, y: 300 } }
+    const chromeMock = mockChrome({ tab: { id: 40, url: 'https://app.example/' } })
+
+    const answer = await dispatchToolCall(call, 'auto', undefined, async () => 'approved')
+    expect(answer).toEqual({ ok: true, result: { text: 'page' } })
+    // Unlike index-based clicks, a coordinate click does not need a prior
+    // snapshot baseline, so it is dispatched cleanly with just x/y.
+    expect(chromeMock.sendMessage).toHaveBeenCalledWith(40, {
+      type: 'DSH_ACTION',
+      action: 'browser_click_at',
+      args: { x: 150, y: 300 },
+    }, { documentId: 'document-40' })
+  })
+
   it('returns automatic action deltas inside a fresh untrusted-content boundary', async () => {
     const call: ToolCall = { id: 'tool-delta', name: 'browser_click', args: { index: 3 } }
     const budget = { maxItems: 10, maxChars: 1_000 }
