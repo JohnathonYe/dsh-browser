@@ -9,6 +9,7 @@
  */
 
 import { DEFAULT_SNAPSHOT_MAX_CHARS } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
+import { fetchAxNodes } from './ax-source.ts'
 import type { ToolError } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import {
   allocateFrameBudgets,
@@ -214,11 +215,20 @@ async function snapshotAllFrames(
   const previous = snapshotDocumentsByTab.get(tabId) ?? new Map<number, string>()
   const deltaRequested = call.args.delta === true
 
+  // Best-effort AX semantic nodes for the top frame (rich components such as
+  // video cards surface as link/heading nodes with a real accessible name).
+  // Fetched once per snapshot; a protected page, an attached DevTools client,
+  // or a test environment with no chrome.debugger returns undefined and the
+  // snapshot falls back to the DOM inventory untouched. Only the top frame is
+  // annotated (cross-origin iframes each need their own debugger tree).
+  const axNodes = await fetchAxNodes(tabId)
+
   const settled = await Promise.allSettled(frames.map(async (frame) => {
     const sameDocument = previous.get(frame.frameId) === frameDocumentKey(frame)
+    const args = deltaRequested && sameDocument ? call.args : { ...call.args, delta: false }
     const frameCall: ToolCall = {
       ...call,
-      args: deltaRequested && sameDocument ? call.args : { ...call.args, delta: false },
+      args: frame.frameId === 0 && axNodes !== undefined ? { ...args, axNodes } : args,
     }
     const response = await sendAction(tabId, frameCall, frame, budgets.get(frame.frameId))
     return { frame, response }
@@ -362,7 +372,7 @@ async function dispatchOnce(
   } else {
     navigationWait?.cancel()
   }
-  if (call.name === 'browser_get_text') {
+  if (call.name === 'browser_get_text' || call.name === 'browser_find_dom') {
     return { ok: true, result: { text: wrapUntrustedContent(text, budget.maxChars) } }
   }
   const pageContent = requestPageDelta ? answerPageContent(response) : undefined
@@ -397,7 +407,7 @@ export async function dispatchToolCall(
 ): Promise<ToolAnswer> {
   if (isCancelled(call, signal)) return cancelled()
   // Privacy boundary: with sharing off, no page content may leave the page.
-  if (sharePageContent === 'off' && (call.name === 'browser_snapshot' || call.name === 'browser_get_text')) {
+  if (sharePageContent === 'off' && (call.name === 'browser_snapshot' || call.name === 'browser_get_text' || call.name === 'browser_find_dom')) {
     return { ok: false, error: { code: 'action-failed', message: 'Page content sharing is disabled in Settings > Page content sharing.' } }
   }
   const tab = targetTab ?? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]

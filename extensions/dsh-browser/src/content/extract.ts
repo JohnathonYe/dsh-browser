@@ -57,7 +57,7 @@ export function isInViewport(el: Element): boolean {
 }
 
 /** Normalize whitespace and trim. */
-function clean(text: string): string {
+export function clean(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
@@ -67,7 +67,7 @@ function clean(text: string): string {
  * @param el - element.
  * @returns the element's text.
  */
-function elementText(el: Element): string {
+export function elementText(el: Element): string {
   if (el instanceof HTMLElement && typeof el.innerText === 'string') return el.innerText
   return el.textContent ?? ''
 }

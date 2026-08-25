@@ -136,4 +136,41 @@ describe('buildSnapshot', () => {
     expect(view.main).toContain('主体内容区')
     expect(view.main).not.toContain('侧边栏内容')
   })
+
+  it('falls back to the DOM inventory when no AX nodes are supplied', () => {
+    document.body.innerHTML = '<button>提交</button><a href="/x">链接</a>'
+    const ids = new ElementIds()
+    const view = buildSnapshot(ids, { budget: BUDGET }, null)
+    expect(view.axItems).toEqual([])
+    const text = renderSnapshot(view, false)
+    expect(text).toContain('Interactive elements:')
+    expect(text).not.toContain('Semantic elements (AX):')
+  })
+
+  it('renders AX semantic elements with role/name/bounds/index when nodes are supplied', () => {
+    document.body.innerHTML = '<a href="/watch?v=1">A Video Title</a><button>提交</button>'
+    const rect = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({
+      x: 10, y: 20, left: 10, top: 20, right: 210, bottom: 60, width: 200, height: 40,
+      toJSON: () => ({}) as unknown as DOMRect,
+    } as DOMRect)
+    const ids = new ElementIds()
+    const view = buildSnapshot(ids, {
+      budget: BUDGET,
+      axNodes: [
+        { role: 'link', name: 'A Video Title' },
+        { role: 'link', name: 'No Matching Element' },
+      ],
+    }, null)
+    expect(view.axItems).toHaveLength(1)
+    expect(view.axItems[0]!.role).toBe('link')
+    expect(view.axItems[0]!.name).toBe('A Video Title')
+    expect(view.axItems[0]!.bounds).toEqual({ x: 10, y: 20, w: 200, h: 40 })
+    expect(view.axItems[0]!.index).toEqual(ids.indexOf(document.querySelector('a')!))
+    expect(view.axUnmatched).toHaveLength(1)
+    const text = renderSnapshot(view, false)
+    expect(text).toContain('Semantic elements (AX):')
+    expect(text).toContain('A Video Title')
+    expect(text).toContain('@(10,20 200x40)')
+    rect.mockRestore()
+  })
 })

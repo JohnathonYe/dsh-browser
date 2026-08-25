@@ -40,6 +40,21 @@ describe('registerBrowserTools', () => {
     expect(result).toEqual({ text: 'ok' })
   })
 
+  it('forwards a bounds point for click and hover', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const exec = { signal: new AbortController().signal }
+    const point = { x: 640, y: 360 }
+
+    const click = registered.find((r) => r.name === 'browser_click')!
+    await (click.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({ point }, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_click', { point }, exec.signal, 1_000)
+
+    const hover = registered.find((r) => r.name === 'browser_hover')!
+    await (hover.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({ point }, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_hover', { point }, exec.signal, 1_000)
+  })
+
   it('associates browser calls with the owning Agent session', async () => {
     const { ctx, bridge, requestTool, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
@@ -132,16 +147,14 @@ describe('registerBrowserTools', () => {
     }
     const click = registered.find(({ name }) => name === 'browser_click')!.definition.parameters as {
       properties: Record<string, unknown>
-      required?: string[]
     }
     expect(click.properties.index).toBeDefined()
-    expect(click.required).toContain('index')
+    expect(click.properties.point).toBeDefined()
     const hover = registered.find(({ name }) => name === 'browser_hover')!.definition.parameters as {
       properties: Record<string, unknown>
-      required?: string[]
     }
     expect(hover.properties.index).toBeDefined()
-    expect(hover.required).toContain('index')
+    expect(hover.properties.point).toBeDefined()
     const drag = registered.find(({ name }) => name === 'browser_drag')!.definition.parameters as {
       properties: Record<string, unknown>
       required?: string[]

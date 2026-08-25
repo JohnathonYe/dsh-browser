@@ -13,6 +13,13 @@
 import { accessibleName, collectInteractive, isInViewport, mainText, pageText, truncate } from './extract.ts'
 import { ElementIds } from './ids.ts'
 import { isSensitiveField, maskValue } from './privacy.ts'
+import {
+  buildAxSummary,
+  collectAxCandidates,
+  resolveAxNodeToElement,
+  type AxItem,
+} from './ax.ts'
+import type { AxNodeInput } from '../ax-shared.ts'
 
 /** Role label per element kind (model-facing vocabulary). */
 function roleOf(el: Element): string {
@@ -67,6 +74,10 @@ export interface SnapshotView {
   main: string
   items: InventoryItem[]
   forms: FormFieldView[]
+  /** AX semantic inventory: role/name/bounds/index for accessibility-relevant nodes. */
+  axItems: AxItem[]
+  /** AX nodes whose role is interesting but which did not resolve to a live element. */
+  axUnmatched: AxNodeInput[]
   /** ids that changed since the last snapshot (delta mode). */
   changed: number[]
   /** ids that disappeared since the last snapshot (delta mode). */
@@ -74,7 +85,7 @@ export interface SnapshotView {
   /** true when the inventory was renumbered (model should re-read ids). */
   reindexed: boolean
   /** Budget accounting: characters cut from main text and items/forms dropped by count caps. */
-  truncated: { mainChars: number; itemsDropped: number; formsDropped: number }
+  truncated: { mainChars: number; itemsDropped: number; formsDropped: number; axItemsDropped: number }
   /** 总预算（渲染封顶用）。 */
   budgetChars: number
 }
@@ -91,6 +102,8 @@ export interface SnapshotOptions {
   delta?: boolean
   region?: string
   budget: SnapshotBudget
+  /** AX semantic nodes fetched by the background; absent → DOM inventory only. */
+  axNodes?: AxNodeInput[]
 }
 
 /** Headline for a link: same-origin relative path, else host + path. */
@@ -117,10 +130,22 @@ function hrefHeadline(href: string): string {
  */
 export function buildSnapshot(ids: ElementIds, options: SnapshotOptions, last: SnapshotView | null): SnapshotView {
   const elements = collectInteractive(document)
-  const { added, removed } = ids.assign(elements)
+  const axNodes = options.axNodes ?? []
+  // Resolve AX nodes to live elements against a broadened candidate scan so
+  // AX-only rich components (video cards, feed items) are admitted to the
+  // stable id registry. Register the union of the DOM inventory and the AX
+  // elements so neither inventory evicts the other across snapshots.
+  const axCandidates = axNodes.length === 0 ? [] : collectAxCandidates(document)
+  const axElements = axNodes.length === 0
+    ? []
+    : axNodes
+        .map((node) => resolveAxNodeToElement(node, axCandidates))
+        .filter((el): el is Element => el !== null)
+  const registry = axElements.length === 0 ? elements : dedupeElements([...elements, ...axElements])
+  const { added, removed } = ids.assign(registry)
   // A renumbering is only meaningful relative to a previous snapshot: the
   // first snapshot on a fresh document always adds everything.
-  const reindexed = last !== null && added + removed > elements.length * 0.5
+  const reindexed = last !== null && added + removed > registry.length * 0.5
 
   // Measure viewport membership once. Calling getBoundingClientRect from a
   // sort comparator forces repeated layout reads on large pages.
@@ -188,6 +213,19 @@ export function buildSnapshot(ids: ElementIds, options: SnapshotOptions, last: S
     })
   }
 
+  // AX semantic inventory: role/name/bounds + stable index for accessibility-
+  // relevant nodes. Resolves against the same broadened candidates (already
+  // registered above), measures real bounds, and caps by the interactive budget.
+  const maxAxItems = Math.max(0, options.budget.maxItems)
+  const axSummary = axNodes.length === 0
+    ? { items: [] as AxItem[], unmatched: [] as AxNodeInput[], omitted: 0 }
+    : buildAxSummary(
+      axNodes,
+      (node) => resolveAxNodeToElement(node, axCandidates),
+      ids,
+      maxAxItems,
+    )
+
   const regionEl = options.region !== undefined && options.region !== ''
     ? document.querySelector(options.region)
     : null
@@ -226,6 +264,8 @@ export function buildSnapshot(ids: ElementIds, options: SnapshotOptions, last: S
     main: main.text,
     items,
     forms,
+    axItems: axSummary.items,
+    axUnmatched: axSummary.unmatched,
     changed: options.delta === true ? [...changed] : [],
     removed: options.delta === true ? removedIds : [],
     reindexed,
@@ -233,9 +273,22 @@ export function buildSnapshot(ids: ElementIds, options: SnapshotOptions, last: S
       mainChars: main.truncated,
       itemsDropped: Math.max(0, elements.length - options.budget.maxItems),
       formsDropped: Math.max(0, formElements.length - options.budget.maxForms),
+      axItemsDropped: axSummary.omitted,
     },
     budgetChars: options.budget.maxChars,
   }
+}
+
+/** De-duplicate an element list by identity, preserving first-seen order. */
+function dedupeElements(elements: Element[]): Element[] {
+  const seen = new Set<Element>()
+  const result: Element[] = []
+  for (const el of elements) {
+    if (seen.has(el)) continue
+    seen.add(el)
+    result.push(el)
+  }
+  return result
 }
 
 function selectedText(select: HTMLSelectElement): string {
@@ -292,6 +345,18 @@ function renderItem(item: InventoryItem): string {
   return `  [${item.index}] ${item.role} "${item.name}"${stateText}${hrefText}`
 }
 
+function renderAxItem(item: AxItem): string {
+  const state = [
+    item.disabled === true ? 'disabled' : undefined,
+    item.checked === undefined ? undefined : item.checked ? 'checked' : 'unchecked',
+    item.inViewport ? undefined : 'outside viewport',
+  ].filter((value) => value !== undefined).join('/')
+  const stateText = state === '' ? '' : ` [${state}]`
+  const hrefText = item.href !== undefined ? ` → ${item.href}` : ''
+  const b = item.bounds
+  return `  [${item.index}] ${item.role} "${item.name}" @(${Math.round(b.x)},${Math.round(b.y)} ${Math.round(b.w)}x${Math.round(b.h)})${stateText}${hrefText}`
+}
+
 function renderForm(form: FormFieldView, includeIdentity: boolean): string {
   const identity = includeIdentity ? `${form.label} (${form.kind}) ` : ''
   const state = form.checked === undefined
@@ -311,6 +376,8 @@ function appendTruncationNotes(lines: string[], view: SnapshotView): void {
   if (view.items.some((item) => item.hoverable)) {
     notes.push('Marked [hover] elements may reveal tooltips or menus; call browser_hover then browser_snapshot to preview')
   }
+  if (view.truncated.axItemsDropped > 0) notes.push(`${view.truncated.axItemsDropped} additional semantic elements omitted`)
+  if (view.axUnmatched.length > 0) notes.push(`${view.axUnmatched.length} semantic elements could not be resolved to a page element`)
   if (notes.length > 0) lines.push(`\n(${notes.join('; ')}. Use browser_get_text or specify region for more content.)`)
 }
 
@@ -324,6 +391,12 @@ export function renderSnapshot(view: SnapshotView, delta: boolean, maxChars: num
     const changedForms = view.forms.filter((form) => changedIds.has(form.index))
 
     lines.push(`Status: ${view.ready}${view.reindexed ? ' (element indices were reassigned; use the indices in this snapshot)' : ''}`)
+    // Keep the AX locator inventory first (never truncated by a tight budget).
+    if (view.axItems.length > 0) {
+      lines.push('')
+      lines.push('Semantic elements (AX):')
+      for (const item of view.axItems) lines.push(renderAxItem(item))
+    }
     if (view.changed.includes(-1)) {
       lines.push(`Title: ${view.title || '(untitled)'}`)
       if (view.main.length > 0) {
@@ -344,13 +417,21 @@ export function renderSnapshot(view: SnapshotView, delta: boolean, maxChars: num
       for (const form of changedForms) lines.push(renderForm(form, !renderedItems.has(form.index)))
     }
     if (view.removed.length > 0) lines.push(`Removed elements: ${view.removed.join(', ')}`)
-    if (view.changed.length === 0 && view.removed.length === 0) lines.push('(No visible changes.)')
+    if (view.changed.length === 0 && view.removed.length === 0 && view.axItems.length === 0) lines.push('(No visible changes.)')
     appendTruncationNotes(lines, view)
     return capRendered(lines.join('\n'), maxChars)
   }
   lines.push(`Title: ${view.title || '(untitled)'}`)
   lines.push(`URL: ${view.url}`)
   lines.push(`Status: ${view.ready}${view.reindexed ? ' (element indices were reassigned; use the indices in this snapshot)' : ''}`)
+  // The AX semantic inventory is the primary locator (role/name/bounds from the
+  // browser's accessibility tree), so it is rendered right after the header —
+  // before main content — so a tight character budget can never truncate it away.
+  if (view.axItems.length > 0) {
+    lines.push('')
+    lines.push('Semantic elements (AX):')
+    for (const item of view.axItems) lines.push(renderAxItem(item))
+  }
   if (view.main.length > 0) {
     lines.push('')
     lines.push('Main content:')

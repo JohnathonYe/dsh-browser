@@ -190,13 +190,34 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // told to fetch snapshots on demand instead of hoarding page text.
   const systemPrompt = ctx.get('systemPrompt')
   if (systemPrompt !== undefined) {
+    // AX-first locating: the snapshot's inventory is the browser's accessibility
+    // semantic tree (role/name + real pixel bounds + stable index), not a DOM
+    // heuristic list and not a screenshot. The model locates by role/name, acts
+    // by index (or bounds centre), and confirms the landing point via the
+    // coordinate→element readback. English only (composition.spec asserts no Han).
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:ax-locate',
+      order: 106,
+      text: 'Locate targets by the browser\'s accessibility (AX) semantic tree that browser_snapshot returns, not by reading '
+        + 'pixels off a screenshot and not by guessing a CSS selector. Each listed item carries the AX role '
+        + '(button/link/heading/listitem/checkbox/...), the AX accessible name (the semantic label, which for rich '
+        + 'components such as video cards is the title/description), its real CSS-pixel bounds (x, y, width, height), and a '
+        + 'stable index. Act on an item with browser_click(index), browser_hover(index) or browser_drag(index); when the '
+        + 'index is unreliable or the element is layered under something else, aim at the bounds\' centre with a small jitter. '
+        + 'The click/hover result confirms the pointer\'s landing coordinate and the element at that coordinate (elementFromPoint); '
+        + 'confirm that element is the intended target before assuming the action worked. Bounds come from the browser layout, so '
+        + 'treat them as real geometry, never as a guarantee about what is on top: the coordinate→element confirmation is the check. '
+        + 'browser_screenshot is visual only and is never a locator; never convert screenshot pixels into a click point yourself.',
+    }), 'bridge-browser: ax-locate system prompt section')
+
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser',
       order: 107,
       text: 'A browser bridge may be connected. To read or operate the user\'s active browser page, call browser_snapshot '
-        + '(text-only; numbered items are the click/type targets), unless the current turn already includes a plugin-provided '
-        + 'followed-page browser_snapshot. Reuse that injected snapshot and its indices directly. Locate every target by its '
-        + 'snapshot index; never guess absolute coordinates on a screenshot. Never assume page content you have not snapshotted.',
+        + '(text-only; numbered items are the click/type targets and carry the AX role/name/bounds, unless the current turn '
+        + 'already includes a plugin-provided followed-page browser_snapshot). Reuse that injected snapshot and its indices '
+        + 'directly. Locate every target by its snapshot index (or the AX role/name/bounds that snapshot reports); never guess '
+        + 'absolute coordinates on a screenshot. Never assume page content you have not snapshotted.',
     }), 'bridge-browser: system prompt section')
 
     // Multi-instance selection is model-driven. When several browser instances

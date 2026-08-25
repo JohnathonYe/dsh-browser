@@ -11,14 +11,17 @@
  */
 
 import { pageText, truncate } from './extract.ts'
+import { findDom } from './find.ts'
 import type { ElementIds } from './ids.ts'
 import type { SnapshotBudget } from './snapshot.ts'
+import type { AxNodeInput } from '../ax-shared.ts'
 import { buildSnapshot, renderSnapshot } from './snapshot.ts'
 import {
   clickElement,
   confirmElementHit,
   describeElementAt,
   dragFromTo,
+  elementAtPoint,
   elementCenter,
   elementRandomPoint,
   ensureInViewport,
@@ -273,6 +276,8 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return reloadAction()
     case 'browser_get_text':
       return getTextAction(args)
+    case 'browser_find_dom':
+      return findDomAction(args, ctx)
     case 'browser_wait':
       return waitAction(args, ctx)
     default:
@@ -283,8 +288,18 @@ export async function runAction(action: string, args: Record<string, unknown>, c
 function snapshotAction(args: Record<string, unknown>, ctx: ActionContext): ActionResult {
   const delta = args.delta === true
   const region = typeof args.region === 'string' && args.region !== '' ? args.region : undefined
+  // Server-supplied AX semantic nodes (fetched via the debugger transport). The
+  // model locates rich components by their AX role/name/bounds; when absent the
+  // snapshot falls back to the DOM inventory untouched.
+  const axNodes = Array.isArray(args.axNodes)
+    ? args.axNodes as AxNodeInput[]
+    : undefined
   // 基线在每次快照后都更新：delta 调用才能相对上一次（无论是否 delta）比较。
-  const view = buildSnapshot(ctx.ids, { delta, region, budget: ctx.budget }, lastSnapshot)
+  const view = buildSnapshot(
+    ctx.ids,
+    { delta, region, budget: ctx.budget, ...axNodes !== undefined ? { axNodes } : {} },
+    lastSnapshot,
+  )
   lastSnapshot = view
   return { text: renderSnapshot(view, delta) }
 }
@@ -309,6 +324,8 @@ function withPageDelta(text: string, ctx: ActionContext): ActionResult {
 }
 
 async function clickAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const point = pointArg(args)
+  if (point !== undefined) return clickAtCoordinates(point, ctx)
   const index = numberArg(args, 'index')
   const el = elementOrThrow(ctx.ids, index)
   // Never operate on an off-screen target: bring it into the viewport first.
@@ -473,6 +490,8 @@ async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): 
 }
 
 async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const point = pointArg(args)
+  if (point !== undefined) return hoverAtCoordinates(point, ctx)
   const index = numberArg(args, 'index')
   const el = elementOrThrow(ctx.ids, index)
   ensureInViewport(el)
@@ -568,11 +587,72 @@ async function getTextAction(args: Record<string, unknown>): Promise<ActionResul
   return { text: truncated.text + (truncated.truncated > 0 ? `\n(Truncated ${truncated.truncated} characters.)` : '') }
 }
 
+async function findDomAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const keyword = typeof args.keyword === 'string' ? args.keyword : ''
+  if (keyword.trim() === '') throw new ActionError('bad-args', 'keyword must not be empty.')
+  const mode = args.mode === 'css' ? 'css' : 'text'
+  const root = typeof args.root === 'string' && args.root !== '' ? args.root : undefined
+  const count = typeof args.count === 'number' && Number.isInteger(args.count) ? args.count : undefined
+  const text = findDom(keyword, { mode, root, count }, ctx.ids)
+  return { text }
+}
+
 async function waitAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const ms = typeof args.ms === 'number' && args.ms > 0 ? args.ms : 0
   await waitForPageSettled(EXPLICIT_WAIT_SETTLE)
   if (ms > 0) await sleep(ms)
   return withPageDelta(`The page is stable${ms > 0 ? ` after an additional ${ms}ms wait` : ''}.`, ctx)
+}
+
+/** A viewport point {x,y} from the click/hover `point` argument (AX bounds centre). */
+function pointArg(args: Record<string, unknown>): { x: number; y: number } | undefined {
+  const point = args.point
+  if (typeof point === 'object' && point !== null && !Array.isArray(point)) {
+    const record = point as Record<string, unknown>
+    const x = record.x
+    const y = record.y
+    if (typeof x === 'number' && typeof y === 'number') return { x, y }
+  }
+  if (Array.isArray(point) && point.length >= 2 && typeof point[0] === 'number' && typeof point[1] === 'number') {
+    return { x: point[0], y: point[1] }
+  }
+  return undefined
+}
+
+/** Small random jitter so a bounds-centre click never lands dead on the centre. */
+function jitterPoint(point: { x: number; y: number }): { x: number; y: number } {
+  const jitter = 3
+  return { x: point.x + (Math.random() - 0.5) * jitter, y: point.y + (Math.random() - 0.5) * jitter }
+}
+
+/** Click at a raw viewport point (the AX bounds centre of a snapshot item). */
+async function clickAtCoordinates(point: { x: number; y: number }, ctx: ActionContext): Promise<ActionResult> {
+  const target = jitterPoint(point)
+  if (target.x < 0 || target.y < 0 || target.x > window.innerWidth || target.y > window.innerHeight) {
+    throw new ActionError('action-failed', 'The point is outside the viewport; scroll to bring it into view first.')
+  }
+  const under = elementAtPoint(target.x, target.y)
+  // No registered element exists for a raw coordinate; fall back to the page so
+  // the humanized plan still has a synthetic target when CDP input is absent.
+  await clickElement(under ?? (document.body ?? document.documentElement), { at: target })
+  await waitForPageSettled(ACTION_SETTLE)
+  const at = describeElementAt(under)
+  const confirmNote = under === null ? ' Note: the coordinate resolved to nothing (page background or blank area).' : ''
+  return withPageDelta(`Clicked at (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}.${confirmNote}`, ctx)
+}
+
+/** Hover at a raw viewport point (the AX bounds centre of a snapshot item). */
+async function hoverAtCoordinates(point: { x: number; y: number }, ctx: ActionContext): Promise<ActionResult> {
+  const target = jitterPoint(point)
+  if (target.x < 0 || target.y < 0 || target.x > window.innerWidth || target.y > window.innerHeight) {
+    throw new ActionError('action-failed', 'The point is outside the viewport; scroll to bring it into view first.')
+  }
+  const under = elementAtPoint(target.x, target.y)
+  await hoverElement(under ?? (document.body ?? document.documentElement), { at: target })
+  await waitForPageSettled(ACTION_SETTLE)
+  const at = describeElementAt(under)
+  const confirmNote = under === null ? ' Note: the coordinate resolved to nothing (page background or blank area).' : ''
+  return withPageDelta(`Hovered at (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}. Call browser_snapshot to read any hover effect.${confirmNote}`, ctx)
 }
 
 function numberArg(args: Record<string, unknown>, name: string): number {

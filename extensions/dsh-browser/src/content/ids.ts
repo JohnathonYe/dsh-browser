@@ -52,6 +52,25 @@ export class ElementIds {
   }
 
   /**
+   * Register a single element without dropping any other element. Idempotent:
+   * returns the existing id when already registered. Used by the AX semantic
+   * inventory to admit resolved nodes that the DOM heuristic scan missed
+   * (rich components) without evicting the interactive inventory.
+   * @param el - element to register.
+   * @returns the element's stable id.
+   */
+  register(el: Element): number {
+    const existing = this.idByElement.get(el)
+    if (existing !== undefined) return existing
+    const id = this.nextId
+    this.nextId += 1
+    this.idByElement.set(el, id)
+    this.elementById.set(id, el)
+    el.setAttribute(ID_ATTRIBUTE, String(id))
+    return id
+  }
+
+  /**
    * Resolve an element's stable id.
    * @param el - element.
    * @returns the assigned id, or undefined when not inventoried.

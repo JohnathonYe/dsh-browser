@@ -5,6 +5,11 @@ import type { TabFrame } from './frames.ts'
 import type { ApprovalPrompt } from '../security/approval.ts'
 import { getUiLocale, type UiLocale } from '../i18n.ts'
 
+// browser_find_dom is a read-only page-content read (no state change) that must
+// NOT prompt the user: it is deliberately absent from PAGE_READS (which would
+// raise a "allow read" dialog in ask mode) and from STATE_CHANGING_ACTIONS, so
+// approvalPromptForCall returns undefined. Its page-sharing block, when content
+// sharing is OFF, lives in dispatchToolCall (background/tools.ts).
 const PAGE_READS = new Set(['browser_snapshot', 'browser_get_text'])
 const STATE_CHANGING_ACTIONS = new Set([
   'browser_click',
