@@ -235,14 +235,146 @@ describe('registerBrowserTools', () => {
     expect(requestTool).toHaveBeenCalledWith('browser_screenshot', {}, exec.signal, 1_000)
     expect(result).toMatchObject({
       text: 'Captured the controlled tab.',
+      imageSize: { width: 2048, height: 991 },
+      originalDimensions: { width: 3840, height: 1858 },
+    })
+    // The model-facing schema exposes the informational size metadata so the
+    // code-mode / structured-output consumer sees the down-scaled model size
+    // and the raw capture. It stays informational: locating is AX/DOM only.
+    const output = tool.definition.output as { schema: { properties: Record<string, unknown> } }
+    expect(output.schema.properties.imageSize).toBeDefined()
+    expect(output.schema.properties.originalDimensions).toBeDefined()
+  })
+
+  // A stub attachment store that commits any valid image and echoes metadata.
+  function stubAttachments() {
+    const saveImage = vi.fn(async (input: { data: Uint8Array; mediaType: string; name?: string }) => ({
+      attachmentId: 'att-1',
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 2048,
+      height: 991,
+      name: input.name,
+    }))
+    const attachments = { saveImage, imageLimits: {} }
+    return { attachments, saveImage }
+  }
+
+  function makeScreenshotHarness(getImpl: (key: string) => unknown) {
+    const registered: { name: string; definition: Record<string, unknown> }[] = []
+    const ctx = {
+      tools: {
+        register: vi.fn((definition: { name: string }) => {
+          registered.push({ name: definition.name, definition: definition as Record<string, unknown> })
+          return () => {}
+        }),
+      },
+      get: vi.fn((key: string) => getImpl(key)),
+    } as unknown as Context
+    const requestTool = vi.fn(async () => ({
+      text: 'Captured the controlled tab.',
+      image: { mediaType: 'image/png', data: 'iVBORw0KGgo=' },
+      imageSize: { width: 2048, height: 991 },
+      originalDimensions: { width: 3840, height: 1858 },
+    }))
+    const bridge = { requestTool } as unknown as BridgeServer
+    return { ctx, bridge, requestTool, registered }
+  }
+
+  it('returns a DSH image content block when the attachment store commits the screenshot', async () => {
+    const { attachments, saveImage } = stubAttachments()
+    const { ctx, bridge, requestTool, registered } = makeScreenshotHarness((key) => (key === 'attachments' ? attachments : undefined))
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_screenshot')!
+    const exec = { signal: new AbortController().signal }
+    const result = await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({}, exec)
+
+    expect(saveImage).toHaveBeenCalledTimes(1)
+    // The canonical value carries the committed attachment metadata, never the
+    // raw base64: a vision model reads the image via the rendered image block.
+    expect(result).toMatchObject({
+      text: 'Captured the controlled tab.',
+      image: {
+        attachmentId: 'att-1',
+        mediaType: 'image/png',
+        bytes: 8,
+        width: 2048,
+        height: 991,
+        name: 'dsh-browser-screenshot',
+      },
+      imageSize: { width: 2048, height: 991 },
+      originalDimensions: { width: 3840, height: 1858 },
+    })
+    expect(result).not.toMatchObject({ image: { data: expect.any(String) } })
+
+    const output = tool.definition.output as { render: (args: unknown, value: unknown) => unknown; schema: { properties: Record<string, unknown> } }
+    const rendered = output.render({}, result) as { type: string; text?: string; attachment?: { mediaType: string; bytes: number; width: number; height: number } }[]
+    expect(rendered).toHaveLength(2)
+    expect(rendered[0]).toEqual({ type: 'text', text: 'Captured the controlled tab.' })
+    expect(rendered[1].type).toBe('image')
+    expect(rendered[1].attachment).toMatchObject({ attachmentId: 'att-1', mediaType: 'image/png', bytes: 8, width: 2048, height: 991 })
+
+    // Contract: the image metadata schema names the attachment fields and no
+    // base64 `data` payload, matching the DSH image-tool canonical shape.
+    const imageSchema = output.schema.properties.image as { properties: Record<string, unknown> }
+    expect(imageSchema.properties.attachmentId).toBeDefined()
+    expect(imageSchema.properties.mediaType).toBeDefined()
+    expect(imageSchema.properties.bytes).toBeDefined()
+    expect(imageSchema.properties.width).toBeDefined()
+    expect(imageSchema.properties.height).toBeDefined()
+    expect(imageSchema.properties.data).toBeUndefined()
+  })
+
+  it('degrades to a text-only result when no attachment service is mounted', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    requestTool.mockResolvedValueOnce({
+      text: 'Captured the controlled tab.',
       image: { mediaType: 'image/png', data: 'iVBORw0KGgo=' },
       imageSize: { width: 2048, height: 991 },
       originalDimensions: { width: 3840, height: 1858 },
     })
-    // The model-facing schema exposes the coordinate basis so the model knows
-    // it reads pixels from a down-scaled image (not the raw capture).
-    const output = tool.definition.output as { schema: { properties: Record<string, unknown> } }
-    expect(output.schema.properties.imageSize).toBeDefined()
-    expect(output.schema.properties.originalDimensions).toBeDefined()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_screenshot')!
+    const exec = { signal: new AbortController().signal }
+    const result = await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({}, exec)
+
+    expect(result).toMatchObject({
+      text: 'Captured the controlled tab.',
+      imageSize: { width: 2048, height: 991 },
+      originalDimensions: { width: 3840, height: 1858 },
+    })
+    expect(result).not.toHaveProperty('image')
+
+    const output = tool.definition.output as { render: (args: unknown, value: unknown) => unknown }
+    const rendered = output.render({}, result) as { type: string; text?: string }[]
+    expect(rendered).toEqual([{ type: 'text', text: 'Captured the controlled tab.' }])
+  })
+
+  it('degrades to a text-only result when the resolved route is not image-capable', async () => {
+    const { attachments } = stubAttachments()
+    const llm = { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) }
+    const { ctx, bridge, registered } = makeScreenshotHarness((key) => {
+      if (key === 'attachments') return attachments
+      if (key === 'llm') return llm
+      return undefined
+    })
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_screenshot')!
+    const exec = {
+      signal: new AbortController().signal,
+      agent: {
+        id: 'session-x',
+        session: { requestHeader: () => ({ config: { provider: 'provider-x', model: 'model-y' } }) },
+        options: {},
+      },
+    }
+    const result = await (tool.definition.execute as (args: unknown, e: typeof exec) => Promise<unknown>)({}, exec)
+
+    expect(result).toMatchObject({ text: 'Captured the controlled tab.' })
+    expect(result).not.toHaveProperty('image')
+
+    const output = tool.definition.output as { render: (args: unknown, value: unknown) => unknown }
+    const rendered = output.render({}, result) as { type: string; text?: string }[]
+    expect(rendered).toEqual([{ type: 'text', text: 'Captured the controlled tab.' }])
   })
 })

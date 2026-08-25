@@ -13,11 +13,10 @@
  * @module
  */
 
-import { isDeepStrictEqual } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { defineTool, type ToolDefinition, type ToolExecution, type ToolExecutionResult, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { defineTool, type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { BridgeToolError, type BridgeServer } from './server.ts'
 
 /** Options resolved from plugin config before tool registration. */
@@ -37,24 +36,41 @@ interface TextResult {
   text: string
 }
 
-/** The extension's screenshot result payload: descriptive text plus raw image. */
-interface ScreenshotResult {
+/** The extension's screenshot result payload: descriptive text plus raw image bytes. */
+interface ScreenshotRawResult {
   text: string
   image?: { mediaType: string; data: string }
-  /** Model-visible image size (the pixels the model reads coordinates from). */
+  /** Model-visible image size (informational, not a locator basis). */
   imageSize?: { width: number; height: number }
   /** Raw captured PNG size (page/device pixels) before down-scaling. */
   originalDimensions?: { width: number; height: number }
 }
 
-/** One screenshot execution's image-enriched projection, staged for finalizeContent. */
-interface ScreenshotProjection {
-  /** The canonical value that produced this projection (stale-guard). */
-  value: unknown
-  /** The render output this projection would otherwise replace (stale-guard). */
-  fallback: ContentBlock[]
-  /** The model-facing content with the image block materialised. */
-  content: ContentBlock[]
+/** Metadata for the committed screenshot attachment, carried in the canonical value. */
+interface ScreenshotImageMeta {
+  /** Attachment store identifier; never a path or a bearer URL. */
+  attachmentId: string
+  mediaType: ImageMediaType
+  /** Exact encoded byte length. */
+  bytes: number
+  /** Intrinsic encoded width in pixels. */
+  width: number
+  /** Intrinsic encoded height in pixels. */
+  height: number
+  /** Optional display name. */
+  name?: string
+}
+
+/** The `browser_screenshot` canonical result: a text envelope plus image metadata. */
+interface ScreenshotResult {
+  /** Model-facing caption that always survives a text-only model. */
+  text: string
+  /** Committed attachment metadata; absent when the image could not be delivered. */
+  image?: ScreenshotImageMeta
+  /** Model-visible image size (informational). */
+  imageSize?: { width: number; height: number }
+  /** Raw captured PNG size (page/device pixels) before down-scaling. */
+  originalDimensions?: { width: number; height: number }
 }
 
 /** Screenshot image formats the attachment store accepts. */
@@ -63,6 +79,81 @@ const IMAGE_MEDIA_TYPES: readonly ImageMediaType[] = ['image/png', 'image/jpeg',
 /** Narrow a declared MIME string to the durable image vocabulary. */
 function isImageMediaType(value: string): value is ImageMediaType {
   return (IMAGE_MEDIA_TYPES as readonly string[]).includes(value)
+}
+
+/** Re-brand canonical screenshot image metadata into the durable attachment reference an `ImageBlock` carries. */
+function screenshotImageRef(image: ScreenshotImageMeta): ImageAttachmentRef {
+  return {
+    attachmentId: AttachmentId(image.attachmentId),
+    mediaType: image.mediaType,
+    bytes: image.bytes,
+    width: image.width,
+    height: image.height,
+    ...(image.name === undefined ? {} : { name: image.name }),
+  }
+}
+
+/**
+ * Whether the calling route may carry an image into model context. Defaults to
+ * image-on unless the exact resolved route EXPLICITLY declares no `image`
+ * input, which then degrades `browser_screenshot` to a text-only result (the
+ * model keeps the AX/DOM-located snapshot locator). Unknown capability (unset
+ * provider/model, no `llm` service, or a resolution failure) keeps the default
+ * image-on behaviour, per the default-return-image contract.
+ */
+async function routeSupportsImage(ctx: Context, exec: ToolRunContext): Promise<boolean> {
+  try {
+    const routed = exec.agent?.session.requestHeader()?.config
+    const provider = routed?.provider ?? exec.agent?.options.provider
+    const model = routed?.model ?? exec.agent?.options.model
+    const llm = ctx.get('llm')
+    if (provider === undefined || model === undefined || llm === undefined) return true
+    const active = await llm.resolveModelInfo(provider, model, exec.signal)
+    if (active.inputModalities !== undefined && !active.inputModalities.includes('image')) return false
+    return true
+  } catch {
+    return true
+  }
+}
+
+/**
+ * Commit the raw screenshot bytes to the attachment store and return the
+ * canonical image metadata, or `undefined` to degrade to a text-only result.
+ * A screenshot is a visual aid, so anything that blocks durable image delivery
+ * (no attachment service, an explicit non-vision route, or an admission
+ * failure such as an oversize/dimension limit) falls back to text-only rather
+ * than aborting the capture.
+ */
+async function commitScreenshotImage(ctx: Context, exec: ToolRunContext, raw: ScreenshotRawResult): Promise<ScreenshotImageMeta | undefined> {
+  const rawImage = raw.image
+  if (rawImage === undefined
+    || !isImageMediaType(rawImage.mediaType)
+    || typeof rawImage.data !== 'string'
+    || rawImage.data.length === 0) {
+    return undefined
+  }
+  const attachments = ctx.get('attachments')
+  if (attachments === undefined) return undefined
+  if (!(await routeSupportsImage(ctx, exec))) return undefined
+  try {
+    const ref = await attachments.saveImage({
+      data: Uint8Array.from(Buffer.from(rawImage.data, 'base64')),
+      mediaType: rawImage.mediaType,
+      name: 'dsh-browser-screenshot',
+    })
+    return {
+      attachmentId: ref.attachmentId,
+      mediaType: ref.mediaType,
+      bytes: ref.bytes,
+      width: ref.width,
+      height: ref.height,
+      ...(ref.name === undefined ? {} : { name: ref.name }),
+    }
+  } catch {
+    // Admission or storage failure (oversized, dimension/pixel limit, media-type
+    // mismatch, transient store error) degrades to a text-only result.
+    return undefined
+  }
 }
 
 /** Output contract shared by every browser tool. */
@@ -152,10 +243,10 @@ export function registerBrowserTools(
   }
 
   // Defined here rather than in defineTools: the screenshot tool reads the
-  // extension's `image` payload and needs this scope's `ctx`/`request`. The
-  // projection is keyed by the exact execution so finalizeContent can
-  // materialise the image block for that call only.
-  const projections = new WeakMap<ToolExecution, ScreenshotProjection>()
+  // extension's `image` payload and needs this scope's `ctx`/`request`. It
+  // commits the bytes to the attachment store in `execute` and delivers the
+  // image content block directly from `output.render`, the same DSH pattern the
+  // `read_image` tool uses, so a vision model reads the screenshot as an image.
   const screenshot = (): ToolDefinition => defineTool({
     name: 'browser_screenshot',
     description: 'Capture a PNG screenshot of the controlled tab and return it as an image content block.',
@@ -170,9 +261,14 @@ export function registerBrowserTools(
           image: {
             type: 'object',
             additionalProperties: false,
+            description: 'Committed screenshot attachment metadata; the image rides the adjacent image content block.',
             properties: {
-              mediaType: { type: 'string', required: true },
-              data: { type: 'string', required: true },
+              attachmentId: { type: 'string', required: true },
+              mediaType: { type: 'string', enum: [...IMAGE_MEDIA_TYPES], required: true },
+              bytes: { type: 'integer', required: true },
+              width: { type: 'integer', required: true },
+              height: { type: 'integer', required: true },
+              name: { type: 'string' },
             },
           },
           imageSize: {
@@ -197,48 +293,28 @@ export function registerBrowserTools(
       },
       render: (_args: unknown, value: unknown) => {
         const result = value as ScreenshotResult
+        if (result.image !== undefined) {
+          return [
+            { type: 'text' as const, text: result.text },
+            { type: 'image' as const, attachment: screenshotImageRef(result.image) },
+          ]
+        }
         return [{ type: 'text' as const, text: result.text }]
       },
     },
     execute: async (_args, exec) => {
       const raw = await request(exec, 'browser_screenshot', {})
-      const result = raw as ScreenshotResult
-      // Persist the image so the harness can materialise it as an image block in
-      // the tool result (the same projection pattern the MCP client uses). The
-      // text block always survives, so a text-only model still has context.
-      const image = result.image
-      if (image !== undefined
-        && isImageMediaType(image.mediaType)
-        && typeof image.data === 'string'
-        && image.data.length > 0) {
-        const attachments = ctx.get('attachments')
-        if (attachments !== undefined) {
-          const attachment = await attachments.saveImage({
-            data: Uint8Array.from(Buffer.from(image.data, 'base64')),
-            mediaType: image.mediaType,
-            name: 'dsh-browser-screenshot',
-          })
-          const text = typeof result.text === 'string' ? result.text : ''
-          projections.set(exec, {
-            value: result,
-            fallback: [{ type: 'text', text }],
-            content: [{ type: 'text', text }, { type: 'image', attachment }],
-          })
-        }
+      const rawResult = raw as ScreenshotRawResult
+      const text = typeof rawResult.text === 'string' ? rawResult.text : 'Captured the controlled tab.'
+      // Commit the bytes to the attachment store; degrade to text-only when the
+      // route cannot carry an image, the store is absent, or admission fails.
+      const image = await commitScreenshotImage(ctx, exec, rawResult)
+      return {
+        text,
+        ...(image === undefined ? {} : { image }),
+        ...(rawResult.imageSize === undefined ? {} : { imageSize: rawResult.imageSize }),
+        ...(rawResult.originalDimensions === undefined ? {} : { originalDimensions: rawResult.originalDimensions }),
       }
-      return result
-    },
-    finalizeContent(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) {
-      // Failures and non-image runs defer to the render output.
-      if (result.isError) return undefined
-      const projection = projections.get(exec)
-      if (projection === undefined) return undefined
-      projections.delete(exec)
-      // Replace the render output only when this exact value produced the image,
-      // so a stale or unrelated projection can never hijack another call's content.
-      if (!isDeepStrictEqual(result.value, projection.value)) return undefined
-      if (!isDeepStrictEqual(result.content, projection.fallback)) return undefined
-      return projection.content
     },
   })
 
