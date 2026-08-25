@@ -128,27 +128,31 @@ describe('dispatchMouseSteps', () => {
 })
 
 describe('buildWheelSteps / humanWheelScroll', () => {
-  it('splits the scroll into several real wheel ticks that sum to the delta', async () => {
-    const steps = buildWheelSteps(400, { segments: 4 })
+  it('scrolls the requested distance with one or two fast wheel ticks that sum to the delta', () => {
+    const steps = buildWheelSteps(400)
     const wheels = steps.filter((step) => step.type === 'mouseWheel')
-    expect(wheels.length).toBe(4)
+    // A fast scroll: one (at most two) large ticks, not a many-segment crawl.
+    expect(wheels.length).toBeGreaterThanOrEqual(1)
+    expect(wheels.length).toBeLessThanOrEqual(2)
     const total = wheels.reduce((sum, step) => sum + (step.deltaY ?? 0), 0)
     expect(total).toBe(400)
+    // It still starts by moving the real pointer toward the anchor.
     expect(steps[0]!.type).toBe('mouseMoved')
   })
 
-  it('dispatches real wheel steps via the CDP plan', async () => {
-    await humanWheelScroll(400, { segments: 6 })
+  it('dispatches the fast wheel plan over CDP', async () => {
+    await humanWheelScroll(400)
     const plan = pointerMock!.captured[0]!
     const wheels = plan.steps.filter((step) => step.type === 'mouseWheel')
-    expect(wheels.length).toBeGreaterThanOrEqual(6)
+    expect(wheels.length).toBeGreaterThanOrEqual(1)
+    expect(wheels.length).toBeLessThanOrEqual(2)
   })
 
   it('parks the cursor on a non-center, lower/side point before wheeling (never the viewport dead-center)', () => {
     const vw = window.innerWidth
     const vh = window.innerHeight
     for (let i = 0; i < 40; i += 1) {
-      const steps = buildWheelSteps(300, { segments: 4 })
+      const steps = buildWheelSteps(300)
       const firstWheel = steps.find((step) => step.type === 'mouseWheel')!
       const ax = firstWheel.x
       const ay = firstWheel.y
@@ -165,14 +169,14 @@ describe('buildWheelSteps / humanWheelScroll', () => {
     }
   })
 
-  it('glides the real cursor to the anchor (several moves + a settle) before the first wheel tick', async () => {
-    await humanWheelScroll(300, { segments: 4 })
+  it('glides the real cursor to the anchor before the first wheel tick (short glide, not a crawl)', async () => {
+    await humanWheelScroll(300)
     const plan = pointerMock!.captured[0]!
     const firstWheelIndex = plan.steps.findIndex((step) => step.type === 'mouseWheel')
     expect(firstWheelIndex).toBeGreaterThan(-1)
-    // A hand glides to the anchor first, not a single teleport: many moves precede the first tick.
+    // A hand glides to the anchor first (a short non-teleport glide, not a long crawl).
     const movesBeforeWheel = plan.steps.slice(0, firstWheelIndex).filter((step) => step.type === 'mouseMoved')
-    expect(movesBeforeWheel.length).toBeGreaterThan(5)
+    expect(movesBeforeWheel.length).toBeGreaterThanOrEqual(2)
     // The cursor parks exactly where it will wheel (glide's last point == first wheel anchor).
     const moves = plan.steps.filter((step) => step.type === 'mouseMoved')
     const lastMove = moves[moves.length - 1]!

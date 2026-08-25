@@ -462,10 +462,12 @@ async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): 
     default:
       throw new ActionError('bad-args', `direction must be up, down, top, or bottom; received "${direction}".`)
   }
-  // Split the scroll into several REAL wheel ticks with small random pauses
-  // instead of jumping the page in one instant move, so the motion reads as
-  // a hand (and the page actually receives wheel events).
-  await humanWheelScroll(delta, { segments: 6 })
+  // FAST scroll: park the real cursor on a humanized non-center anchor (a
+  // short glide) then cover the requested distance with one or two real wheel
+  // ticks, so the page still receives genuine wheel events without the slow
+  // multi-segment crawl. `humanWheelScroll` falls back to a direct scrollBy
+  // when CDP input is unavailable.
+  await humanWheelScroll(delta)
   await waitForPageSettled(SCROLL_SETTLE)
   return withPageDelta(`Scrolled ${direction}.`, ctx)
 }

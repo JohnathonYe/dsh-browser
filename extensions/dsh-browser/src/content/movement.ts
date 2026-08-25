@@ -318,32 +318,31 @@ function humanizedScrollAnchor(): Point {
 }
 
 /**
- * Build a wheel-scroll plan: FIRST park the real cursor on a humanized
- * non-center point (an eased glide + a settle beat) so the wheel ticks land on
- * a hand-like anchor under the pointer instead of the viewport dead-center,
- * then split the total delta into a few random sub-deltas (a "grab" can rest
- * on a zero segment) applied at that anchor so the page scrolls the container
- * under the pointer.
+ * Build a FAST wheel-scroll plan: FIRST park the real cursor on a humanized
+ * non-center point with a short eased glide + a settle beat (so the page sees
+ * a pointer there and it reads as a hand rather than dead-center), then cover
+ * the requested distance with ONE (or at most two) large `mouseWheel` tick(s)
+ * at that anchor instead of splitting it into many slow sub-deltas. The scroll
+ * reaches the target pixel quickly; only a light human rhythm remains.
  */
-export function buildWheelSteps(totalDelta: number, opts: { segments?: number } = {}): MouseStep[] {
-  const segments = opts.segments ?? 6
+export function buildWheelSteps(totalDelta: number, opts: { points?: number; wheels?: number } = {}): MouseStep[] {
   const anchor = humanizedScrollAnchor()
   const from = startPoint(anchor)
-  const weights = Array.from({ length: segments }, () => 0.25 + Math.random())
-  const totalWeight = weights.reduce((sum, value) => sum + value, 0)
-  let remaining = totalDelta
 
   const steps: MouseStep[] = [
-    // Glide to the humanized anchor along the eased, bowed curve, then rest a
-    // beat so the page sees the pointer arrive before it starts wheeling.
-    ...moveSteps(from, anchor, { points: 9 }),
+    // Short glide to the humanized anchor along the eased, bowed curve, then a
+    // settle beat so the page sees the pointer arrive. No long multi-step crawl.
+    ...moveSteps(from, anchor, { points: opts.points ?? 3 }),
     movedStep(anchor, 0, randomPause(RHYTHM_PAUSE)),
   ]
-  for (let i = 0; i < segments; i += 1) {
-    const fraction = i === segments - 1 ? 1 : weights[i]! / totalWeight
-    const delta = i === segments - 1
-      ? remaining
-      : Math.round(totalDelta * fraction * (0.85 + Math.random() * 0.3))
+  // One, or at most two, large wheel ticks. Splitting into two keeps a hint of
+  // rhythm (and guards against a giant single delta on very long pages) without
+  // turning the scroll into a slow segmented crawl.
+  const wheels = Math.max(1, Math.min(opts.wheels ?? 1, 2))
+  let remaining = totalDelta
+  for (let i = 0; i < wheels; i += 1) {
+    const isLast = i === wheels - 1
+    const delta = isLast ? remaining : Math.round(totalDelta / wheels)
     remaining -= delta
     steps.push({
       type: 'mouseWheel',
@@ -352,7 +351,7 @@ export function buildWheelSteps(totalDelta: number, opts: { segments?: number } 
       deltaX: 0,
       deltaY: delta,
       buttons: 0,
-      pauseAfterMs: randomPause(RHYTHM_PAUSE),
+      pauseAfterMs: randomPause(GLIDE_PAUSE),
     })
   }
   rememberMouse(anchor)
@@ -481,10 +480,13 @@ export async function dragFromTo(
 }
 
 /**
- * Humanized wheel scrolling as a handful of real `mouseWheel` steps with
- * pauses in between. The viewport moves via the real input event (CDP) or an
- * explicit `scrollBy` in the synthetic fallback.
+ * FAST humanized wheel scrolling: park the real cursor on a humanized
+ * non-center anchor (one short glide + a settle beat), then apply one or two
+ * large real `mouseWheel` ticks to cover the requested distance. The motion
+ * reads as a hand but does not crawl. `dispatchMouseSteps` falls back to a
+ * direct `window.scrollBy` (in the synthetic path) when CDP input is
+ * unavailable or too slow.
  */
-export async function humanWheelScroll(totalDelta: number, opts: { segments?: number } = {}): Promise<void> {
+export async function humanWheelScroll(totalDelta: number, opts: { points?: number; wheels?: number } = {}): Promise<void> {
   await dispatchMouseSteps(buildWheelSteps(totalDelta, opts))
 }

@@ -99,7 +99,7 @@ describe('visible-before-operate', () => {
 })
 
 describe('humanized scroll', () => {
-  it('dispatches real wheel ticks through the cursor plan rather than one jump', async () => {
+  it('scrolls the requested distance fast with one or two real wheel ticks through the cursor plan', async () => {
     document.body.innerHTML = '<main>Long page</main>'
     const ids = new ElementIds()
     await runAction('browser_snapshot', {}, { ids, budget: BUDGET })
@@ -114,7 +114,9 @@ describe('humanized scroll', () => {
     expect(result.text).toContain('Scrolled down')
     const plan = pointerMock!.captured[0]!
     const wheels = plan.steps.filter((step) => step.type === 'mouseWheel')
-    expect(wheels.length).toBeGreaterThan(2)
+    // A fast scroll: one or two large wheel ticks (previously a slow 6-segment crawl).
+    expect(wheels.length).toBeGreaterThanOrEqual(1)
+    expect(wheels.length).toBeLessThanOrEqual(2)
     expect(wheels.every((step) => (step.deltaY ?? 0) > 0)).toBe(true)
   })
 })
