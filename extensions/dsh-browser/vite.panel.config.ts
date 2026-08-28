@@ -1,11 +1,10 @@
 import { resolve } from 'node:path'
-import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 import { outDir, sharedPlugins } from './vite.shared.ts'
 
-/** Side panel: React application (html entry). */
+/** Side panel: minimal vanilla TypeScript controller (html entry, no React). */
 export default defineConfig({
-  plugins: [react(), ...sharedPlugins],
+  plugins: sharedPlugins,
   build: {
     outDir,
     emptyOutDir: false,

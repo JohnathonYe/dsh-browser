@@ -27,6 +27,8 @@ class DebuggerSession {
   private readonly attached = new Set<number>()
   /** Per-tab serialization tail so acquire/release never interleave. */
   private readonly locks = new Map<number, Promise<void>>()
+  /** Tabs kept attached by an explicit persist-hold (control switch). */
+  private readonly held = new Set<number>()
 
   /** Run `fn` for a tab after the previous acquire/release for it completes. */
   private async withLock<T>(tabId: number, fn: () => Promise<T>): Promise<T> {
@@ -77,6 +79,60 @@ class DebuggerSession {
         await chrome.debugger.detach({ tabId }).catch(() => {})
       }
     })
+  }
+
+  /**
+   * Keep the debugger attached to a tab until releaseHold. A persist-hold is a
+   * reference that no single operation releases: ordinary acquire / release
+   * callers still bump/drop their own counts, but while a tab is held the last
+   * such release never detaches. This keeps the browser's native "正在调试此浏览器"
+   * banner triggered (unflickering) for the whole control span.
+   * Throws if the attach fails (protected page / DevTools owns the target);
+   * callers must tolerate that and just skip the persist-hold.
+   */
+  async hold(tabId: number): Promise<void> {
+    await this.withLock(tabId, async () => {
+      if (this.held.has(tabId)) return
+      const count = this.refs.get(tabId) ?? 0
+      if (count === 0) {
+        await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION)
+        this.attached.add(tabId)
+      }
+      this.refs.set(tabId, count + 1)
+      this.held.add(tabId)
+    })
+  }
+
+  /** Drop one persist-hold; the last one releases our own attach (banner hides). */
+  async releaseHold(tabId: number): Promise<void> {
+    await this.withLock(tabId, async () => {
+      if (!this.held.has(tabId)) return
+      this.held.delete(tabId)
+      const count = this.refs.get(tabId) ?? 0
+      if (count > 1) {
+        this.refs.set(tabId, count - 1)
+        return
+      }
+      this.refs.delete(tabId)
+      this.attached.delete(tabId)
+      // Only detach when we actually held a reference (an `hold` that threw
+      // never attached, so there is nothing to clean up).
+      if (count === 1) {
+        await chrome.debugger.detach({ tabId }).catch(() => {})
+      }
+    })
+  }
+
+  /** Tabs currently under a persist-hold. */
+  heldTabs(): number[] {
+    return [...this.held]
+  }
+
+  /** Release every persist-hold (used when control is toggled off). */
+  async releaseAllHolds(): Promise<void> {
+    for (const tabId of [...this.held]) {
+      await this.releaseHold(tabId).catch(() => {})
+    }
   }
 
   /** Send a CDP command on the tab, assuming the caller holds a reference. */

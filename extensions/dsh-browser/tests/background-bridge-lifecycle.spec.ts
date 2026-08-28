@@ -544,4 +544,50 @@ describe('background bridge lifecycle', () => {
     // The now-empty group must disappear from the authorized snapshot.
     expect(lastAuth.state!.groups.some((g) => g.groupId === 6)).toBe(false)
   })
+
+  it('fail-closes browser tools when control is toggled off', async () => {
+    const chromeMock = mockChrome()
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      wsUrl: 'ws://127.0.0.1:3080/ext/bridge',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+
+    const socket = FakeWebSocket.instances[0]!
+    const sent: string[] = []
+    socket.send = vi.fn((frame?: string) => { if (frame) sent.push(frame) }) as unknown as typeof socket.send
+    socket.open()
+    await Promise.resolve()
+    socket.receive({ t: 'hello.ok', caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 } })
+    // The hello.ok budget push uses sendMessage; clear it so we can assert no dispatch below.
+    await vi.waitFor(() => { expect(chrome.tabs.sendMessage).toHaveBeenCalled() })
+    vi.mocked(chrome.tabs.sendMessage).mockClear()
+
+    // Turn control OFF through the panel settings channel.
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    panel.onMessage.emit({ type: 'settings', settings: { controlEnabled: false } })
+    await vi.waitFor(() => {
+      expect(panel.port.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: 'settings' }))
+    })
+
+    socket.receive({
+      t: 'tool.call',
+      id: 'off1',
+      name: 'browser_snapshot',
+      args: {},
+      expiresAt: Date.now() + 90_000,
+      sessionId: 's1',
+    })
+    await vi.waitFor(() => {
+      expect(sent.some((s) => s.includes('tool.result'))).toBe(true)
+    })
+    const sentFrame = sent.map((s) => JSON.parse(s) as { t: string; ok: boolean; error?: { code?: string } })
+      .find((f) => f.t === 'tool.result')!
+    expect(sentFrame).toMatchObject({ t: 'tool.result', ok: false, error: { code: 'control-disabled' } })
+    // Control off must prevent any content-script dispatch.
+    expect(chrome.tabs.sendMessage).not.toHaveBeenCalled()
+  })
 })

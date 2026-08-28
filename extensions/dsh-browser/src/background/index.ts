@@ -87,6 +87,8 @@ export interface Settings {
   approvalNotifications: boolean
   /** Restore the last active browser conversation when the panel reopens. */
   autoResumeSession: boolean
+  /** Master switch for the AI's ability to drive the browser. Off blocks browser_* tools. */
+  controlEnabled: boolean
 }
 
 const SETTINGS_DEFAULTS: Settings = {
@@ -97,6 +99,7 @@ const SETTINGS_DEFAULTS: Settings = {
   trustedActionOrigins: [],
   approvalNotifications: true,
   autoResumeSession: true,
+  controlEnabled: true,
 }
 
 /** 自动探测的候选端口（dsh web 默认 3080；桌面应用常用 14389；--port 覆盖的常见值）。 */
@@ -313,6 +316,8 @@ async function loadSettings(): Promise<Settings> {
 async function persistSettings(next: Partial<Settings>): Promise<void> {
   settings = normalizeSettings({ ...settings, ...next })
   await chrome.storage.local.set({ [STORAGE_KEY]: settings })
+  broadcastSettings()
+  void syncDebuggerHold()
 }
 
 function normalizeSettings(candidate: Settings): Settings {
@@ -328,6 +333,7 @@ function normalizeSettings(candidate: Settings): Settings {
     trustedActionOrigins: trusted,
     approvalNotifications: candidate.approvalNotifications !== false,
     autoResumeSession: candidate.autoResumeSession !== false,
+    controlEnabled: candidate.controlEnabled !== false,
   }
 }
 
@@ -537,6 +543,31 @@ function broadcastTabAuthorization(): void {
   }
 }
 
+function broadcastSettings(): void {
+  const payload = { type: 'settings', settings }
+  for (const port of panelPorts) {
+    try { port.postMessage(payload) } catch { /* port closed */ }
+  }
+}
+
+/** 保持「正在调试此浏览器」提示条常驻：控制开启时对 target tab 持久 attach，否则释放全部。
+ *  调用方需容忍 hold 的 attach 失败（DevTools 占用/受保护页）：失败仅意味着无法常驻。 */
+async function syncDebuggerHold(): Promise<void> {
+  if (!settings.controlEnabled) {
+    await debuggerSession.releaseAllHolds()
+    return
+  }
+  const targetId = tabAuthorization.snapshot().targetTabId
+  if (targetId === null) {
+    await debuggerSession.releaseAllHolds()
+    return
+  }
+  for (const held of debuggerSession.heldTabs()) {
+    if (held !== targetId) await debuggerSession.releaseHold(held).catch(() => {})
+  }
+  await debuggerSession.hold(targetId).catch(() => {})
+}
+
 /** Re-enumerate live group membership so the authorized set stays current (new drags / AI new tabs). */
 async function refreshAuthorizedTabs(groupId?: number): Promise<void> {
   const groups = groupId === undefined
@@ -589,11 +620,13 @@ async function resolveAuthorizedTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url
     if (summary === null) return affinityFailure('missing')
     tabAuthorization.setTarget(tabId, { title: summary.title, url: summary.url })
     broadcastTabAuthorization()
+    await syncDebuggerHold()
     return tab
   } catch {
     tabAuthorization.removeTab(tabId)
     persistTabAuthorization()
     broadcastTabAuthorization()
+    await syncDebuggerHold()
     return affinityFailure('lost')
   }
 }
@@ -865,6 +898,7 @@ async function openColdStartAuthorizedTab(url: string): Promise<{ tab: chrome.ta
   tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
   persistTabAuthorization()
   broadcastTabAuthorization()
+  void syncDebuggerHold()
   return { tab, groupId }
 }
 
@@ -915,6 +949,7 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
       const url = tab?.url ?? ''
       tabAuthorization.setTarget(tabId, { title, url })
       broadcastTabAuthorization()
+      await syncDebuggerHold()
       return { ok: true, result: { text: `Switched to tab ${tabId}${title ? ': ' + title : ''}` } }
     }
     return { ok: false, error: { code: 'no-active-tab', message: 'Invalid or unauthorized tabId. Use browser_tab_list first.' } }
@@ -1017,6 +1052,21 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
 /** Route one tool.call frame to the user-approved controlled tab. */
 function routeToolCall(call: ToolCall): void {
   if (bridge === null) return
+  // 控制开关：关闭时所有 browser_* 工具 fail-closed，禁止 AI 操作页面。
+  if (!settings.controlEnabled) {
+    bridge.send({
+      t: 'tool.result',
+      id: call.id,
+      ok: false,
+      error: {
+        code: 'control-disabled',
+        message: getUiLocale() === 'zh'
+          ? '浏览器控制已关闭，请在扩展面板开启'
+          : 'Browser control is off. Enable it in the extension panel.',
+      },
+    })
+    return
+  }
   if (call.name === 'browser_tab_list' || call.name === 'browser_tab_switch' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot') {
     const controller = new AbortController()
     activeToolCalls.set(call.id, controller)
@@ -1258,10 +1308,12 @@ chrome.runtime.onConnect.addListener((port) => {
           await persistSettings(settingsMsg.settings)
           const connectionChanged = settings.bridgeUrl !== previousConnection.bridgeUrl
             || settings.token !== previousConnection.token
-          // Eager mode: a changed bridge address/token must rebuild the socket
-          // even when no side panel is open, so the next reconnect uses the new
-          // values. Other setting changes keep the healthy socket untouched.
-          if (connectionChanged || panelPorts.size > 0) {
+          // Only a changed bridge address/token must rebuild the socket (eager mode,
+          // even with no side panel open), so the next reconnect uses the new values.
+          // Every other setting (e.g. the control toggle) keeps the healthy socket
+          // untouched — restarting on every panel setting change would drop the
+          // bridge mid-automation and destabilize the very control it toggles.
+          if (connectionChanged) {
             await startBridge()
             broadcastStatus()
           }
@@ -1366,6 +1418,7 @@ chrome.runtime.onConnect.addListener((port) => {
           }
           persistTabAuthorization()
           broadcastTabAuthorization()
+          void syncDebuggerHold()
         }
         void handle().catch(() => {})
         break

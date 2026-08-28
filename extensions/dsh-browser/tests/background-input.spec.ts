@@ -74,6 +74,50 @@ describe('debuggerSession', () => {
   })
 })
 
+describe('debuggerSession persist-hold', () => {
+  it('holds a tab attached until releaseHold, surviving per-operation acquire/release', async () => {
+    await debuggerSession.hold(20)
+    expect(debuggerMock!.attach).toHaveBeenCalledTimes(1)
+    expect(debuggerSession.heldTabs()).toEqual([20])
+    // a normal operation around the hold must not release the hold
+    await debuggerSession.acquire(20)
+    await debuggerSession.release(20)
+    expect(debuggerMock!.detach).not.toHaveBeenCalled()
+    expect(debuggerSession.isAttached(20)).toBe(true)
+    // releaseHold drops the last reference -> detach
+    await debuggerSession.releaseHold(20)
+    expect(debuggerMock!.detach).toHaveBeenCalledTimes(1)
+    expect(debuggerSession.heldTabs()).toEqual([])
+  })
+
+  it('a second hold on the same tab is idempotent', async () => {
+    await debuggerSession.hold(21)
+    await debuggerSession.hold(21)
+    expect(debuggerMock!.attach).toHaveBeenCalledTimes(1)
+    expect(debuggerSession.heldTabs()).toEqual([21])
+    await debuggerSession.releaseHold(21)
+    expect(debuggerMock!.detach).toHaveBeenCalledTimes(1)
+  })
+
+  it('releaseAllHolds detaches every held tab', async () => {
+    await debuggerSession.hold(22)
+    await debuggerSession.hold(23)
+    expect(debuggerMock!.attach).toHaveBeenCalledTimes(2)
+    await debuggerSession.releaseAllHolds()
+    expect(debuggerMock!.detach).toHaveBeenCalledTimes(2)
+    expect(debuggerSession.heldTabs()).toEqual([])
+  })
+
+  it('a failed hold does not attach and a later releaseHold is a no-op for that tab', async () => {
+    debuggerMock!.setFailAttach(true)
+    await expect(debuggerSession.hold(24)).rejects.toThrow()
+    expect(debuggerMock!.attach).toHaveBeenCalledTimes(1)
+    expect(debuggerSession.heldTabs()).toEqual([])
+    debuggerMock!.setFailAttach(false)
+    await debuggerSession.releaseHold(24)
+    expect(debuggerMock!.detach).not.toHaveBeenCalled()
+  })
+})
 describe('replayMouseSteps', () => {
   it('replays each step as a real Input.dispatchMouseEvent and attaches once', async () => {
     const steps: MouseStep[] = [
