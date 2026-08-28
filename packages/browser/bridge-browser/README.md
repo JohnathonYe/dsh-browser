@@ -4,7 +4,17 @@ English | [中文](README.zh.md)
 
 The **browser-operation bridge** for dsh: mounts a token-authenticated WebSocket carrier (`/ext/bridge`) that the Chrome extension connects to, proxies gateway RPCs through the same fetch handler the `/api` surface uses, pumps session events per connection, and registers the text-only `browser_*` tool set that reads and operates the user's active tab through the extension — click elements, fill forms, scroll, and navigate in the real browser, login state preserved. The side panel is the conversation entry; the tools are the product.
 
-**Text-only browser tools, multimodal chat passthrough**: page snapshots stay structured text (title, main content, numbered interactive inventory, and masked form fields), and every browser action uses stable inventory numbers. The generic RPC carrier also passes dsh 0.1.1 image prompts and durable attachment reads; deferred new sessions expose image limits only when the host actually mounts the attachment service.
+**Text-only browser tools, multimodal chat passthrough**: page snapshots stay structured text (title, main content, numbered interactive inventory, and masked form fields), and every browser action uses stable inventory numbers. The generic RPC carrier also passes dsh image prompts and durable attachment reads.
+
+## Compatibility
+
+This plugin targets **`@deepseek-ai/dsh@0.1.2-alpha.1`** and later. The migration dropped the old `apiProxy`/`@deepseek-ai/dsh-host-apiproxy` transport (removed in 0.1.2-alpha.1 in favor of the Remote gateway) and now drives gateway RPCs through the `/api` shared channel on `ctx.connection` (`createSharedFetchHandler('/api')`). Extension dot-methods are translated to alpha's `<namespace>/<method>` Remote endpoints (`session.prompt` → `session/prompt`, `session.history` → `session/page`, `host.pickDirectory` → `directoryPicker/pick`, `settings.openDocument` → `settings/openSettingsDocument`, `host.openPath` → `session/openWorkspacePath`).
+
+Behavioral changes on alpha:
+
+- **No global session event pump.** Alpha removed `apiProxy.events.mux`; live events are now per-session via `session/follow`. The bridge no longer auto-pumps a global `event` frame, and calls that need live per-session events open `session/follow` themselves through the shared channel.
+- **`sessionWorkspacePath` and `deferSessionCreate` are no-ops on alpha.** Alpha's `session/create` attaches the declared workspace natively and materializes the session on create, so the workspace-grouping and deferred-materialization wrappers were removed. The config keys remain accepted for backward compatibility but have no effect against the Remote gateway.
+- Methods renamed or removed in alpha are answered by the carrier with an RPC error (never a bridge crash). Unknown/unmapped methods degrade gracefully.
 
 ## Config
 
@@ -14,8 +24,8 @@ The **browser-operation bridge** for dsh: mounts a token-authenticated WebSocket
 | `toolTimeoutMs` | `number` | 90000 | Per-tool-call budget, leaving time for the extension's 60-second approval window. |
 | `snapshotMaxChars` | `number` | 32000 | Upper bound on one rendered snapshot's characters, minimum 500 (also negotiated to the extension via `hello.ok` caps). |
 | `maxInteractiveItems` | `number` | 60 | Upper bound on interactive inventory items per snapshot. |
-| `sessionWorkspacePath` | `string` | `~/.dsh/browser-sessions` | Dedicated Host Workspace for extension-created sessions. The plugin creates and idempotently registers the directory on the first implicit `session.create`; the session cwd becomes this path, so the GUI shows a `browser-sessions` workspace group. Set `""` to keep sessions Ungrouped. |
-| `deferSessionCreate` | `boolean` | `true` | Sessions materialize only on the first message: `session.create` answers with a provisional id (nothing persisted), history reads empty, and the first `session.prompt` creates the real session (same id, original payload). Opening the panel without chatting leaves zero trace in the session store/GUI. |
+| `sessionWorkspacePath` | `string` | `~/.dsh/browser-sessions` | Dedicated Host Workspace for extension-created sessions. The plugin creates and idempotently registers the directory on the first implicit `session.create`; the session cwd becomes this path, so the GUI shows a `browser-sessions` workspace group. Set `""` to keep sessions Ungrouped. **(alpha: no-op — alpha's `session/create` attaches the declared workspace natively.)** |
+| `deferSessionCreate` | `boolean` | `true` | Sessions materialize only on the first message: `session.create` answers with a provisional id (nothing persisted), history reads empty, and the first `session.prompt` creates the real session (same id, original payload). Opening the panel without chatting leaves zero trace in the session store/GUI. **(alpha: no-op — the Remote gateway materializes on create.)** |
 
 Workspace grouping is best-effort. If the composition has no workspace domain, directory creation fails, or `workspace.create` rejects the path, the plugin logs one warning and sends every session creation without an injected workspace so browser chat remains usable.
 

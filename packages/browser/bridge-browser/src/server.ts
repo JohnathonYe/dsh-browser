@@ -27,7 +27,6 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
 import {
   BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD,
   HELLO_TIMEOUT_MS,
@@ -60,6 +59,56 @@ const PRIVILEGED_METHODS = new Set([
   'credentials.unset',
 ])
 
+/**
+ * One gateway event envelope pumped to a connected extension. The alpha
+ * gateway no longer exposes `ctx.apiProxy.events.mux`; the bridge keeps the
+ * same `{ rpcId, payload: { type, ... } }` envelope shape so the extension's
+ * event frames and `protocol.ts` stay unchanged.
+ */
+export interface BridgeEventEnvelope {
+  readonly rpcId: string
+  readonly payload: { readonly type: string } & Record<string, unknown>
+}
+
+/**
+ * Translate the extension's dot-separated gateway method to the alpha
+ * `<namespace>/<method>` Remote endpoint. Methods the alpha assembly renamed
+ * are mapped explicitly; everything else converts the namespace separator.
+ * Unmapped methods produce an endpoint the gateway does not claim, which the
+ * carrier answers with a 404 that the bridge forwards as an RPC error — the
+ * bridge itself never crashes on a renamed/unavailable domain.
+ */
+export function toGatewayEndpoint(method: string): string {
+  const renamed: Record<string, string> = {
+    'host.pickDirectory': 'directoryPicker/pick',
+    'host.openPath': 'session/openWorkspacePath',
+    'settings.openDocument': 'settings/openSettingsDocument',
+    // Cold history is served by `session/page` in alpha, not `session/history`.
+    'session.history': 'session/page',
+  }
+  const alias = renamed[method]
+  if (alias !== undefined) return alias
+  const separator = method.indexOf('.')
+  if (separator === -1) return method
+  return `${method.slice(0, separator)}/${method.slice(separator + 1)}`
+}
+
+/**
+ * Encode one unary gateway dispatch as the alpha shared-channel
+ * `client-request` envelope. The alpha gateway requires the invocation payload
+ * to carry exactly one plain-object `args` field, so the extension's raw
+ * method args are wrapped in `{ args }` and the URL/endpoint use the
+ * translated `<namespace>/<method>` endpoint.
+ */
+function gatewayBody(endpoint: string, rpcId: string, payload: unknown): string {
+  return JSON.stringify({
+    type: 'client-request',
+    rpcId,
+    method: endpoint,
+    payload: { args: payload },
+  })
+}
+
 /** Session mutations whose WebSocket arrival order is behaviorally significant. */
 const ORDERED_SESSION_METHODS = new Set([
   BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD,
@@ -87,10 +136,14 @@ export class BridgeToolError extends Error {
 export interface BridgeServerDeps {
   /** Bearer token the extension must present in `hello`. */
   token: string
-  /** Fetch-shaped gateway carrier (from `toFetchHandler(ctx.apiProxy)`). */
+  /** Fetch-shaped gateway carrier (from `ctx.connection.createSharedFetchHandler('/api')`). */
   apiHandler: { fetch: (request: Request) => Promise<Response> }
-  /** Per-connection event stream (usually `ctx.apiProxy.events.mux`). */
-  openEvents: (signal: AbortSignal) => AsyncIterable<RpcRequest<MuxFrame>>
+  /**
+   * Per-connection gateway event stream. The alpha gateway has no global
+   * `events.mux`; the bridge supplies a best-effort stream (or an empty one)
+   * while keeping the `{ rpcId, payload: { type, ... } }` envelope shape.
+   */
+  openEvents: (signal: AbortSignal) => AsyncIterable<BridgeEventEnvelope>
   /** Default per-tool-call timeout in ms. */
   toolTimeoutMs: number
   /** Capabilities to echo in `hello.ok` (negotiated snapshot budgets). */
@@ -613,11 +666,13 @@ export class BridgeServer {
       }
       return
     }
-    const body = JSON.stringify({ type: 'client-request', rpcId: frame.id, method: frame.method, payload: frame.payload })
-    const request = new Request(new URL(`/api/${frame.method}`, 'http://dsh.internal'), {
+    // Translate the extension's dot-separated method to the alpha gateway's
+    // `<namespace>/<method>` endpoint and wrap its payload in `{ args }`.
+    const endpoint = toGatewayEndpoint(frame.method)
+    const request = new Request(new URL(`/api/${endpoint}`, 'http://dsh.internal'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body,
+      body: gatewayBody(endpoint, frame.id, frame.payload),
     })
     try {
       const response = await this.deps.apiHandler.fetch(request)
@@ -638,7 +693,12 @@ export class BridgeServer {
     }
   }
 
-  /** Relay a pending host-interaction response through the GUI's /api/respond channel. */
+  /**
+   * Relay a pending host-interaction response. The alpha assembly moved host
+   * interactions off the removed `/api/respond` channel; when the shared
+   * carrier answers 404 the bridge forwards that as an error frame to the
+   * extension instead of crashing (graceful degradation).
+   */
   private async handleRespond(frame: Extract<ClientFrame, { t: 'respond' }>, conn: ReadyConnection): Promise<void> {
     const request = new Request(new URL('/api/respond', 'http://dsh.internal'), {
       method: 'POST',

@@ -8,7 +8,7 @@ Connect [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) to t
 
 `dsh` is DeepSeek AI's open-source, plugin-based agent harness. This repository provides a companion browser bridge plugin and Chrome/Firefox MV3 extension as one standalone pnpm workspace.
 
-Browser operation is text-first: pages become structured text with a numbered inventory of interactive elements, and the model addresses those elements by number (click/fill/scroll). It also offers `browser_screenshot` (`chrome.debugger` rasterized capture) for vision models, plus human-like interaction (curved mouse movement, incremental wheel scrolling, hover-before-click, operate-on-visible targets, scroll-into-view first). dsh 0.1.1 multimodal chat is separate from that page channel—the side panel accepts PNG, JPEG, WebP, and GIF attachments when the host advertises image support.
+Browser operation is text-first: pages become structured text with a numbered inventory of interactive elements, and the model addresses those elements by number (click/fill/scroll). It also offers `browser_screenshot` (`chrome.debugger` rasterized capture) for vision models, plus human-like interaction (curved mouse movement, incremental wheel scrolling, hover-before-click, operate-on-visible targets, scroll-into-view first). dsh multimodal chat is separate from that page channel—the side panel accepts PNG, JPEG, WebP, and GIF attachments when the host advertises image support. The bridge plugin targets **`@deepseek-ai/dsh@0.1.2-alpha.1`** and later (it uses the Remote gateway's `/api` shared channel via `ctx.connection`; see [`packages/browser/bridge-browser/README.md#compatibility`](packages/browser/bridge-browser/README.md#compatibility)).
 
 ## Quick install
 

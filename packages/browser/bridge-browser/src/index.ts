@@ -16,19 +16,16 @@
  * @module @yuxianglin/dsh-bridge-browser
  */
 
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-host-apiproxy'
+// Brings the `ctx.connection` Context augmentation (HostConnectionHandle) into scope.
+import type {} from '@deepseek-ai/dsh-client-connection'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
-import { BridgeServer } from './server.ts'
+import { BridgeServer, type BridgeEventEnvelope } from './server.ts'
 import { BrowserContextInjector } from './browser-context.ts'
 import { registerBrowserTools } from './tools.ts'
 import {
@@ -37,15 +34,13 @@ import {
   DEFAULT_SNAPSHOT_MAX_CHARS,
   MIN_SNAPSHOT_MAX_CHARS,
 } from './protocol.ts'
-import { withSessionDeferral } from './session-deferral.ts'
-import { withSessionWorkspace } from './session-workspace.ts'
 import { resolveToken } from './token.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'bridge-browser'
 
 /** Services required by this plugin. */
-export const inject = ['webServer', 'apiProxy', 'tools', 'agents']
+export const inject = ['webServer', 'connection', 'tools', 'agents']
 
 /** Default per-tool-call budget (ms). */
 const DEFAULT_TOOL_TIMEOUT_MS = 90_000
@@ -118,6 +113,20 @@ export function resolveConfig(config: Config): ResolvedConfig {
 }
 
 /**
+ * Empty gateway-event stream. The alpha assembly has no global session mux
+ * (`ctx.apiProxy.events.mux` is gone): live events are now per-session via
+ * `session/follow`. The bridge cannot forward a global stream, so a connected
+ * extension receives no auto-pumped events; calls that need live per-session
+ * events open `session/follow` themselves through the shared channel. Kept as
+ * a single shared value so the union type stays exporter-only.
+ */
+function noGatewayEvents(): AsyncIterable<BridgeEventEnvelope> {
+  return (async function* () {
+    /* no alpha global event mux to forward */
+  })()
+}
+
+/**
  * Mount the bridge: resolve the token, register the upgrade route, the tool
  * set, and an optional system-prompt section, all effect-scoped for HMR.
  *
@@ -128,23 +137,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const resolved = resolveConfig(config)
 
   const tokenRes = await resolveToken(resolved.token)
-  // Workspace grouping wraps the gateway create; session deferral wraps the
-  // result so materialization at first prompt still flows through grouping.
-  const api: ApiProxy = withSessionDeferral(
-    withSessionWorkspace(
-      ctx.apiProxy,
-      resolved.sessionWorkspacePath,
-      message => { ctx.logger.warn(message) },
-    ),
-    resolved.deferSessionCreate,
-    ctx.get('attachments')?.imageLimits,
-  )
+  // The alpha assembly exposes the gateway as a fetch-shaped `/api` shared
+  // channel on `ctx.connection` — there is no `ctx.apiProxy` object and no
+  // `events.mux`. Session-workspace grouping and deferred materialization are
+  // dropped (alpha's `session/create` attaches the declared workspace natively
+  // and materializes on create); the bridge forwards unary RPCs translated in
+  // `server.ts` and no longer pumps a global event stream.
+  const apiHandler = ctx.connection.createSharedFetchHandler('/api')
   const browserContext = new BrowserContextInjector(ctx.agents)
   ctx.on('agent/session-start', ({ agent }) => { browserContext.activate(agent) })
   const server = new BridgeServer({
     token: tokenRes.token,
-    apiHandler: toFetchHandler(api),
-    openEvents: (signal) => api.events.mux({ rpcId: RpcId(randomUUID()), payload: {} }, signal),
+    apiHandler,
+    openEvents: () => noGatewayEvents(),
     toolTimeoutMs: resolved.toolTimeoutMs,
     caps: {
       textOnly: true,
