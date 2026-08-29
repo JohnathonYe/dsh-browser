@@ -1016,8 +1016,11 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     const tab = await chrome.tabs.create({ url: url || 'about:blank', active: false }).catch(() => null)
     if (tab && tab.id !== undefined) {
       await chrome.tabs.group({ tabIds: [tab.id], groupId }).catch(() => {})
-      const added = tabAuthorization.addTabsToGroup(groupId, [tab.id])
-      if (!added) {
+      // 幂等归组并判定：新 tab 在 chrome.tabs.group 之后会被 onUpdated 自动入组，此时再
+      // addTabsToGroup 会因「已存在」而返回 false（无操作），被 !added 误判为组满。这里改用
+      // syncGroupTabs/reconcileGroupOpenTabs（幂等），并只按「实际打开数」判断是否真正超限。
+      const afterCount = await reconcileGroupOpenTabs(groupId)
+      if (afterCount > MAX_GROUP_TABS) {
         await chrome.tabs.remove(tab.id).catch(() => {})
         return { ok: false, error: { code: 'action-failed', message: `Your group is full (${MAX_GROUP_TABS} max). Close or reuse a tab first.` } }
       }
