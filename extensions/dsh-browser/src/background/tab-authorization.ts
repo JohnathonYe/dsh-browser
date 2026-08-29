@@ -29,10 +29,14 @@ export function normalizeGroupTitle(name: string): string {
   return trimmed.startsWith(DSH_GROUP_PREFIX) ? trimmed : DSH_GROUP_PREFIX + trimmed
 }
 
+export const MAX_GROUP_TABS = 10
+
 export interface AuthorizedGroup {
   groupId: number
   title: string
   tabIds: number[]
+  /** sessionId of the agent that owns this group; groups are not shared across agents. */
+  ownerSessionId: string | null
 }
 
 export interface TabAuthSnapshot {
@@ -55,6 +59,7 @@ interface GroupRecord {
   groupId: number
   title: string
   tabIds: Set<number>
+  ownerSessionId: string | null
 }
 
 /** Owns the authorized-group lifecycle for one extension/bridge connection. */
@@ -75,6 +80,7 @@ export class TabAuthorizationController {
         groupId: g.groupId,
         title: g.title,
         tabIds: [...g.tabIds],
+        ownerSessionId: g.ownerSessionId,
       })),
       targetTabId: this.targetTabId,
       targetGroupId: this.targetGroupId,
@@ -102,9 +108,10 @@ export class TabAuthorizationController {
   }
 
   /** 授权一个（已存在的）组。 */
-  authorizeGroup(groupId: number, title = '', tabIds: number[] = []): boolean {
+  authorizeGroup(groupId: number, title = '', tabIds: number[] = [], ownerSessionId: string | null = null): boolean {
     if (this.groups.has(groupId)) return false
-    const record: GroupRecord = { groupId, title, tabIds: new Set(tabIds) }
+    if (tabIds.length > MAX_GROUP_TABS) return false
+    const record: GroupRecord = { groupId, title, tabIds: new Set(tabIds), ownerSessionId }
     this.groups.set(groupId, record)
     for (const tabId of tabIds) this.tabToGroup.set(tabId, groupId)
     if (this.targetTabId === null && tabIds.length > 0) {
@@ -116,8 +123,8 @@ export class TabAuthorizationController {
   }
 
   /** 授权单个页：调用方确保 groupId 是新建/已存在的组。 */
-  authorizeTab(groupId: number, tabId: number, title = ''): boolean {
-    return this.authorizeGroup(groupId, title, [tabId])
+  authorizeTab(groupId: number, tabId: number, title = '', ownerSessionId: string | null = null): boolean {
+    return this.authorizeGroup(groupId, title, [tabId], ownerSessionId)
   }
 
   /** 取消授权一个组，并把组内 tab 从授权范围移除。 */
@@ -148,6 +155,8 @@ export class TabAuthorizationController {
   addTabsToGroup(groupId: number, tabIds: number[]): boolean {
     const record = this.groups.get(groupId)
     if (record === undefined || tabIds.length === 0) return false
+    const newOnes = tabIds.filter((tabId) => !record.tabIds.has(tabId)).length
+    if (record.tabIds.size + newOnes > MAX_GROUP_TABS) return false
     let changed = false
     for (const tabId of tabIds) {
       const prev = this.tabToGroup.get(tabId)
@@ -252,6 +261,48 @@ export class TabAuthorizationController {
   /** 是否允许 AI 开新 tab（按策略）。 */
   mayOpenTab(): boolean {
     return this.mode === 'allow'
+  }
+
+  /** 属于某个 agent 的组 id 列表。 */
+  groupsForSession(sessionId: string): number[] {
+    const out: number[] = []
+    for (const g of this.groups.values()) if (g.ownerSessionId === sessionId) out.push(g.groupId)
+    return out
+  }
+
+  /** 某 agent 最近一个可加入的组；无则 null。 */
+  lastGroupForSession(sessionId: string): number | null {
+    const ids = this.groupsForSession(sessionId)
+    return ids.length === 0 ? null : ids[ids.length - 1]
+  }
+
+  /** 某 agent 可操作的所有 tab（只含它自己组的 tab）。 */
+  listTabsForSession(sessionId: string): number[] {
+    const out: number[] = []
+    for (const groupId of this.groupsForSession(sessionId)) {
+      const record = this.groups.get(groupId)
+      if (record !== undefined) for (const tabId of record.tabIds) out.push(tabId)
+    }
+    return out
+  }
+
+  /** 某 tab 是否属于某 agent（在该 agent 自己的组内）。 */
+  isAuthorizedTabForSession(tabId: number, sessionId: string): boolean {
+    const groupId = this.tabToGroup.get(tabId)
+    if (groupId === undefined) return false
+    return this.groups.get(groupId)?.ownerSessionId === sessionId
+  }
+
+  /** 解析某 agent 的目标 tab：仅限它自己的组；无则 null。 */
+  resolveTargetForSession(sessionId: string): number | null {
+    if (this.targetTabId !== null && this.isAuthorizedTabForSession(this.targetTabId, sessionId)) return this.targetTabId
+    const all = this.listTabsForSession(sessionId)
+    return all.length === 0 ? null : all[0]
+  }
+
+  /** 某 agent 当前已用页数（跨它所有组，用于组上限提示）。 */
+  sessionTabCount(sessionId: string): number {
+    return this.listTabsForSession(sessionId).length
   }
 
   private bump(): void {

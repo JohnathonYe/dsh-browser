@@ -72,6 +72,7 @@ import {
 } from './session-continuity.ts'
 import {
   TabAuthorizationController,
+  MAX_GROUP_TABS,
   normalizeGroupTitle,
   type TabAuthAction,
 } from './tab-authorization.ts'
@@ -614,14 +615,15 @@ async function resolveAuthorizedTab(call?: ToolCall): Promise<Pick<chrome.tabs.T
   await authorizationReady
   // Per-command tabId targeting (no separate browser_tab_switch): when the model
   // passes an authorized tabId, make it the current target before resolving.
+  const sessionId = call?.sessionId ?? '_default'
   const requestedTabId = Number((call?.args as { tabId?: unknown } | undefined)?.tabId)
-  if (call !== undefined && Number.isInteger(requestedTabId) && tabAuthorization.isAuthorizedTab(requestedTabId)) {
+  if (Number.isInteger(requestedTabId) && tabAuthorization.isAuthorizedTabForSession(requestedTabId, sessionId)) {
     const t = await chrome.tabs.get(requestedTabId).catch(() => null)
     tabAuthorization.setTarget(requestedTabId, { title: t?.title ?? '', url: t?.url ?? '' })
     broadcastTabAuthorization()
     await syncDebuggerHold()
   }
-  const tabId = tabAuthorization.resolveTarget()
+  const tabId = tabAuthorization.resolveTargetForSession(sessionId)
   if (tabId === null) return affinityFailure('missing')
   try {
     const tab = await chrome.tabs.get(tabId)
@@ -882,7 +884,7 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: s
  * 只对新建的 tab 建组授权，绝不触碰当前活动页；dsh 自身页（dsh-web / 扩展页）不是合法目标。
  * @returns 成功时返回新开的 tab 与其 groupId；否则返回 ToolAnswer 错误。
  */
-async function openColdStartAuthorizedTab(url: string): Promise<{ tab: chrome.tabs.Tab; groupId: number } | ToolAnswer> {
+async function openColdStartAuthorizedTab(url: string, ownerSessionId: string | null = '_default'): Promise<{ tab: chrome.tabs.Tab; groupId: number } | ToolAnswer> {
   // dsh 自身页（dsh-web / 扩展页）绝不能成为受控目标。
   if (isDshOwnPage(url)) {
     return { ok: false, error: { code: 'no-active-tab', message: 'The target URL is a dsh page and cannot be an authorized target. Open a real third-party URL instead.' } }
@@ -903,7 +905,7 @@ async function openColdStartAuthorizedTab(url: string): Promise<{ tab: chrome.ta
   }
   const shown = normalizeGroupTitle('AI')
   await chrome.tabGroups.update(groupId, { title: shown }).catch(() => {})
-  tabAuthorization.authorizeGroup(groupId, shown, [tab.id])
+  tabAuthorization.authorizeGroup(groupId, shown, [tab.id], ownerSessionId)
   tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
   persistTabAuthorization()
   broadcastTabAuthorization()
@@ -924,7 +926,7 @@ async function coldStartNavigate(call: ToolCall): Promise<ToolAnswer> {
   if (url === undefined) {
     return noAuthGroupError()
   }
-  const opened = await openColdStartAuthorizedTab(url)
+  const opened = await openColdStartAuthorizedTab(url, call.sessionId ?? '_default')
   if ('ok' in opened) return opened
   return {
     ok: true,
@@ -938,7 +940,8 @@ async function coldStartNavigate(call: ToolCall): Promise<ToolAnswer> {
 async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
   await authorizationReady
   if (call.name === 'browser_tab_list') {
-    const groups = tabAuthorization.snapshot().groups
+    const sessionId = call.sessionId ?? '_default'
+    const groups = tabAuthorization.snapshot().groups.filter((g) => g.ownerSessionId === sessionId)
     const lines: string[] = []
     for (const g of groups) {
       for (const tabId of g.tabIds) {
@@ -955,8 +958,8 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     if (!Number.isInteger(tabId)) {
       return { ok: false, error: { code: 'bad-args', message: 'browser_close_tab requires a numeric tabId.' } }
     }
-    if (!tabAuthorization.isAuthorizedTab(tabId)) {
-      return { ok: false, error: { code: 'no-active-tab', message: 'The tab is not authorized. Use browser_tab_list first.' } }
+    if (!tabAuthorization.isAuthorizedTabForSession(tabId, call.sessionId ?? '_default')) {
+      return { ok: false, error: { code: 'no-active-tab', message: 'The tab is not authorized for this agent. Use browser_tab_list first.' } }
     }
     await chrome.tabs.remove(tabId).catch(() => {})
     tabAuthorization.removeTab(tabId)
@@ -967,34 +970,44 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
   }
   if (call.name === 'browser_new_tab') {
     const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
-    const groups = tabAuthorization.snapshot().groups
+    const sessionId = call.sessionId ?? '_default'
+    const myGroupIds = tabAuthorization.groupsForSession(sessionId)
     // dsh 自身页（dsh-web / 扩展页）绝不能成为受控目标：无论冷启动还是已有授权组下，
     // browser_new_tab 都不把 dsh 页建成授权组，只应打开真实第三方页。
     if (url !== undefined && isDshOwnPage(url)) {
       return { ok: false, error: { code: 'no-active-tab', message: 'The target URL is a dsh page and cannot be an authorized target. Open a real third-party URL instead.' } }
     }
-    if (groups.length === 0) {
-      // 冷启动建组：仅当 AI 明确打开一个真实 http(s) 目标时才建组（这正是「打开目标 tab」路径）。
+    if (myGroupIds.length === 0) {
+      // 冷启动建组：该 agent 还没有自己的组，仅当明确打开真实 http(s) 目标时才建组并归属本 agent。
       const hasRealUrl = url !== undefined && isTargetableHttpUrl(url)
       if (!hasRealUrl) {
-        return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group. Open a real URL, or authorize a group in the panel first.' } }
+        return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group for this agent. Open a real URL, or authorize a group in the panel first.' } }
       }
-      const opened = await openColdStartAuthorizedTab(url!)
+      const opened = await openColdStartAuthorizedTab(url, sessionId)
       if ('ok' in opened) return opened
       return { ok: true, result: { text: `Opened a new tab (id ${opened.tab.id}) in a new DSH- group.` } }
     }
     if (!tabAuthorization.mayOpenTab()) {
       return { ok: false, error: { code: 'action-failed', message: 'Open-tab policy is "ask"; switch it to allow in the panel, or allow once here.' } }
     }
+    // 每个 agent 只用自己的组；组满 MAX_GROUP_TABS 时要求先关闭/复用，避免页面堆积与争用。
+    const groupId = myGroupIds[myGroupIds.length - 1]
+    const group = tabAuthorization.snapshot().groups.find((g) => g.groupId === groupId)
+    if (group !== undefined && group.tabIds.length >= MAX_GROUP_TABS) {
+      return { ok: false, error: { code: 'action-failed', message: `Your group already has ${MAX_GROUP_TABS} tabs (the per-agent maximum). Close a tab with browser_close_tab or reuse an existing one first.` } }
+    }
     const tab = await chrome.tabs.create({ url: url || 'about:blank', active: false }).catch(() => null)
     if (tab && tab.id !== undefined) {
-      const groupId = groups[groups.length - 1].groupId
       await chrome.tabs.group({ tabIds: [tab.id], groupId }).catch(() => {})
-      tabAuthorization.addTabsToGroup(groupId, [tab.id])
+      const added = tabAuthorization.addTabsToGroup(groupId, [tab.id])
+      if (!added) {
+        await chrome.tabs.remove(tab.id).catch(() => {})
+        return { ok: false, error: { code: 'action-failed', message: `Your group is full (${MAX_GROUP_TABS} max). Close or reuse a tab first.` } }
+      }
       tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
       persistTabAuthorization()
       broadcastTabAuthorization()
-      return { ok: true, result: { text: `Opened a new tab (id ${tab.id}) in group ${groupId}.` } }
+      return { ok: true, result: { text: `Opened a new tab (id ${tab.id}) in your group ${groupId}.` } }
     }
     return { ok: false, error: { code: 'action-failed', message: 'Could not open a new tab.' } }
   }
@@ -1126,7 +1139,7 @@ function routeToolCall(call: ToolCall): void {
       controller.signal,
       target,
       () => target.id !== undefined
-        && (!authorized || tabAuthorization.isAuthorizedTab(target.id)),
+        && (!authorized || tabAuthorization.isAuthorizedTabForSession(target.id, call.sessionId ?? '_default')),
     )
     return answer
   }).then(
