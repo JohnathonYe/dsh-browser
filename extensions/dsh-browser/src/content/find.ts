@@ -204,7 +204,8 @@ function ancestorsSnippet(el: Element): string {
 function hrefHeadline(href: string): string {
   try {
     const url = new URL(href, document.baseURI)
-    return url.origin === location.origin ? `${url.pathname}${url.search}` : `${url.host}${url.pathname}`
+    // 模拟人操作：跨域链接也保留完整 URL（含查询串参数），不剥离任何信息，便于用完整地址导航。
+    return url.origin === location.origin ? `${url.pathname}${url.search}` : url.href
   } catch {
     return href
   }
