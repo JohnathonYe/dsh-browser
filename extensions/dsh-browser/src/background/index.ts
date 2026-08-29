@@ -884,7 +884,7 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: s
  * 只对新建的 tab 建组授权，绝不触碰当前活动页；dsh 自身页（dsh-web / 扩展页）不是合法目标。
  * @returns 成功时返回新开的 tab 与其 groupId；否则返回 ToolAnswer 错误。
  */
-async function openColdStartAuthorizedTab(url: string, ownerSessionId: string | null = '_default'): Promise<{ tab: chrome.tabs.Tab; groupId: number } | ToolAnswer> {
+async function openColdStartAuthorizedTab(url: string, ownerSessionId: string | null = '_default', name?: string): Promise<{ tab: chrome.tabs.Tab; groupId: number } | ToolAnswer> {
   // dsh 自身页（dsh-web / 扩展页）绝不能成为受控目标。
   if (isDshOwnPage(url)) {
     return { ok: false, error: { code: 'no-active-tab', message: 'The target URL is a dsh page and cannot be an authorized target. Open a real third-party URL instead.' } }
@@ -903,7 +903,7 @@ async function openColdStartAuthorizedTab(url: string, ownerSessionId: string | 
   if (groupId < 0) {
     return { ok: false, error: { code: 'action-failed', message: 'Could not group the new tab into a DSH- group.' } }
   }
-  const shown = normalizeGroupTitle('AI')
+  const shown = normalizeGroupTitle(name && name.trim() !== '' ? name : 'AI')
   await chrome.tabGroups.update(groupId, { title: shown }).catch(() => {})
   tabAuthorization.authorizeGroup(groupId, shown, [tab.id], ownerSessionId)
   tabAuthorization.setTarget(tab.id, { title: tab.title ?? '', url: tab.url ?? '' })
@@ -970,6 +970,7 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
   }
   if (call.name === 'browser_new_tab') {
     const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
+    const name = typeof (call.args as { name?: unknown })?.name === 'string' ? (call.args as { name?: unknown }).name as string : undefined
     const sessionId = call.sessionId ?? '_default'
     const myGroupIds = tabAuthorization.groupsForSession(sessionId)
     // dsh 自身页（dsh-web / 扩展页）绝不能成为受控目标：无论冷启动还是已有授权组下，
@@ -983,7 +984,7 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
       if (!hasRealUrl) {
         return { ok: false, error: { code: 'no-active-tab', message: 'No authorized group for this agent. Open a real URL, or authorize a group in the panel first.' } }
       }
-      const opened = await openColdStartAuthorizedTab(url, sessionId)
+      const opened = await openColdStartAuthorizedTab(url, sessionId, name)
       if ('ok' in opened) return opened
       return { ok: true, result: { text: `Opened a new tab (id ${opened.tab.id}) in a new DSH- group.` } }
     }

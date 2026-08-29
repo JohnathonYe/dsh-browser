@@ -588,8 +588,11 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
   })
   const newTab = (): ToolDefinition => defineTool({
     name: 'browser_new_tab',
-    description: 'Open a new tab in the authorized group; joins the group and becomes operable.',
-    parameters: { url: { type: 'string', description: 'Optional URL to open in the new tab.' } },
+    description: 'Open a new tab in the authorized group; joins the group and becomes operable. Pass name to label this agent/group (used as the DSH- group title).',
+    parameters: {
+      url: { type: 'string', description: 'Optional URL to open in the new tab.' },
+      name: { type: 'string', description: 'Optional short task label; used as the group name (e.g. "跨境女装采集").' },
+    },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => call(exec, 'browser_new_tab', args as Record<string, unknown>),
