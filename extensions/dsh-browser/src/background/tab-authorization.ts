@@ -180,6 +180,44 @@ export class TabAuthorizationController {
     return changed
   }
 
+  /** 把组的授权集合同步为「当前打开」的 tab 集合：剔除已关闭的、补入新打开的，使
+   *  组容量（MAX_GROUP_TABS）始终按真实打开的页数计算，避免「只见 2 个 tab 却报满」
+   *  这类幽灵计数导致的假满。 */
+  syncGroupTabs(groupId: number, tabIds: number[]): boolean {
+    const record = this.groups.get(groupId)
+    if (record === undefined) return false
+    let changed = false
+    const next = new Set(tabIds)
+    // 剔除已关闭的 tab（不在当前打开集合中）。
+    for (const tabId of [...record.tabIds]) {
+      if (!next.has(tabId)) {
+        record.tabIds.delete(tabId)
+        this.tabToGroup.delete(tabId)
+        if (this.targetTabId === tabId) {
+          this.targetTabId = null
+          this.targetGroupId = null
+        }
+        changed = true
+      }
+    }
+    // 补入新打开的 tab。
+    for (const tabId of next) {
+      const prev = this.tabToGroup.get(tabId)
+      if (prev !== undefined && prev !== groupId) {
+        // 该 tab 已在其它授权组：从原组移除，改归本组。
+        this.groups.get(prev)?.tabIds.delete(tabId)
+        this.tabToGroup.delete(tabId)
+      }
+      if (!record.tabIds.has(tabId)) {
+        record.tabIds.add(tabId)
+        this.tabToGroup.set(tabId, groupId)
+        changed = true
+      }
+    }
+    if (changed) this.bump()
+    return changed
+  }
+
   /** 组内移除 tab。 */
   removeTabsFromGroup(groupId: number, tabIds: number[]): boolean {
     const record = this.groups.get(groupId)
