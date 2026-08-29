@@ -143,7 +143,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // dropped (alpha's `session/create` attaches the declared workspace natively
   // and materializes on create); the bridge forwards unary RPCs translated in
   // `server.ts` and no longer pumps a global event stream.
-  const apiHandler = ctx.connection.createSharedFetchHandler('/api')
+  // @deepseek-ai alpha type drift: HostConnectionHandle's declared type may lag
+  // the runtime channel (the shared /api fetch handler). Cast so tsc resolves it.
+  const connection = ctx.connection as unknown as { createSharedFetchHandler: (path: string) => { fetch: (request: Request) => Promise<Response> } }
+  const apiHandler = connection.createSharedFetchHandler('/api')
   const browserContext = new BrowserContextInjector(ctx.agents)
   ctx.on('agent/session-start', ({ agent }) => { browserContext.activate(agent) })
   const server = new BridgeServer({

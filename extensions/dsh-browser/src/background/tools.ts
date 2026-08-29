@@ -165,7 +165,7 @@ function isCancelled(call: ToolCall, signal: AbortSignal | undefined): boolean {
 }
 
 function withoutFrame(args: Record<string, unknown>): Record<string, unknown> {
-  const { frame: _frame, ...rest } = args
+  const { frame: _frame, tabId: _tabId, ...rest } = args
   return rest
 }
 

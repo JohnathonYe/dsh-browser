@@ -610,8 +610,17 @@ async function restoreTabAuthorization(): Promise<void> {
 const authorizationReady = restoreTabAuthorization()
 
 /** Resolve the AI's current authorized target tab (no handoff; works on background tabs). */
-async function resolveAuthorizedTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'> | ToolAnswer> {
+async function resolveAuthorizedTab(call?: ToolCall): Promise<Pick<chrome.tabs.Tab, 'id' | 'url' | 'windowId'> | ToolAnswer> {
   await authorizationReady
+  // Per-command tabId targeting (no separate browser_tab_switch): when the model
+  // passes an authorized tabId, make it the current target before resolving.
+  const requestedTabId = Number((call?.args as { tabId?: unknown } | undefined)?.tabId)
+  if (call !== undefined && Number.isInteger(requestedTabId) && tabAuthorization.isAuthorizedTab(requestedTabId)) {
+    const t = await chrome.tabs.get(requestedTabId).catch(() => null)
+    tabAuthorization.setTarget(requestedTabId, { title: t?.title ?? '', url: t?.url ?? '' })
+    broadcastTabAuthorization()
+    await syncDebuggerHold()
+  }
   const tabId = tabAuthorization.resolveTarget()
   if (tabId === null) return affinityFailure('missing')
   try {
@@ -628,6 +637,15 @@ async function resolveAuthorizedTab(): Promise<Pick<chrome.tabs.Tab, 'id' | 'url
     broadcastTabAuthorization()
     await syncDebuggerHold()
     return affinityFailure('lost')
+  }
+}
+
+/** 把刚操作的标签带到前台，让用户看到 AI 正在执行的 tab（展示跟随最后命令到的标签）。 */
+async function revealTab(target: Pick<chrome.tabs.Tab, 'id' | 'windowId'>): Promise<void> {
+  if (target.id === undefined) return
+  try { await chrome.tabs.update(target.id, { active: true }) } catch { /* tab closed */ }
+  if (target.windowId !== undefined) {
+    try { await chrome.windows.update(target.windowId, { focused: true }) } catch { /* window closed */ }
   }
 }
 
@@ -941,19 +959,6 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     }
     return { ok: true, result: { text: lines.join('\n') || 'No authorized tabs yet.' } }
   }
-  if (call.name === 'browser_tab_switch') {
-    const tabId = Number((call.args as { tabId?: unknown })?.tabId)
-    if (Number.isInteger(tabId) && tabAuthorization.isAuthorizedTab(tabId)) {
-      const tab = await chrome.tabs.get(tabId).catch(() => null)
-      const title = tab?.title ?? ''
-      const url = tab?.url ?? ''
-      tabAuthorization.setTarget(tabId, { title, url })
-      broadcastTabAuthorization()
-      await syncDebuggerHold()
-      return { ok: true, result: { text: `Switched to tab ${tabId}${title ? ': ' + title : ''}` } }
-    }
-    return { ok: false, error: { code: 'no-active-tab', message: 'Invalid or unauthorized tabId. Use browser_tab_list first.' } }
-  }
   if (call.name === 'browser_new_tab') {
     const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
     const groups = tabAuthorization.snapshot().groups
@@ -993,7 +998,7 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
       return { ok: false, error: { code: 'action-failed', message: 'Page content sharing is disabled in Settings > Page content sharing.' } }
     }
     if (tabAuthorization.snapshot().groups.length === 0) return noAuthGroupError()
-    const target = await resolveAuthorizedTab()
+    const target = await resolveAuthorizedTab(call)
     if ('ok' in target) return target
     const tabId = target.id
     if (tabId === undefined) {
@@ -1028,6 +1033,7 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
       // is recorded and no screenshot-pixel conversion is performed.
       const originalDimensions = pngSizeFromBase64(data)
       const imageSize = originalDimensions === undefined ? undefined : modelVisibleImageSize(originalDimensions)
+      await revealTab(target)
       return {
         ok: true,
         result: {
@@ -1067,7 +1073,7 @@ function routeToolCall(call: ToolCall): void {
     })
     return
   }
-  if (call.name === 'browser_tab_list' || call.name === 'browser_tab_switch' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot') {
+  if (call.name === 'browser_tab_list' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot') {
     const controller = new AbortController()
     activeToolCalls.set(call.id, controller)
     const timer = setTimeout(() => { controller.abort() }, 90_000)
@@ -1098,7 +1104,7 @@ function routeToolCall(call: ToolCall): void {
   //（自动新开 tab 建组授权）；其余 browser_* 工具在下方直接返回「请先打开目标页」引导，避免劫持用户当前页（尤其 dsh-web）。
   const hasAuthGroups = tabAuthorization.snapshot().groups.length > 0
   const resolveTarget = hasAuthGroups
-    ? resolveAuthorizedTab()
+    ? resolveAuthorizedTab(call)
     : call.name === 'browser_navigate'
       ? coldStartNavigate(call)
       : Promise.resolve(noAuthGroupError())
@@ -1107,7 +1113,7 @@ function routeToolCall(call: ToolCall): void {
     // 到达这里说明 hasAuthGroups 为 true，resolveAuthorizedTab() 解析到了受控 tab，
     // 按授权组 dispatch；冷启动导航分支只会返回成功/错误 ToolAnswer，不会走到这里。
     const authorized = tabAuthorization.snapshot().groups.length > 0
-    return dispatchToolCall(
+    const answer = await dispatchToolCall(
       call,
       authorized ? 'auto' : settings.sharePageContent,
       budget,
@@ -1117,6 +1123,9 @@ function routeToolCall(call: ToolCall): void {
       () => target.id !== undefined
         && (!authorized || tabAuthorization.isAuthorizedTab(target.id)),
     )
+    // 展示跟随最后命令到的标签：把刚操作的目标 tab 带到前台。
+    if (answer.ok) await revealTab(target)
+    return answer
   }).then(
     (answer) => {
       if (controller.signal.aborted) return

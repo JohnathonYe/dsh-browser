@@ -174,6 +174,12 @@ const FRAME_PARAMETER = {
   description: 'Iframe number from browser_snapshot; omit for the top page.',
 }
 
+/** Optional target tab id from browser_tab_list; when omitted the current authorized tab is used. */
+const TAB_ID_PARAMETER = {
+  type: 'number' as const,
+  description: 'Target tabId from browser_tab_list; when omitted the current authorized tab is used.',
+}
+
 /** Optional viewport point for acting on a target by its AX bounds centre. */
 const POINT_PARAMETER = {
   type: 'object' as const,
@@ -206,7 +212,6 @@ export const BROWSER_TOOL_NAMES = [
   'browser_find_dom',
   'browser_wait',
   'browser_tab_list',
-  'browser_tab_switch',
   'browser_new_tab',
   'browser_screenshot',
   'browser_list_instances',
@@ -249,8 +254,8 @@ export function registerBrowserTools(
   // `read_image` tool uses, so a vision model reads the screenshot as an image.
   const screenshot = (): ToolDefinition => defineTool({
     name: 'browser_screenshot',
-    description: 'Capture a PNG screenshot of the controlled tab and return it as an image content block.',
-    parameters: {},
+    description: 'Capture a PNG screenshot of the target tab and return it as an image content block.',
+    parameters: { tabId: TAB_ID_PARAMETER },
     timeoutMs: options.toolTimeoutMs,
     output: {
       schema: {
@@ -302,8 +307,11 @@ export function registerBrowserTools(
         return [{ type: 'text' as const, text: result.text }]
       },
     },
-    execute: async (_args, exec) => {
-      const raw = await request(exec, 'browser_screenshot', {})
+    execute: async (args, exec) => {
+      const a = args as { tabId?: number }
+      const raw = await request(exec, 'browser_screenshot', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
+      })
       const rawResult = raw as ScreenshotRawResult
       const text = typeof rawResult.text === 'string' ? rawResult.text : 'Captured the controlled tab.'
       // Commit the bytes to the attachment store; degrade to text-only when the
@@ -342,14 +350,16 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_snapshot',
     description: `Read the page as numbered targets; frame for iframes, delta=true for changes. ${UNTRUSTED_CONTENT_WARNING}`,
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       delta: { type: 'boolean', description: 'Return changes since the previous snapshot.' },
       region: { type: 'string', description: 'CSS selector or "main" to read only that region.' },
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { delta?: boolean; region?: string }
+      const a = args as { delta?: boolean; region?: string; tabId?: number }
       return call(exec, 'browser_snapshot', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         ...a.delta !== undefined ? { delta: a.delta } : {},
         ...a.region !== undefined ? { region: a.region } : {},
       })
@@ -360,6 +370,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_click',
     description: 'Click an element from browser_snapshot (by its index, or by the viewport point from its AX bounds); include frame for an iframe target.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       index: { type: 'number', description: 'Element index from the browser_snapshot inventory.' },
       point: POINT_PARAMETER,
       frame: FRAME_PARAMETER,
@@ -373,6 +384,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_hover',
     description: 'Hover an element (by its index, or by the viewport point from its AX bounds) so its tooltip or menu renders; snapshot to read it.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       index: { type: 'number', description: 'Element index from the browser_snapshot inventory.' },
       point: POINT_PARAMETER,
       frame: FRAME_PARAMETER,
@@ -380,8 +392,9 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { index?: number; point?: Record<string, unknown>; frame?: number }
+      const a = args as { index?: number; point?: Record<string, unknown>; frame?: number; tabId?: number }
       return call(exec, 'browser_hover', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         ...a.index !== undefined ? { index: a.index } : {},
         ...a.point !== undefined ? { point: a.point } : {},
         ...a.frame !== undefined ? { frame: a.frame } : {},
@@ -393,6 +406,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_drag',
     description: 'Drag a slider (index) to a value, or a generic element by dx/dy.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       index: { type: 'number', required: true, description: 'Element index from the browser_snapshot inventory.' },
       value: { type: 'number', description: 'Target value for a slider/range element.' },
       dx: { type: 'number', description: 'Horizontal drag distance in pixels (generic drags).' },
@@ -402,8 +416,9 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { index: number; value?: number; dx?: number; dy?: number; frame?: number }
+      const a = args as { index: number; value?: number; dx?: number; dy?: number; frame?: number; tabId?: number }
       return call(exec, 'browser_drag', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         index: a.index,
         ...a.value !== undefined ? { value: a.value } : {},
         ...a.dx !== undefined ? { dx: a.dx } : {},
@@ -417,6 +432,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_type',
     description: 'Append text to a field (index); replace=true clears it. Sensitive values are never returned.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       index: { type: 'number', required: true, description: 'Form-field index from the browser_snapshot forms inventory.' },
       frame: FRAME_PARAMETER,
       text: { type: 'string', required: true, description: 'Text to enter.' },
@@ -425,8 +441,9 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { index: number; frame?: number; text: string; replace?: boolean }
+      const a = args as { index: number; frame?: number; text: string; replace?: boolean; tabId?: number }
       return call(exec, 'browser_type', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         index: a.index,
         ...a.frame !== undefined ? { frame: a.frame } : {},
         text: a.text,
@@ -439,6 +456,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_press',
     description: 'Send one key press, such as Enter, Tab, Escape, an arrow, Backspace, or Delete.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       key: { type: 'string', required: true, description: 'Key name using KeyboardEvent.key semantics.' },
       frame: FRAME_PARAMETER,
     },
@@ -451,6 +469,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_scroll',
     description: 'Scroll up, down, top, or bottom; amount is optional pixels.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       direction: { type: 'string', required: true, enum: ['up', 'down', 'top', 'bottom'], description: 'Scroll direction.' },
       amount: { type: 'number', description: 'Number of pixels to scroll; ignored for top and bottom.' },
       frame: FRAME_PARAMETER,
@@ -458,8 +477,9 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { direction: 'up' | 'down' | 'top' | 'bottom'; amount?: number; frame?: number }
+      const a = args as { direction: 'up' | 'down' | 'top' | 'bottom'; amount?: number; frame?: number; tabId?: number }
       return call(exec, 'browser_scroll', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         direction: a.direction,
         ...a.amount !== undefined ? { amount: a.amount } : {},
         ...a.frame !== undefined ? { frame: a.frame } : {},
@@ -471,6 +491,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_navigate',
     description: 'Navigate the controlled tab to an HTTP(S) URL while preserving its login state.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       url: { type: 'string', required: true, description: 'Complete http or https URL.' },
     },
     timeoutMs: options.toolTimeoutMs,
@@ -481,24 +502,31 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
   const simple = (name: 'browser_back' | 'browser_forward' | 'browser_reload', description: string): ToolDefinition => defineTool({
     name,
     description,
-    parameters: {},
+    parameters: { tabId: TAB_ID_PARAMETER },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
-    execute: (_args, exec) => call(exec, name, {}),
+    execute: (args, exec) => {
+      const a = args as { tabId?: number }
+      return call(exec, name, {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
+      })
+    },
   })
 
   const getText = (): ToolDefinition => defineTool({
     name: 'browser_get_text',
     description: `Read page text or a selector. ${UNTRUSTED_CONTENT_WARNING}`,
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       selector: { type: 'string', description: 'CSS selector. Omit to read the whole page.' },
       frame: FRAME_PARAMETER,
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { selector?: string; frame?: number }
+      const a = args as { selector?: string; frame?: number; tabId?: number }
       return call(exec, 'browser_get_text', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         ...a.selector !== undefined ? { selector: a.selector } : {},
         ...a.frame !== undefined ? { frame: a.frame } : {},
       })
@@ -509,6 +537,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_find_dom',
     description: 'Locate DOM elements by text you saw in browser_snapshot (or a CSS selector); returns indexes and XPath to act on.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       keyword: { type: 'string', required: true, description: 'Text seen in browser_snapshot to find.' },
       mode: { type: 'string', enum: ['text', 'css'], description: 'text matches visible text (default); css matches a CSS selector.' },
       root: { type: 'string', description: 'CSS selector to scope the search; default is the whole page.' },
@@ -517,8 +546,9 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { keyword: string; mode?: 'text' | 'css'; root?: string; count?: number }
+      const a = args as { keyword: string; mode?: 'text' | 'css'; root?: string; count?: number; tabId?: number }
       return call(exec, 'browser_find_dom', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         keyword: a.keyword,
         ...a.mode !== undefined ? { mode: a.mode } : {},
         ...a.root !== undefined ? { root: a.root } : {},
@@ -531,14 +561,16 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     name: 'browser_wait',
     description: 'Wait for loading and DOM changes to settle, with an optional extra delay.',
     parameters: {
+      tabId: TAB_ID_PARAMETER,
       ms: { type: 'number', description: 'Additional milliseconds to wait. Omit to perform only the settle check.' },
       frame: FRAME_PARAMETER,
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { ms?: number; frame?: number }
+      const a = args as { ms?: number; frame?: number; tabId?: number }
       return call(exec, 'browser_wait', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         ...a.ms !== undefined ? { ms: a.ms } : {},
         ...a.frame !== undefined ? { frame: a.frame } : {},
       })
@@ -552,14 +584,6 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (_args, exec) => call(exec, 'browser_tab_list', {}),
-  })
-  const tabSwitch = (): ToolDefinition => defineTool({
-    name: 'browser_tab_switch',
-    description: 'Switch the browser target to an authorized tab (by tabId from browser_tab_list).',
-    parameters: { tabId: { type: 'number', required: true, description: 'Authorized tabId to make the current target.' } },
-    timeoutMs: options.toolTimeoutMs,
-    output: TEXT_OUTPUT,
-    execute: (args, exec) => call(exec, 'browser_tab_switch', args as Record<string, unknown>),
   })
   const newTab = (): ToolDefinition => defineTool({
     name: 'browser_new_tab',
@@ -586,7 +610,6 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     findDom(),
     wait(),
     tabList(),
-    tabSwitch(),
     newTab(),
   ]
 }

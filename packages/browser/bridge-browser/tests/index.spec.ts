@@ -11,6 +11,7 @@ import { apply, assertPositiveInteger, Config, resolveConfig } from '../src/inde
 function stubContext(): Context {
   return {
     apiProxy: { sessions: {} } as ApiProxy,
+    connection: { createSharedFetchHandler: () => ({ fetch: async () => new Response() }) },
     webServer: { port: 0, registerUpgrade: () => () => {}, register: () => () => {} },
     tools: { register: () => () => {} },
     agents: { get: () => undefined },
