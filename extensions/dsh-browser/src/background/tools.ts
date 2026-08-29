@@ -372,7 +372,7 @@ async function dispatchOnce(
   } else {
     navigationWait?.cancel()
   }
-  if (call.name === 'browser_get_text' || call.name === 'browser_find_dom') {
+  if (call.name === 'browser_get_text' || call.name === 'browser_find_dom' || call.name === 'browser_get_dom') {
     return { ok: true, result: { text: wrapUntrustedContent(text, budget.maxChars) } }
   }
   const pageContent = requestPageDelta ? answerPageContent(response) : undefined

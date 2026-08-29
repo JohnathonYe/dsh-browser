@@ -278,6 +278,8 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return getTextAction(args)
     case 'browser_find_dom':
       return findDomAction(args, ctx)
+    case 'browser_get_dom':
+      return getDomAction(args)
     case 'browser_wait':
       return waitAction(args, ctx)
     default:
@@ -585,6 +587,20 @@ async function getTextAction(args: Record<string, unknown>): Promise<ActionResul
   const text = source !== null ? pageText(source) : selector !== undefined ? `No element matched selector: ${selector}` : pageText()
   const truncated = truncate(text, 8_000)
   return { text: truncated.text + (truncated.truncated > 0 ? `\n(Truncated ${truncated.truncated} characters.)` : '') }
+}
+
+/** 读取元素完整原始 outerHTML（不剥离/不脱敏），供「难处理场景」直接取完整 DOM 片段（如完整 href、data-* 属性）。 */
+async function getDomAction(args: Record<string, unknown>): Promise<ActionResult> {
+  const selector = typeof args.selector === 'string' && args.selector !== '' ? args.selector : undefined
+  if (selector === undefined) throw new ActionError('bad-args', 'browser_get_dom requires a selector.')
+  const source = document.querySelector(selector)
+  if (source === null) throw new ActionError('not-found', `No element matched selector: ${selector}`)
+  const html = source.outerHTML
+  const maxChars = typeof args.maxChars === 'number' && Number.isInteger(args.maxChars) ? Math.min(Math.max(args.maxChars, 1_000), 40_000) : 16_000
+  if (html.length <= maxChars) return { text: html }
+  return {
+    text: html.slice(0, maxChars) + `\n…(browser_get_dom truncated; full element length ${html.length})`,
+  }
 }
 
 async function findDomAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {

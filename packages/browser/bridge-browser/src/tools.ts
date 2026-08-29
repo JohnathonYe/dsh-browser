@@ -210,6 +210,7 @@ export const BROWSER_TOOL_NAMES = [
   'browser_reload',
   'browser_get_text',
   'browser_find_dom',
+  'browser_get_dom',
   'browser_wait',
   'browser_tab_list',
   'browser_new_tab',
@@ -534,6 +535,28 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     },
   })
 
+  const getDom = (): ToolDefinition => defineTool({
+    name: 'browser_get_dom',
+    description: 'Full outerHTML of a matched element (untrusted).',
+    parameters: {
+      tabId: TAB_ID_PARAMETER,
+      selector: { type: 'string', required: true, description: 'CSS selector of the element to read.' },
+      maxChars: { type: 'number', description: 'Max chars of the returned outerHTML (default 16000, 1000-40000).' },
+      frame: FRAME_PARAMETER,
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => {
+      const a = args as { selector?: string; maxChars?: number; frame?: number; tabId?: number }
+      return call(exec, 'browser_get_dom', {
+        ...a.tabId !== undefined ? { tabId: a.tabId } : {},
+        ...a.selector !== undefined ? { selector: a.selector } : {},
+        ...a.maxChars !== undefined ? { maxChars: a.maxChars } : {},
+        ...a.frame !== undefined ? { frame: a.frame } : {},
+      })
+    },
+  })
+
   const findDom = (): ToolDefinition => defineTool({
     name: 'browser_find_dom',
     description: 'Locate DOM elements by text you saw in browser_snapshot (or a CSS selector); returns indexes and XPath to act on.',
@@ -588,10 +611,10 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
   })
   const newTab = (): ToolDefinition => defineTool({
     name: 'browser_new_tab',
-    description: 'Open a new tab in the authorized group; joins the group and becomes operable. Pass name to label this agent/group (used as the DSH- group title).',
+    description: 'Open a new tab in the authorized group; joins it and becomes operable. Pass name to label this agent/group.',
     parameters: {
       url: { type: 'string', description: 'Optional URL to open in the new tab.' },
-      name: { type: 'string', description: 'Optional short task label; used as the group name (e.g. "跨境女装采集").' },
+      name: { type: 'string', description: 'Optional short task label; used as the group name (e.g. "cross-border womens clothing").' },
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
@@ -599,7 +622,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
   })
   const closeTab = (): ToolDefinition => defineTool({
     name: 'browser_close_tab',
-    description: "Close an authorized tab and remove it from the agent's authorized group. Use it to release a page you no longer need so agents do not pile up or fight over pages.",
+    description: "Close an authorized tab and remove it from the agent's group.",
     parameters: { tabId: { type: 'number', required: true, description: 'Authorized tabId (from browser_tab_list) to close.' } },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
@@ -620,6 +643,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     simple('browser_reload', 'Reload the current page.'),
     getText(),
     findDom(),
+    getDom(),
     wait(),
     tabList(),
     newTab(),
