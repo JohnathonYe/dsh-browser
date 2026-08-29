@@ -583,11 +583,25 @@ async function refreshAuthorizedTabs(groupId?: number): Promise<void> {
       }
       const tabs = await chrome.tabs.query({ groupId: g.groupId }).catch(() => [])
       const ids = tabs.map((t) => t.id).filter((id): id is number => id !== undefined)
-      tabAuthorization.addTabsToGroup(g.groupId, ids)
+      // 同步而非仅新增：把组授权集合同步为「当前打开」的 tab，剔除已关闭的幽灵计数。
+      tabAuthorization.syncGroupTabs(g.groupId, ids)
     } catch { /* skip */ }
   }
   persistTabAuthorization()
   broadcastTabAuthorization()
+}
+
+/** 将某授权组同步为「当前打开」的 tab 集合并返回实际打开数。用于组满判定，不按幽灵计数。 */
+async function reconcileGroupOpenTabs(groupId: number): Promise<number> {
+  try {
+    const tabs = await chrome.tabs.query({ groupId }).catch(() => [])
+    const ids = tabs.map((t) => t.id).filter((id): id is number => id !== undefined)
+    tabAuthorization.syncGroupTabs(groupId, ids)
+    persistTabAuthorization()
+    broadcastTabAuthorization()
+  } catch { /* skip */ }
+  const group = tabAuthorization.snapshot().groups.find((g) => g.groupId === groupId)
+  return group?.tabIds.length ?? 0
 }
 
 async function restoreTabAuthorization(): Promise<void> {
@@ -992,10 +1006,12 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
       return { ok: false, error: { code: 'action-failed', message: 'Open-tab policy is "ask"; switch it to allow in the panel, or allow once here.' } }
     }
     // 每个 agent 只用自己的组；组满 MAX_GROUP_TABS 时要求先关闭/复用，避免页面堆积与争用。
+    // 组满判定用「当前实际打开」的 tab 数（reconcileGroupOpenTabs 会先收敛幽灵计数），
+    // 避免「只见少量 tab 却报满」的假满。
     const groupId = myGroupIds[myGroupIds.length - 1]
-    const group = tabAuthorization.snapshot().groups.find((g) => g.groupId === groupId)
-    if (group !== undefined && group.tabIds.length >= MAX_GROUP_TABS) {
-      return { ok: false, error: { code: 'action-failed', message: `Your group already has ${MAX_GROUP_TABS} tabs (the per-agent maximum). Close a tab with browser_close_tab or reuse an existing one first.` } }
+    const openCount = await reconcileGroupOpenTabs(groupId)
+    if (openCount >= MAX_GROUP_TABS) {
+      return { ok: false, error: { code: 'action-failed', message: `Your group already has ${openCount} open tab${openCount > 1 ? 's' : ''} (the per-agent maximum is ${MAX_GROUP_TABS}). Close a tab with browser_close_tab or reuse an existing one first.` } }
     }
     const tab = await chrome.tabs.create({ url: url || 'about:blank', active: false }).catch(() => null)
     if (tab && tab.id !== undefined) {
