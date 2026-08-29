@@ -1581,6 +1581,11 @@ chrome.tabs.onCreated.addListener((tab) => {
     persistTabAuthorization()
     broadcastTabAuthorization()
   }
+  // 防止 agent 驱动的「页面点开」新 tab 抢前台（如 1688 卡片用 target=_blank 前台开明细页）：
+  // 凡由某个已授权 tab 作为 opener 打开的新 tab，强制保持后台，避免「当前展示页被切到新开页」。
+  if (tab.id !== undefined && tab.active && tab.openerTabId !== undefined && tabAuthorization.isAuthorizedTab(tab.openerTabId)) {
+    void chrome.tabs.update(tab.id, { active: false }).catch(() => {})
+  }
 })
 chrome.tabs.onDetached.addListener((tabId) => {
   if (tabAuthorization.isAuthorizedTab(tabId)) {
