@@ -213,6 +213,7 @@ export const BROWSER_TOOL_NAMES = [
   'browser_wait',
   'browser_tab_list',
   'browser_new_tab',
+  'browser_close_tab',
   'browser_screenshot',
   'browser_list_instances',
   'browser_select_instance',
@@ -593,6 +594,14 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     output: TEXT_OUTPUT,
     execute: (args, exec) => call(exec, 'browser_new_tab', args as Record<string, unknown>),
   })
+  const closeTab = (): ToolDefinition => defineTool({
+    name: 'browser_close_tab',
+    description: "Close an authorized tab and remove it from the agent's authorized group. Use it to release a page you no longer need so agents do not pile up or fight over pages.",
+    parameters: { tabId: { type: 'number', required: true, description: 'Authorized tabId (from browser_tab_list) to close.' } },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_close_tab', args as Record<string, unknown>),
+  })
 
   return [
     snapshot(),
@@ -611,6 +620,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     wait(),
     tabList(),
     newTab(),
+    closeTab(),
   ]
 }
 

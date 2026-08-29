@@ -640,15 +640,6 @@ async function resolveAuthorizedTab(call?: ToolCall): Promise<Pick<chrome.tabs.T
   }
 }
 
-/** 把刚操作的标签带到前台，让用户看到 AI 正在执行的 tab（展示跟随最后命令到的标签）。 */
-async function revealTab(target: Pick<chrome.tabs.Tab, 'id' | 'windowId'>): Promise<void> {
-  if (target.id === undefined) return
-  try { await chrome.tabs.update(target.id, { active: true }) } catch { /* tab closed */ }
-  if (target.windowId !== undefined) {
-    try { await chrome.windows.update(target.windowId, { focused: true }) } catch { /* window closed */ }
-  }
-}
-
 /** 跟随页面的绑定能力已废弃：浏览器操作只按授权组 / 冷启动自建组驱动，不再把某个
  * tab 当作「要跟随的当前页」。返回 true 让 session.prompt 照常放行。 */
 async function ensureInitialTabBinding(): Promise<boolean> {
@@ -959,6 +950,21 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
     }
     return { ok: true, result: { text: lines.join('\n') || 'No authorized tabs yet.' } }
   }
+  if (call.name === 'browser_close_tab') {
+    const tabId = Number((call.args as { tabId?: unknown })?.tabId)
+    if (!Number.isInteger(tabId)) {
+      return { ok: false, error: { code: 'bad-args', message: 'browser_close_tab requires a numeric tabId.' } }
+    }
+    if (!tabAuthorization.isAuthorizedTab(tabId)) {
+      return { ok: false, error: { code: 'no-active-tab', message: 'The tab is not authorized. Use browser_tab_list first.' } }
+    }
+    await chrome.tabs.remove(tabId).catch(() => {})
+    tabAuthorization.removeTab(tabId)
+    persistTabAuthorization()
+    broadcastTabAuthorization()
+    await syncDebuggerHold()
+    return { ok: true, result: { text: `Closed tab ${tabId}.` } }
+  }
   if (call.name === 'browser_new_tab') {
     const url = typeof (call.args as { url?: unknown })?.url === 'string' ? (call.args as { url?: unknown }).url as string : undefined
     const groups = tabAuthorization.snapshot().groups
@@ -1033,7 +1039,6 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
       // is recorded and no screenshot-pixel conversion is performed.
       const originalDimensions = pngSizeFromBase64(data)
       const imageSize = originalDimensions === undefined ? undefined : modelVisibleImageSize(originalDimensions)
-      await revealTab(target)
       return {
         ok: true,
         result: {
@@ -1073,7 +1078,7 @@ function routeToolCall(call: ToolCall): void {
     })
     return
   }
-  if (call.name === 'browser_tab_list' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot') {
+  if (call.name === 'browser_tab_list' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot' || call.name === 'browser_close_tab') {
     const controller = new AbortController()
     activeToolCalls.set(call.id, controller)
     const timer = setTimeout(() => { controller.abort() }, 90_000)
@@ -1123,8 +1128,6 @@ function routeToolCall(call: ToolCall): void {
       () => target.id !== undefined
         && (!authorized || tabAuthorization.isAuthorizedTab(target.id)),
     )
-    // 展示跟随最后命令到的标签：把刚操作的目标 tab 带到前台。
-    if (answer.ok) await revealTab(target)
     return answer
   }).then(
     (answer) => {
