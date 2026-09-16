@@ -1,17 +1,22 @@
 /**
  * REAL-composition coverage: a test-only cordis.yml booted through the
  * published Loader mounts the webserver, the minimal spine (sessions /
- * user-questions / agents / system-prompt / tools), a test-only api host
- * providing `ctx.apiProxy` over `createApiProxy` (the same shape the apiproxy
- * package's own tests use), and the bridge plugin itself. A real WebSocket
- * client then authenticates over a real socket and drives real gateway RPCs
- * against the real session store; disposal removes the tool registrations
- * (HMR safety).
+ * user-questions / agents / system-prompt / tools), a test-only `/api` carrier
+ * and the bridge plugin itself. A real WebSocket client then authenticates over
+ * a real socket and drives the bridge's gateway path against the real session
+ * store; disposal removes the tool registrations (HMR safety).
  *
- * Mocked boundary: only the api host's model routing defaults (no LLM
- * adapter) — RPCs exercised here (session.create/list) never touch the model.
+ * Mocked boundary: the `/api` carrier. A production deployment serves that
+ * channel from the Connection host half, which dispatches to API Gateway and the
+ * Session Controller's generated Remote endpoints; this fixture binds the two
+ * endpoints the suite drives (session/create, session/list) to the real
+ * SessionStore instead of mounting that whole API layer. The bridge's own
+ * translation (`session.create` → `session/create`, `{ args }` wrapping), trust
+ * fence, relay and error paths stay production code. No LLM adapter is mounted:
+ * the RPCs exercised here never touch the model.
  */
 
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -29,7 +34,6 @@ import ToolRegistry from '@deepseek-ai/dsh-tools'
 import LlmService from '@deepseek-ai/dsh-llm'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
-import { createApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
 import * as BridgeBrowser from '../src/index.ts'
 import { BRIDGE_PATH, type BridgeFrame } from '../src/protocol.ts'
 
@@ -47,19 +51,48 @@ afterEach(async () => {
 })
 
 /**
- * The gateway over the minimal spine, provided as `ctx.apiProxy` — the same
- * factory the apiproxy package's own tests use. Model routing is stubbed
- * (provider/model names only; no adapter), which is the one external
- * boundary this composition does not exercise.
+ * Test-owned `/api` carrier over the real spine. The bridge needs only
+ * `ctx.connection.createSharedFetchHandler('/api')`; this fixture answers the
+ * endpoints the suite drives from the real SessionStore and refuses anything
+ * else with a 404 — the same answer the production carrier gives an unclaimed
+ * endpoint.
  */
-const ApiHost = {
-  name: 'api-host',
-  inject: ['sessions', 'userQuestions', 'agents'],
+const TestCarrier = {
+  name: 'test:carrier',
+  inject: ['sessions'],
   apply(ctx: Context, config: { cwd: string }): void {
-    ctx.provide('apiProxy', createApiProxy(ctx, {
-      defaultModelSelection: () => ({ provider: 'p', model: 'm' }),
-      cwd: config.cwd,
-    }))
+    const handler = {
+      fetch: async (request: Request): Promise<Response> => {
+        const body = await request.json() as {
+          rpcId: string
+          method: string
+          payload?: { args?: Record<string, unknown> }
+        }
+        const args = body.payload?.args ?? {}
+        const reply = (value: unknown): Response => Response.json({
+          type: 'server-response',
+          rpcId: body.rpcId,
+          result: { ok: true, value },
+        })
+        switch (body.method) {
+          case 'session/create': {
+            const meta = { cwd: typeof args.cwd === 'string' ? args.cwd : config.cwd }
+            const session = ctx.sessions.create(SessionId(`session-${randomUUID()}`), { meta })
+            return reply({ sessionId: session.id })
+          }
+          case 'session/list':
+            return reply({
+              sessions: ctx.sessions.list().map((session) => ({
+                sessionId: session.id,
+                cwd: session.header.cwd ?? null,
+              })),
+            })
+          default:
+            return new Response(`unclaimed endpoint: ${body.method}`, { status: 404 })
+        }
+      },
+    }
+    ctx.provide('connection', { createSharedFetchHandler: () => handler } as never)
   },
 }
 
@@ -79,7 +112,7 @@ async function loadComposition(): Promise<{ ctx: Context; configPath: string; po
     "- name: '@deepseek-ai/dsh-tools'",
     "- name: '@deepseek-ai/dsh-llm'",
     "- name: '@deepseek-ai/dsh-agent-loop'",
-    "- name: 'test:api-host'",
+    "- name: 'test:carrier'",
     '  config:',
     `    cwd: '${root}'`,
     `- name: '${BRIDGE}'`,
@@ -105,7 +138,7 @@ async function loadComposition(): Promise<{ ctx: Context; configPath: string; po
     ['@deepseek-ai/dsh-tools', ToolRegistry],
     ['@deepseek-ai/dsh-llm', LlmService],
     ['@deepseek-ai/dsh-agent-loop', AgentLoop],
-    ['test:api-host', ApiHost],
+    ['test:carrier', TestCarrier],
     [BRIDGE, BridgeBrowser],
   ])
   context.loader.internal = {

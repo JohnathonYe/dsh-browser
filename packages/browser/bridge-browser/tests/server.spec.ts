@@ -2,9 +2,7 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { BridgeServer, BridgeToolError, isLoopbackAddress, messageToText, payloadCode, payloadMessage } from '../src/server.ts'
+import { BridgeServer, BridgeToolError, isLoopbackAddress, messageToText, payloadCode, payloadMessage, type BridgeEventEnvelope } from '../src/server.ts'
 import { BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD, type BridgeFrame } from '../src/protocol.ts'
 
 const TOKEN = 'deadbeefdeadbeefdeadbeefdeadbeef'
@@ -28,10 +26,10 @@ async function startBridge(overrides: Partial<ConstructorParameters<typeof Bridg
     status: 200,
     headers: { 'content-type': 'application/json' },
   }))
-  const events: AsyncIterable<RpcRequest<MuxFrame>> = {
+  const events: AsyncIterable<BridgeEventEnvelope> = {
     async *[Symbol.asyncIterator]() {
-      yield { rpcId: RpcId('e1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
-      yield { rpcId: RpcId('e2'), payload: { type: 'session/queue', sessionId: 's1' as never, items: [] } }
+      yield { rpcId: 'e1', payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
+      yield { rpcId: 'e2', payload: { type: 'session/queue', sessionId: 's1' as never, items: [] } }
     },
   }
   const bridge = new BridgeServer({
@@ -201,10 +199,12 @@ describe('BridgeServer', () => {
     expect(result).toMatchObject({ t: 'rpc.result', id: 'rpc-1', ok: true })
     expect(h.fetchMock).toHaveBeenCalledTimes(1)
     const request = h.fetchMock.mock.calls[0]![0] as Request
-    expect(request.url).toBe('http://dsh.internal/api/session.list')
+    expect(request.url).toBe('http://dsh.internal/api/session/list')
     expect(request.method).toBe('POST')
     expect(request.headers.get('content-type')).toBe('application/json')
-    expect(JSON.parse(await request.text())).toEqual({ type: 'client-request', rpcId: 'rpc-1', method: 'session.list', payload: {} })
+    expect(JSON.parse(await request.text())).toEqual({
+      type: 'client-request', rpcId: 'rpc-1', method: 'session/list', payload: { args: {} },
+    })
     ws.close()
   })
 
@@ -292,9 +292,9 @@ describe('BridgeServer', () => {
     const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve })
     const calls: Array<{ method: string; sessionId: string }> = []
     const apiHandler = { fetch: vi.fn(async (request: Request) => {
-      const body = await request.json() as { rpcId: string; method: string; payload: { sessionId: string } }
-      calls.push({ method: body.method, sessionId: body.payload.sessionId })
-      if (body.method === 'session.prompt' && body.payload.sessionId === 'provisional') await promptGate
+      const body = await request.json() as { rpcId: string; method: string; payload: { args: { sessionId: string } } }
+      calls.push({ method: body.method, sessionId: body.payload.args.sessionId })
+      if (body.method === 'session/prompt' && body.payload.args.sessionId === 'provisional') await promptGate
       return Response.json({
         type: 'server-response',
         rpcId: body.rpcId,
@@ -315,15 +315,15 @@ describe('BridgeServer', () => {
     send(ws, { t: 'rpc', id: 'other-cancel', method: 'session.cancel', payload: { sessionId: 'other' } })
 
     await waitFor(() => calls.some((call) => call.sessionId === 'other'))
-    expect(calls).toContainEqual({ method: 'session.prompt', sessionId: 'provisional' })
-    expect(calls).toContainEqual({ method: 'session.cancel', sessionId: 'other' })
-    expect(calls).not.toContainEqual({ method: 'session.cancel', sessionId: 'provisional' })
+    expect(calls).toContainEqual({ method: 'session/prompt', sessionId: 'provisional' })
+    expect(calls).toContainEqual({ method: 'session/cancel', sessionId: 'other' })
+    expect(calls).not.toContainEqual({ method: 'session/cancel', sessionId: 'provisional' })
 
     releasePrompt()
-    await waitFor(() => calls.some((call) => call.method === 'session.cancel' && call.sessionId === 'provisional'))
+    await waitFor(() => calls.some((call) => call.method === 'session/cancel' && call.sessionId === 'provisional'))
     expect(calls.filter((call) => call.sessionId === 'provisional')).toEqual([
-      { method: 'session.prompt', sessionId: 'provisional' },
-      { method: 'session.cancel', sessionId: 'provisional' },
+      { method: 'session/prompt', sessionId: 'provisional' },
+      { method: 'session/cancel', sessionId: 'provisional' },
     ])
     await waitFor(() => frames.filter((frame) => frame.t === 'rpc.result').length === 3)
     ws.close()
@@ -599,9 +599,9 @@ describe('BridgeServer', () => {
   })
 
   it('stops the stream-failed arm when the pump fails after the socket closed', async () => {
-    const lateFailEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
+    const lateFailEvents: AsyncIterable<BridgeEventEnvelope> = {
       async *[Symbol.asyncIterator]() {
-        yield { rpcId: RpcId('l1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
+        yield { rpcId: 'l1', payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
         await new Promise((resolve) => { setTimeout(resolve, 120) })
         throw new Error('late failure')
       },
@@ -726,9 +726,9 @@ describe('BridgeServer', () => {
   })
 
   it('emits a stream-failed error frame when the event stream throws', async () => {
-    const failingEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
+    const failingEvents: AsyncIterable<BridgeEventEnvelope> = {
       async *[Symbol.asyncIterator]() {
-        yield { rpcId: RpcId('f1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
+        yield { rpcId: 'f1', payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
         throw new Error('stream broke')
       },
     }
@@ -742,10 +742,10 @@ describe('BridgeServer', () => {
   })
 
   it('stops pumping events once the socket closes mid-stream', async () => {
-    const slowEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
+    const slowEvents: AsyncIterable<BridgeEventEnvelope> = {
       async *[Symbol.asyncIterator]() {
         for (let i = 0; i < 100; i += 1) {
-          yield { rpcId: RpcId(`s${i}`), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: i } }
+          yield { rpcId: `s${i}`, payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: i } }
           await new Promise((resolve) => { setTimeout(resolve, 10) })
         }
       },
