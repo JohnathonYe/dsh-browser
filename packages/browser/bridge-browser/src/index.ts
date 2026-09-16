@@ -127,6 +127,31 @@ function noGatewayEvents(): AsyncIterable<BridgeEventEnvelope> {
 }
 
 /**
+ * Flush one session's pending browser context at the harness's agent-creation
+ * boundary.
+ *
+ * `agent/created` is the only startup-driving event that survives
+ * `@deepseek-ai/dsh@0.1.6-alpha.1` (which removed `agent/session-start`);
+ * `0.1.5-rc.1`/`rc.2` emit it as well, from the AgentRegistry, once an agent
+ * enters it with a live session and completed setup — so one subscription
+ * covers every supported harness. 0.1.6 awaits these listeners serially and
+ * rolls agent creation back when one rejects, so this flush reports its own
+ * failure instead of letting it escape.
+ *
+ * @param ctx - Cordis context owning the subscription.
+ * @param injector - injector holding snapshots for not-yet-materialized sessions.
+ */
+export function registerAgentCreatedFlush(ctx: Context, injector: BrowserContextInjector): void {
+  ctx.on('agent/created', ({ agent }) => {
+    try {
+      injector.activate(agent)
+    } catch (error) {
+      ctx.logger.warn(`bridge-browser: browser context flush failed for agent "${String(agent.id)}": ${String(error)}`)
+    }
+  })
+}
+
+/**
  * Mount the bridge: resolve the token, register the upgrade route, the tool
  * set, and an optional system-prompt section, all effect-scoped for HMR.
  *
@@ -148,7 +173,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const connection = ctx.connection as unknown as { createSharedFetchHandler: (path: string) => { fetch: (request: Request) => Promise<Response> } }
   const apiHandler = connection.createSharedFetchHandler('/api')
   const browserContext = new BrowserContextInjector(ctx.agents)
-  ctx.on('agent/session-start', ({ agent }) => { browserContext.activate(agent) })
+  registerAgentCreatedFlush(ctx, browserContext)
   const server = new BridgeServer({
     token: tokenRes.token,
     apiHandler,

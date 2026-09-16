@@ -15,6 +15,7 @@ Behavioral changes on alpha:
 - **No global session event pump.** Alpha removed `apiProxy.events.mux`; live events are now per-session via `session/follow`. The bridge no longer auto-pumps a global `event` frame, and calls that need live per-session events open `session/follow` themselves through the shared channel.
 - **`sessionWorkspacePath` and `deferSessionCreate` are no-ops on alpha.** Alpha's `session/create` attaches the declared workspace natively and materializes the session on create, so the workspace-grouping and deferred-materialization wrappers were removed. The config keys remain accepted for backward compatibility but have no effect against the Remote gateway.
 - Methods renamed or removed in alpha are answered by the carrier with an RPC error (never a bridge crash). Unknown/unmapped methods degrade gracefully.
+- **Agent startup boundary is `agent/created`.** `0.1.6-alpha.1` removed `agent/session-start`, so the pending followed-page snapshot and screenshot flush on `agent/created` — which `0.1.5-rc.1`/`rc.2` also emit, from the AgentRegistry. The flush swallows and logs its own failure because 0.1.6 awaits these listeners serially and rolls agent creation back when one rejects.
 
 ## Config
 

@@ -3,9 +3,10 @@
  *
  * The extension captures the page immediately after the user chooses to
  * follow it. A live Agent receives that snapshot at once; a deferred session
- * keeps only its newest snapshot until `agent/session-start` publishes the
- * Agent. Injection deliberately does not wake an idle Agent — the snapshot is
- * claimed together with the user's next message.
+ * keeps only its newest snapshot until the harness announces the Agent through
+ * `agent/created` — the boundary `0.1.6-alpha.1` kept after removing
+ * `agent/session-start`. Injection deliberately does not wake an idle Agent;
+ * the snapshot is claimed together with the user's next message.
  *
  * @module
  */
