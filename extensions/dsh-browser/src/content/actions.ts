@@ -594,7 +594,7 @@ async function getDomAction(args: Record<string, unknown>): Promise<ActionResult
   const selector = typeof args.selector === 'string' && args.selector !== '' ? args.selector : undefined
   if (selector === undefined) throw new ActionError('bad-args', 'browser_get_dom requires a selector.')
   const source = document.querySelector(selector)
-  if (source === null) throw new ActionError('not-found', `No element matched selector: ${selector}`)
+  if (source === null) throw new ActionError('action-failed', `No element matched selector: ${selector}`)
   const html = source.outerHTML
   const maxChars = typeof args.maxChars === 'number' && Number.isInteger(args.maxChars) ? Math.min(Math.max(args.maxChars, 1_000), 40_000) : 16_000
   if (html.length <= maxChars) return { text: html }

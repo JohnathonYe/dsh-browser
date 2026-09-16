@@ -8,7 +8,7 @@ The **browser-operation bridge** for dsh: mounts a token-authenticated WebSocket
 
 ## Compatibility
 
-This plugin targets **`@deepseek-ai/dsh@0.1.2-alpha.1`** and later. The migration dropped the old `apiProxy`/`@deepseek-ai/dsh-host-apiproxy` transport (removed in 0.1.2-alpha.1 in favor of the Remote gateway) and now drives gateway RPCs through the `/api` shared channel on `ctx.connection` (`createSharedFetchHandler('/api')`). Extension dot-methods are translated to alpha's `<namespace>/<method>` Remote endpoints (`session.prompt` → `session/prompt`, `session.history` → `session/page`, `host.pickDirectory` → `directoryPicker/pick`, `settings.openDocument` → `settings/openSettingsDocument`, `host.openPath` → `session/openWorkspacePath`).
+This plugin targets **`@deepseek-ai/dsh@0.1.5-rc.1`** and later. The migration dropped the old `apiProxy`/`@deepseek-ai/dsh-host-apiproxy` transport (removed in 0.1.2-alpha.1 in favor of the Remote gateway) and now drives gateway RPCs through the `/api` shared channel on `ctx.connection` (`createSharedFetchHandler('/api')`). Extension dot-methods are translated to alpha's `<namespace>/<method>` Remote endpoints (`session.prompt` → `session/prompt`, `session.history` → `session/page`, `host.pickDirectory` → `directoryPicker/pick`, `settings.openDocument` → `settings/openSettingsDocument`, `host.openPath` → `session/openWorkspacePath`).
 
 Behavioral changes on alpha:
 
