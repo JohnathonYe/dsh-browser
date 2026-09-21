@@ -180,11 +180,18 @@ class AICursorOverlay {
     this.active = false
   }
 
-  /** Position the cursor tip at a viewport CSS pixel (inside the shadow). */
-  moveTo(x: number, y: number): void {
+  /** Position the cursor tip at a viewport CSS pixel (inside the shadow).
+   *  `durationMs` sets how long this leg takes, so a caller can make each arc
+   *  point finish exactly as the next begins — one continuous sweep instead of
+   *  a transition cut short every step (which reads as a tiny nudge). */
+  moveTo(x: number, y: number, durationMs?: number): void {
     if (!this.active) return
     const track = this.track()
     if (track === null) return
+    if (durationMs !== undefined) {
+      const ms = Math.max(1, Math.round(durationMs))
+      track.style.transition = `transform ${ms}ms linear, opacity 140ms ease`
+    }
     track.style.transform = `translate(${x}px, ${y}px)`
   }
 
@@ -248,26 +255,26 @@ class AICursorOverlay {
     this.show()
     const token = ++this.animation
     const first = steps[0]!
-    this.moveTo(first.x, first.y)
+    this.moveTo(first.x, first.y, 0)
     for (const step of steps) {
       // A newer plan started: stop animating the stale one (the new one owns
       // the cursor now).
       if (token !== this.animation) return
       switch (step.type) {
         case 'mouseMoved':
-          this.moveTo(step.x, step.y)
+          this.moveTo(step.x, step.y, step.pauseAfterMs)
           break
         case 'mousePressed':
-          this.moveTo(step.x, step.y)
+          this.moveTo(step.x, step.y, step.pauseAfterMs)
           this.press()
           break
         case 'mouseReleased':
-          this.moveTo(step.x, step.y)
+          this.moveTo(step.x, step.y, step.pauseAfterMs)
           this.release()
           break
         case 'mouseWheel':
           // Keep the pointer parked on the anchor while the page scrolls under it.
-          this.moveTo(step.x, step.y)
+          this.moveTo(step.x, step.y, step.pauseAfterMs)
           break
       }
       const pause = step.pauseAfterMs ?? 0

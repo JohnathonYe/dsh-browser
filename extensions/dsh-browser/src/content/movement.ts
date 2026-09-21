@@ -5,8 +5,8 @@
  * `click()` teleports the pointer instead of moving it. These helpers compute
  * a hand-like pointer plan: the cursor travels along an eased, slightly bowed
  * curve (fast-then-slow) with a little random perturbation, lands on a
- * RANDOM point inside the target element (not the dead-center), and pauses
- * randomly between steps. The plan is then replayed as REAL cursor events via
+ * RANDOM point inside the target element (not the dead-center), and glides the
+ * whole way without stopping between interior points. The plan is then replayed as REAL cursor events via
  * CDP `Input.dispatchMouseEvent` (see pointer.ts), so the page sees an actual
  * pointer, `:hover`/tooltips/dropdowns react, and `mousePressed`/`release`
  * produce a genuine click. Where real CDP input is unavailable (a protected
@@ -30,10 +30,16 @@ interface Point {
 
 /** Random pause ranges (ms) that shape the human rhythm. Configurable per op. */
 type PauseRange = [number, number]
-/** Glide between curve points: fast but not a teleport. */
-const GLIDE_PAUSE: PauseRange = [30, 90]
-/** Approach / press / release / settle holds: clearly non-robotic. */
-const RHYTHM_PAUSE: PauseRange = [60, 200]
+/** Total time (ms) one pointer sweep spends crossing the arc. The curve is
+ *  spread evenly over this window, so interior points are one continuous glide
+ *  (no stop, no random gap) and the move still lands in a couple hundred ms. */
+const MOVE_DURATION_MS = 220
+/** Short human beat on arrival / press / release — not a crawl. */
+const RHYTHM_PAUSE: PauseRange = [40, 90]
+/** Clamp one curve-step interval so a 2-point nudge and a 30-point sweep both
+ *  stay readable while the whole sweep still respects MOVE_DURATION_MS. */
+const STEP_INTERVAL_MIN_MS = 8
+const STEP_INTERVAL_MAX_MS = 60
 
 function randomPause(range: PauseRange): number {
   const [min, max] = range
@@ -220,11 +226,17 @@ function movedStep(point: Point, buttons: number, pauseAfterMs: number): MouseSt
   return { type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons, pauseAfterMs }
 }
 
-/** Glide along the curve as a sequence of `mouseMoved` steps with pauses. */
+/** Glide along the curve as a sequence of `mouseMoved` steps. Every step uses
+ *  the SAME interval, so the points form one continuous arc instead of a
+ *  stop-and-go march; the eased curve still gives the fast-then-slow feel. */
 function moveSteps(from: Point, to: Point, opts: { points?: number; buttons?: number } = {}): MouseStep[] {
   const curve = curvePoints(from, to, opts.points ?? 9)
   const buttons = opts.buttons ?? 0
-  return curve.map((point) => movedStep(point, buttons, randomPause(GLIDE_PAUSE)))
+  const interval = Math.max(
+    STEP_INTERVAL_MIN_MS,
+    Math.min(STEP_INTERVAL_MAX_MS, Math.round(MOVE_DURATION_MS / Math.max(1, curve.length))),
+  )
+  return curve.map((point) => movedStep(point, buttons, interval))
 }
 
 /**
@@ -283,7 +295,7 @@ export function buildDragSteps(from: Point, to: Point, opts: { steps?: number } 
   const move = moveSteps(from, to, { points: opts.steps ?? 7, buttons: 1 })
   move[0] = movedStep(from, 1, pressPause)
   const steps: MouseStep[] = [
-    movedStep(from, 0, randomPause(GLIDE_PAUSE)),
+    movedStep(from, 0, Math.round(MOVE_DURATION_MS / 8)),
     { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1, pauseAfterMs: pressPause },
     ...move,
     { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1, pauseAfterMs: randomPause(RHYTHM_PAUSE) },
@@ -351,7 +363,7 @@ export function buildWheelSteps(totalDelta: number, opts: { points?: number; whe
       deltaX: 0,
       deltaY: delta,
       buttons: 0,
-      pauseAfterMs: randomPause(GLIDE_PAUSE),
+      pauseAfterMs: randomPause(RHYTHM_PAUSE),
     })
   }
   rememberMouse(anchor)
