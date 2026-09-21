@@ -71,6 +71,27 @@ export class ElementIds {
   }
 
   /**
+   * Register a batch of elements WITHOUT dropping any other element.
+   *
+   * `assign()` is the reconciling entry point and evicts everything absent from
+   * its argument. A caller that only holds the DOM heuristic inventory (e.g.
+   * `browser_find_dom`) must not use it: the snapshot's registry is
+   * union(DOM, AX), so evicting the AX-only rows would retire indices a previous
+   * snapshot had just handed to the model.
+   * @param elements - elements to admit, in document order.
+   * @returns the number of newly registered elements.
+   */
+  registerAll(elements: Element[]): number {
+    let added = 0
+    for (const el of elements) {
+      if (this.idByElement.has(el)) continue
+      this.register(el)
+      added += 1
+    }
+    return added
+  }
+
+  /**
    * Resolve an element's stable id.
    * @param el - element.
    * @returns the assigned id, or undefined when not inventoried.

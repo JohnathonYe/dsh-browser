@@ -173,4 +173,29 @@ describe('buildSnapshot', () => {
     expect(text).toContain('@(10,20 200x40)')
     rect.mockRestore()
   })
+
+  it('renders the interactive inventory ahead of main content so a tight budget cannot cut the locators', () => {
+    document.body.innerHTML = `<article><p>${'正'.repeat(3_000)}</p></article><a href="/checkout">结算</a>`
+    const ids = new ElementIds()
+    const view = buildSnapshot(ids, { budget: BUDGET }, null)
+    const text = renderSnapshot(view, false)
+    expect(text).toContain('Interactive elements:')
+    expect(text.indexOf('Interactive elements:')).toBeLessThan(text.indexOf('Main content:'))
+    // Even when the prose is cut, the clickable line it must not outrank survives.
+    expect(text).toContain('结算')
+  })
+
+  it('caps a tracking-heavy link headline while keeping the load-bearing query parameter', () => {
+    const offerId = '937525327193'
+    const href = `http://detail.m.1688.com/page/index.html?offerId=${offerId}`
+      + `&${'trace='.concat('x'.repeat(500))}`
+    document.body.innerHTML = `<a href="${href}">跨境礼服</a>`
+    const ids = new ElementIds()
+    const view = buildSnapshot(ids, { budget: BUDGET }, null)
+    const text = renderSnapshot(view, false)
+    expect(text).toContain(offerId)
+    expect(text).toContain('…')
+    const rendered = text.split('\n').find((line) => line.includes(offerId))!
+    expect(rendered.length).toBeLessThan(260)
+  })
 })

@@ -17,12 +17,19 @@ import { accessibleName, clean, collectInteractive, elementText, truncate } from
 import type { ElementIds } from './ids.ts'
 
 /** Upper bound on one find_dom render. */
-export const FIND_DOM_MAX_CHARS = 6_000
+export const FIND_DOM_MAX_CHARS = 20_000
 /** Upper bound on returned matches (the `count` option is clamped to this). */
 const MAX_FIND_COUNT = 20
 /** Per-match field display budgets. */
 const MAX_TEXT_CHARS = 60
-const MAX_HREF_CHARS = 60
+/**
+ * A marketplace href is where the offer's identity lives, and its load-bearing
+ * parameter can start past character 48 (e.g.
+ * `http://detail.m.1688.com/page/index.html?offerId=` is 49 chars). The old
+ * 60-char budget left 11 characters of the id — enough to look like an id and
+ * be wrong. Keep the query string; the render cap absorbs the cost.
+ */
+const MAX_HREF_CHARS = 300
 const MAX_CONTEXT_CHARS = 24
 
 /** find_dom options, mirroring the model-facing `browser_find_dom` parameters. */
@@ -232,6 +239,10 @@ function renderFind(matches: Element[], keyword: string, mode: string, count: nu
     block.push(`Match ${index + 1}:`)
     block.push(`  text: ${truncate(matchedText, MAX_TEXT_CHARS).text || '<empty>'}`)
     block.push(`  index: ${resolveIndex(el, ids)}`)
+    // Same shape the AX locator lines use in browser_snapshot, so a caller can
+    // aim by point when the index is unusable (covered, stale, or ambiguous).
+    const bounds = el.getBoundingClientRect()
+    block.push(`  bounds: @(${Math.round(bounds.x)},${Math.round(bounds.y)} ${Math.round(bounds.width)}x${Math.round(bounds.height)})`)
     block.push(`  xpath: ${xpathOf(el)}`)
     block.push(`  tag: ${el.tagName.toLowerCase()}`)
     if (el instanceof HTMLAnchorElement && el.href !== '') {
@@ -270,8 +281,11 @@ export function findDom(keyword: string, opts: FindDomOptions, ids: ElementIds):
     root = scoped
   }
 
-  // Reconcile the inventory so index resolution matches the snapshot numbering.
-  ids.assign(collectInteractive(document))
+  // Admit the DOM inventory so index resolution matches the snapshot numbering —
+  // WITHOUT the eviction `assign()` performs: the snapshot registry is
+  // union(DOM, AX) and find_dom only ever sees the DOM half, so reconciling here
+  // used to retire every AX-only index a snapshot had just returned.
+  ids.registerAll(collectInteractive(document))
 
   const matches = mode === 'css'
     ? collectCssMatches(root, keywordText)

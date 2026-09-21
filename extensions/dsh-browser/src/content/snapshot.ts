@@ -106,12 +106,22 @@ export interface SnapshotOptions {
   axNodes?: AxNodeInput[]
 }
 
+/**
+ * Cap on a rendered link headline. Tracking-heavy marketplace URLs routinely
+ * run past 300 characters; one such line used to eat the whole item budget.
+ * 160 keeps the load-bearing query parameters (e.g. `?offerId=` starts at
+ * character 49 on the 1688 detail links this workflow depends on) while
+ * halving the worst case.
+ */
+const MAX_ITEM_HREF_CHARS = 160
+
 /** Headline for a link: same-origin relative path, else host + path. */
 function hrefHeadline(href: string): string {
   try {
     const url = new URL(href, document.baseURI)
-    // 模拟人操作：跨域链接也保留完整 URL（含查询串参数），不剥离任何信息，便于用完整地址导航。
-    return url.origin === location.origin ? `${url.pathname}${url.search}` : url.href
+    // 模拟人操作：跨域链接也保留完整 URL（含查询串参数），只做长度封顶，便于用完整地址导航。
+    const full = url.origin === location.origin ? `${url.pathname}${url.search}` : url.href
+    return full.length <= MAX_ITEM_HREF_CHARS ? full : `${full.slice(0, MAX_ITEM_HREF_CHARS)}…`
   } catch {
     return href
   }
@@ -400,16 +410,16 @@ export function renderSnapshot(view: SnapshotView, delta: boolean, maxChars: num
     }
     if (view.changed.includes(-1)) {
       lines.push(`Title: ${view.title || '(untitled)'}`)
-      if (view.main.length > 0) {
-        lines.push('')
-        lines.push('Changed main content:')
-        lines.push(view.main)
-      }
     }
     if (changedItems.length > 0) {
       lines.push('')
       lines.push('Changed interactive elements:')
       for (const item of changedItems) lines.push(renderItem(item))
+    }
+    if (view.changed.includes(-1) && view.main.length > 0) {
+      lines.push('')
+      lines.push('Changed main content:')
+      lines.push(view.main)
     }
     if (changedForms.length > 0) {
       lines.push('')
@@ -433,11 +443,10 @@ export function renderSnapshot(view: SnapshotView, delta: boolean, maxChars: num
     lines.push('Semantic elements (AX):')
     for (const item of view.axItems) lines.push(renderAxItem(item))
   }
-  if (view.main.length > 0) {
-    lines.push('')
-    lines.push('Main content:')
-    lines.push(view.main)
-  }
+  // Locator before prose. The main-content block is itself capped at half the
+  // budget, so rendering it ahead of the inventory let a long article silently
+  // truncate away the very lines the model has to click on — and the omission
+  // notes are appended last, so the truncation was invisible too.
   if (view.items.length > 0) {
     lines.push('')
     lines.push('Interactive elements:')
@@ -450,6 +459,11 @@ export function renderSnapshot(view: SnapshotView, delta: boolean, maxChars: num
     for (const form of view.forms) {
       lines.push(renderForm(form, !renderedItems.has(form.index)))
     }
+  }
+  if (view.main.length > 0) {
+    lines.push('')
+    lines.push('Main content:')
+    lines.push(view.main)
   }
   appendTruncationNotes(lines, view)
   return capRendered(lines.join('\n'), maxChars)
