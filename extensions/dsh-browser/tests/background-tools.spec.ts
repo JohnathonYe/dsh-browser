@@ -243,6 +243,29 @@ describe('dispatchToolCall', () => {
     }, { documentId: 'document-33' })
   })
 
+  // The reported failure: a caller that prints only the text before the payload
+  // marker saw the security notice alone and concluded the locator tools had
+  // died. The result must say what came back, so the tool stays distinguishable
+  // from one that genuinely returned nothing.
+  it('states the returned page-text size in the part of a locator result a caller sees first', async () => {
+    const pageBody = `Found 1 matching element(s) for "a" (css mode)\nMatch 1:\n  text: 找商品`
+    const call: ToolCall = { id: 'tool-find-dom', name: 'browser_find_dom', args: { keyword: 'a', mode: 'css' } }
+    const chromeMock = mockChrome({
+      tab: { id: 36, url: 'https://app.example/' },
+      respond: () => ({ ok: true, result: { text: pageBody } }),
+    })
+
+    const answer = await dispatchToolCall(call, 'auto', { maxItems: 10, maxChars: 2_000 })
+
+    expect(chromeMock.sendMessage).toHaveBeenCalledTimes(1)
+    expect(answer.ok).toBe(true)
+    const text = (answer.result as { text: string }).text
+    const visibleBeforePayloadMark = text.split('<')[0] ?? ''
+    expect(visibleBeforePayloadMark).toContain('browser_find_dom')
+    expect(visibleBeforePayloadMark).toContain(`${pageBody.length} characters`)
+    expect(text).toContain('找商品')
+  })
+
   it('does not extract or forward an action delta when reads require approval', async () => {
     const call: ToolCall = { id: 'tool-private-delta', name: 'browser_click', args: { index: 2 } }
     const chromeMock = mockChrome({

@@ -202,7 +202,7 @@ function wrapActionDelta(status: string, pageContent: string, frame: TabFrame, m
   const boundaryBudget = maxChars - prefix.length - separator.length
   if (boundaryBudget < 500) return prefix.slice(0, maxChars)
   const framedContent = frame.frameId === 0 ? pageContent : `${frameHeader(frame)}\n${pageContent}`
-  return `${prefix}${separator}${wrapUntrustedContent(framedContent, boundaryBudget)}`
+  return `${prefix}${separator}${wrapUntrustedContent(framedContent, boundaryBudget, crypto.randomUUID(), status.split('\n')[0])}`
 }
 
 async function snapshotAllFrames(
@@ -268,7 +268,7 @@ async function snapshotAllFrames(
   }
 
   snapshotDocumentsByTab.set(tabId, capturedDocuments)
-  return { ok: true, result: { text: wrapUntrustedContent(sections.join('\n'), budget.maxChars) } }
+  return { ok: true, result: { text: wrapUntrustedContent(sections.join('\n'), budget.maxChars, crypto.randomUUID(), 'browser_snapshot') } }
 }
 
 function frameHeader(frame: TabFrame): string {
@@ -373,7 +373,7 @@ async function dispatchOnce(
     navigationWait?.cancel()
   }
   if (call.name === 'browser_get_text' || call.name === 'browser_find_dom' || call.name === 'browser_get_dom') {
-    return { ok: true, result: { text: wrapUntrustedContent(text, budget.maxChars) } }
+    return { ok: true, result: { text: wrapUntrustedContent(text, budget.maxChars, crypto.randomUUID(), call.name) } }
   }
   const pageContent = requestPageDelta ? answerPageContent(response) : undefined
   return {
