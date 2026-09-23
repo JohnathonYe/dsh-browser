@@ -15,7 +15,7 @@ Browser operation is text-first: pages become structured text with a numbered in
 The standard `dsh plugin` command alone cannot install this project. The integration contains both a dsh bridge plugin and a browser extension. The one-line installer currently sets up the Chrome build:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lum1104/dsh-browser/refs/heads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JohnathonYe/dsh-browser/refs/heads/main/scripts/install.sh | bash
 ```
 
 When the installer opens `chrome://extensions`, follow its instructions to load or reload **dsh Browser Assistant**. If dsh is already running, restart it after installation. See [Detailed installation and usage](#detailed-installation-and-usage) for prerequisites, startup commands, updates, and developer installation.
@@ -106,7 +106,7 @@ Requirements: Node.js `^22.19` or `>=24`, Corepack/pnpm, and Chrome 116+ or Fire
 For a managed installation, run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lum1104/dsh-browser/refs/heads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JohnathonYe/dsh-browser/refs/heads/main/scripts/install.sh | bash
 ```
 
 The installer downloads `main`, builds and registers the bridge plugin, builds the Chrome extension into `~/.dsh/browser-extension`, and opens `chrome://extensions`. On the first install, load that directory as an unpacked extension; on updates, click **Reload**. Restart dsh if it is already running.
@@ -114,7 +114,7 @@ The installer downloads `main`, builds and registers the bridge plugin, builds t
 To install the current branch from a source checkout instead:
 
 ```sh
-git clone https://github.com/Lum1104/dsh-browser.git
+git clone https://github.com/JohnathonYe/dsh-browser.git
 cd dsh-browser
 ./scripts/install.sh
 ```

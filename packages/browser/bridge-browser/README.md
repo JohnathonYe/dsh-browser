@@ -35,7 +35,7 @@ Workspace grouping is best-effort. If the composition has no workspace domain, d
 The remote installer downloads an installer-managed workspace, builds the plugin, and registers its official bundle in the local dsh `web` profile. It requires neither Git nor a local clone:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Lum1104/dsh-browser/refs/heads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JohnathonYe/dsh-browser/refs/heads/main/scripts/install.sh | bash
 cd ~/.dsh/dsh-browser && pnpm start
 ```
 

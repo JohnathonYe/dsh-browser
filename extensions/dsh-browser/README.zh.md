@@ -53,7 +53,7 @@ pnpm --filter dsh-browser-extension run test
 1. **构建并安装扩展**：
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/Lum1104/dsh-browser/refs/heads/main/scripts/install.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/JohnathonYe/dsh-browser/refs/heads/main/scripts/install.sh | bash
    ```
 
    脚本会把托管 workspace 下载到 `~/.dsh/dsh-browser`，构建桥插件，把它的官方 bundle 注册到本机 dsh 的 `web` profile，再构建扩展并把产物复制到稳定目录 `~/.dsh/browser-extension`，然后打开 `chrome://extensions`。开启开发者模式，选择「加载已解压的扩展程序」，加载扩展目录。再次运行该命令会更新托管安装。
@@ -61,7 +61,7 @@ pnpm --filter dsh-browser-extension run test
    clone 得到的 checkout 也使用同一个安装器，而且不会下载或覆盖源码：
 
    ```sh
-   git clone https://github.com/Lum1104/dsh-browser.git
+   git clone https://github.com/JohnathonYe/dsh-browser.git
    cd dsh-browser
    ./scripts/install.sh
    ```
