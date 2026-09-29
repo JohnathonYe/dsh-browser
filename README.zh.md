@@ -165,6 +165,7 @@ Chrome 本机使用无需配置；Firefox 需要填写上述本地桥 token。�
 pnpm run build
 pnpm run typecheck
 pnpm run test
+pnpm run check:compat
 
 pnpm --filter @yuxianglin/dsh-bridge-browser run build
 pnpm --filter @yuxianglin/dsh-bridge-browser run typecheck
@@ -179,6 +180,7 @@ pnpm --filter dsh-browser-extension run test
 
 - 启动前桥接插件必须已有 `lib/` 供 Loader 加载；`scripts/install.sh` 和根目录 `pnpm run build` 都会先构建插件再构建扩展。
 - `@deepseek-ai/dsh` 与桥接插件的依赖固定在同一条经过验证的公开发布线上；升级时必须同时更新 manifest、锁文件并重跑根目录检查。
+- `pnpm run check:compat` 调用 DSH 自带的兼容性评估器（`@deepseek-ai/dsh-app-boot`）检查本仓库桥接插件的 peer 范围：会让 DSH 拒绝加载的范围，在这里就失败，而不是等到用户机器上才发现。`--runtime <版本>` 可以提前验证尚未安装的运行时，`--plugin <目录>` 可以检查别的包。
 
 ## 安全
 

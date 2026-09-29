@@ -164,6 +164,7 @@ The bridge plugin and Chrome/Firefox extension are both members of this reposito
 pnpm run build
 pnpm run typecheck
 pnpm run test
+pnpm run check:compat
 
 pnpm --filter @yuxianglin/dsh-bridge-browser run build
 pnpm --filter @yuxianglin/dsh-bridge-browser run typecheck
@@ -178,6 +179,7 @@ Notes:
 
 - The bridge plugin must have a built `lib/` before startup because the loader consumes it; both `scripts/install.sh` and the root `pnpm run build` build the plugin before the extension.
 - The dependencies of `@deepseek-ai/dsh` and the bridge plugin are pinned to the same tested public release line. An upgrade must update the manifests and lockfile together and rerun the root checks.
+- `pnpm run check:compat` runs the compatibility evaluator DSH itself ships (`@deepseek-ai/dsh-app-boot`) against this workspace's bridge plugin. A peer range that would make DSH refuse to load the plugin fails here instead of on a user's machine. Pass `--runtime <version>` to test a runtime you have not installed yet, and `--plugin <dir>` to check another package.
 
 ## Security
 
