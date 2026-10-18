@@ -23,6 +23,14 @@ const INTERACTIVE_SELECTOR = [
   '[role="radio"]',
   '[role="tab"]',
   '[role="menuitem"]',
+  '[role="combobox"]',
+  '[role="listbox"]',
+  '[role="option"]',
+  '[role="switch"]',
+  '[role="searchbox"]',
+  '[role="spinbutton"]',
+  '[role="slider"]',
+  '[role="treeitem"]',
   'summary',
   '[contenteditable="true"]',
   '[contenteditable=""]',
@@ -149,6 +157,14 @@ export function collectInteractive(root: Document | Element): Element[] {
   for (const el of root.querySelectorAll(INTERACTIVE_SELECTOR)) {
     if (seen.has(el)) continue
     seen.add(el)
+    // File inputs are routinely hidden behind a styled button
+    // (`display: none` + `label[for]`/click handler). The model still has to
+    // address them to upload, so keep them in the inventory even though they
+    // have no visible box; upload uses the index without clicking.
+    if (el instanceof HTMLInputElement && el.type === 'file') {
+      result.push(el)
+      continue
+    }
     if (isVisible(el)) result.push(el)
   }
   return result

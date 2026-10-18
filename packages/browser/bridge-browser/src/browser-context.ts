@@ -30,12 +30,15 @@ export function createBrowserSnapshotMessage(snapshot: string): UserMessage {
   ].join('\n\n')
   return createUserMessage({
     content: [{ type: 'text', text }],
+    // `plugin` is the runtime's plugin-provenance source kind. Some DSH type
+    // releases have not widened MessageSourceMap yet; the runtime accepts it,
+    // and the cast keeps this workspace buildable against both surfaces.
     source: {
       kind: 'plugin',
       plugin: BROWSER_CONTEXT_PLUGIN,
       form: 'snapshot',
       sections: [{ name: 'browser-page', text }],
-    },
+    } as unknown as UserMessage['source'],
   })
 }
 
@@ -51,7 +54,7 @@ export function createBrowserImageMessage(attachment: ImageAttachmentRef): UserM
       plugin: BROWSER_CONTEXT_PLUGIN,
       form: 'snapshot',
       sections: [{ name: 'browser-screenshot', text: SCREENSHOT_DESCRIPTION }],
-    },
+    } as unknown as UserMessage['source'],
   })
 }
 

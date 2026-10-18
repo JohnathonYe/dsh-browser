@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { replayMouseSteps, type MouseStep } from '../src/background/input.ts'
+import { replayKeySteps, replayMouseSteps, type MouseStep } from '../src/background/input.ts'
+import type { KeyStep } from '../src/content/keyboard.ts'
 import { debuggerSession } from '../src/background/debugger-session.ts'
 
 /** A mock chrome.debugger with call recording and a configurable failure. */
@@ -164,6 +165,37 @@ describe('replayMouseSteps', () => {
     await expect(replayMouseSteps(3, [
       { type: 'mouseMoved', x: 0, y: 0, buttons: 0, pauseAfterMs: 0 },
     ])).rejects.toThrow()
+    expect(debuggerMock!.detach).not.toHaveBeenCalled()
+  })
+})
+
+describe('replayKeySteps', () => {
+  it('replays keyDown/keyUp as Input.dispatchKeyEvent and insertText separately', async () => {
+    const steps: KeyStep[] = [
+      { type: 'keyDown', key: 'a', code: 'KeyA', text: 'a', unmodifiedText: 'a', modifiers: 0, windowsVirtualKeyCode: 65 },
+      { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 0, windowsVirtualKeyCode: 65 },
+      { type: 'insertText', text: '你好' },
+    ]
+    await replayKeySteps(31, steps)
+
+    expect(debuggerMock!.attach).toHaveBeenCalledTimes(1)
+    expect(debuggerMock!.detach).toHaveBeenCalledTimes(1)
+    expect(debuggerMock!.sendCommand).toHaveBeenCalledTimes(3)
+
+    const [firstTarget, firstMethod, firstParams] = debuggerMock!.sendCommand.mock.calls[0]!
+    expect(firstTarget).toEqual({ tabId: 31 })
+    expect(firstMethod).toBe('Input.dispatchKeyEvent')
+    expect(firstParams).toMatchObject({ type: 'keyDown', key: 'a', code: 'KeyA', text: 'a', modifiers: 0 })
+
+    const [thirdTarget, thirdMethod, thirdParams] = debuggerMock!.sendCommand.mock.calls[2]!
+    expect(thirdTarget).toEqual({ tabId: 31 })
+    expect(thirdMethod).toBe('Input.insertText')
+    expect(thirdParams).toEqual({ text: '你好' })
+  })
+
+  it('propagates an attach failure so the caller can use synthetic input', async () => {
+    debuggerMock!.setFailAttach(true)
+    await expect(replayKeySteps(32, [{ type: 'keyDown', key: 'Enter', code: 'Enter' }])).rejects.toThrow()
     expect(debuggerMock!.detach).not.toHaveBeenCalled()
   })
 })

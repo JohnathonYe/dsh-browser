@@ -70,6 +70,7 @@ const VALID = {
   snapshotMaxChars: 32_000,
   maxInteractiveItems: 60,
   sessionWorkspacePath: '',
+  discoveryPort: 0,
 }
 
 describe('agent-creation boundary', () => {

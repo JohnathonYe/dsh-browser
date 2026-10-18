@@ -62,6 +62,32 @@ describe('approvalPromptForCall', () => {
     expect(prompt?.summary.length).toBeLessThan(70)
   })
 
+  it('prompts for select, upload, and dialog actions without persisting trust for high-impact ones', () => {
+    const select = approvalPromptForCall(call('browser_select_option', { index: 9, value: 'bj' }), 'auto', FRAMES, 'en')
+    expect(select).toMatchObject({ kind: 'action', canTrust: true })
+    expect(select?.summary).toBe('Choose an option in element [9]')
+
+    const upload = approvalPromptForCall(call('browser_upload_file', { index: 11, paths: ['/secret/a.png', '/secret/b.png'] }), 'auto', FRAMES, 'en')
+    expect(upload).toMatchObject({ kind: 'action', canTrust: false })
+    expect(upload?.summary).toBe('Upload 2 local file(s) into element [11]')
+    expect(upload?.summary).not.toContain('/secret')
+
+    const dialog = approvalPromptForCall(call('browser_dialog', { accept: true }), 'auto', FRAMES, 'en')
+    expect(dialog).toMatchObject({ kind: 'action', canTrust: false })
+    expect(dialog?.summary).toBe('Accept the open JavaScript dialog')
+    expect(approvalPromptForCall(call('browser_dialog', { accept: false }), 'auto', FRAMES, 'en')?.summary)
+      .toBe('Dismiss the open JavaScript dialog')
+  })
+
+  it('treats browser_observe as a page read and browser_wait_for as read-only', () => {
+    expect(approvalPromptForCall(call('browser_observe'), 'ask', FRAMES, 'en')).toMatchObject({
+      kind: 'read',
+      summary: 'Read console errors and failed requests from the current page',
+    })
+    expect(approvalPromptForCall(call('browser_observe'), 'auto', FRAMES, 'en')).toBeUndefined()
+    expect(approvalPromptForCall(call('browser_wait_for', { selector: '.done' }), 'auto', FRAMES, 'en')).toBeUndefined()
+  })
+
   it('keeps read-only viewport tools outside the approval path', () => {
     expect(approvalPromptForCall(call('browser_scroll', { direction: 'down' }), 'auto', FRAMES, 'zh')).toBeUndefined()
     expect(approvalPromptForCall(call('browser_wait'), 'auto', FRAMES, 'zh')).toBeUndefined()

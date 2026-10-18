@@ -27,3 +27,6 @@
         toolTimeoutMs: 90000
         snapshotMaxChars: 32000
         maxInteractiveItems: 60
+        # Stable loopback discovery (default 19387); 0 disables the extra
+        # listener, another port moves it.
+        # discoveryPort: 19387

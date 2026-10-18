@@ -222,21 +222,22 @@ function startPoint(target: Point): Point {
 }
 
 /** One `mouseMoved` step. */
-function movedStep(point: Point, buttons: number, pauseAfterMs: number): MouseStep {
-  return { type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons, pauseAfterMs }
+function movedStep(point: Point, buttons: number, pauseAfterMs: number, modifiers: number = 0): MouseStep {
+  return { type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons, modifiers, pauseAfterMs }
 }
 
 /** Glide along the curve as a sequence of `mouseMoved` steps. Every step uses
  *  the SAME interval, so the points form one continuous arc instead of a
  *  stop-and-go march; the eased curve still gives the fast-then-slow feel. */
-function moveSteps(from: Point, to: Point, opts: { points?: number; buttons?: number } = {}): MouseStep[] {
+function moveSteps(from: Point, to: Point, opts: { points?: number; buttons?: number; modifiers?: number } = {}): MouseStep[] {
   const curve = curvePoints(from, to, opts.points ?? 9)
   const buttons = opts.buttons ?? 0
+  const modifiers = opts.modifiers ?? 0
   const interval = Math.max(
     STEP_INTERVAL_MIN_MS,
     Math.min(STEP_INTERVAL_MAX_MS, Math.round(MOVE_DURATION_MS / Math.max(1, curve.length))),
   )
-  return curve.map((point) => movedStep(point, buttons, interval))
+  return curve.map((point) => movedStep(point, buttons, interval, modifiers))
 }
 
 /**
@@ -252,20 +253,64 @@ export function buildMoveToSteps(el: Element, opts: { points?: number } = {}): M
   return steps
 }
 
-/** Build a plan that clicks a random point on the element: glide, press, release. */
-export function buildClickSteps(el: Element): MouseStep[] {
-  return buildClickStepsAt(elementRandomPoint(el))
+/** How to click: which button, how many clicks, and which modifiers are held. */
+export interface ClickOptions {
+  button?: 'left' | 'right' | 'middle'
+  /** 1 = single click, 2 = double click. */
+  clickCount?: number
+  /** CDP modifier bitfield: Alt=1, Control=2, Meta=4, Shift=8. */
+  modifiers?: number
 }
 
-/** Build a plan that glides to a given point, presses, and releases (one click). */
-function buildClickStepsAt(to: Point): MouseStep[] {
+/** Bit for the pressed button, as CDP's `buttons` field expects. */
+function buttonBits(button: 'left' | 'right' | 'middle'): number {
+  return button === 'left' ? 1 : button === 'right' ? 2 : 4
+}
+
+/** Build a plan that clicks a random point on the element: glide, press, release. */
+export function buildClickSteps(el: Element, opts: ClickOptions = {}): MouseStep[] {
+  return buildClickStepsAt(elementRandomPoint(el), opts)
+}
+
+/**
+ * Build a plan that glides to a given point and clicks. A right/middle click
+ * uses the corresponding CDP button; a double click repeats press/release with
+ * `clickCount` 2 so the browser synthesizes `dblclick`. Modifiers (Ctrl/Meta/
+ * Shift/Alt) are held on every event, which is how "open in new tab" works.
+ */
+function buildClickStepsAt(to: Point, opts: ClickOptions = {}): MouseStep[] {
   const from = startPoint(to)
+  const button = opts.button ?? 'left'
+  const modifiers = opts.modifiers ?? 0
+  const count = Math.max(1, Math.min(opts.clickCount ?? 1, 3))
+  const bits = buttonBits(button)
   const steps: MouseStep[] = [
-    ...moveSteps(from, to, { points: 9 }),
-    movedStep(to, 0, randomPause(RHYTHM_PAUSE)),
-    { type: 'mousePressed', x: to.x, y: to.y, button: 'left', buttons: 1, clickCount: 1, pauseAfterMs: randomPause(RHYTHM_PAUSE) },
-    { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1, pauseAfterMs: randomPause(RHYTHM_PAUSE) },
+    ...moveSteps(from, to, { points: 9, modifiers }),
+    movedStep(to, 0, randomPause(RHYTHM_PAUSE), modifiers),
   ]
+  for (let click = 1; click <= count; click += 1) {
+    steps.push({
+      type: 'mousePressed',
+      x: to.x,
+      y: to.y,
+      button,
+      buttons: bits,
+      clickCount: click,
+      modifiers,
+      pauseAfterMs: randomPause(RHYTHM_PAUSE),
+    })
+    steps.push({
+      type: 'mouseReleased',
+      x: to.x,
+      y: to.y,
+      button,
+      buttons: 0,
+      clickCount: click,
+      modifiers,
+      pauseAfterMs: randomPause(RHYTHM_PAUSE),
+    })
+    if (click < count) steps.push(movedStep(to, 0, 24, modifiers))
+  }
   rememberMouse(to)
   return steps
 }
@@ -461,9 +506,10 @@ export async function movePointerTo(el: Element, opts: { points?: number } = {})
  * @returns the viewport point that was actually clicked, so the caller can
  *   confirm the coordinate→element readback. `opts.at` pins the tap to an
  *   explicit point (used by the DOM/coordinate→element confirmation flow). */
-export async function clickElement(el: Element, opts: { at?: Point } = {}): Promise<Point> {
-  const to = opts.at ?? elementRandomPoint(el)
-  await dispatchMouseSteps(buildClickStepsAt(to), el)
+export async function clickElement(el: Element, opts: { at?: Point } & ClickOptions = {}): Promise<Point> {
+  const { at, ...clickOptions } = opts
+  const to = at ?? elementRandomPoint(el)
+  await dispatchMouseSteps(buildClickStepsAt(to, clickOptions), el)
   return to
 }
 

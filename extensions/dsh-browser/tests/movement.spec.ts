@@ -204,3 +204,30 @@ describe('buildMoveToSteps', () => {
   })
 })
 
+
+describe('buildClickSteps options', () => {
+  const rect = { top: 100, left: 100, right: 200, bottom: 160, width: 100, height: 60, x: 100, y: 100, toJSON: () => ({}) } as DOMRect
+
+  it('right-clicks with the right button and buttons bitfield', () => {
+    const el = document.createElement('button')
+    el.getBoundingClientRect = () => rect
+    const press = buildClickSteps(el, { button: 'right' }).find((step) => step.type === 'mousePressed')!
+    expect(press).toMatchObject({ button: 'right', buttons: 2, clickCount: 1 })
+    const release = buildClickSteps(el, { button: 'right' }).find((step) => step.type === 'mouseReleased')!
+    expect(release).toMatchObject({ button: 'right', buttons: 0 })
+  })
+
+  it('double-clicks with a second press/release at clickCount 2', () => {
+    const el = document.createElement('button')
+    el.getBoundingClientRect = () => rect
+    const presses = buildClickSteps(el, { clickCount: 2 }).filter((step) => step.type === 'mousePressed')
+    expect(presses.map((step) => step.clickCount)).toEqual([1, 2])
+  })
+
+  it('holds modifiers on movement and press/release events', () => {
+    const el = document.createElement('button')
+    el.getBoundingClientRect = () => rect
+    const steps = buildClickSteps(el, { modifiers: 4 | 8 })
+    expect(steps.every((step) => step.modifiers === 12)).toBe(true)
+  })
+})

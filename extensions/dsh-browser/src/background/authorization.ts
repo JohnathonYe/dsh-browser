@@ -10,12 +10,15 @@ import { getUiLocale, type UiLocale } from '../i18n.ts'
 // raise a "allow read" dialog in ask mode) and from STATE_CHANGING_ACTIONS, so
 // approvalPromptForCall returns undefined. Its page-sharing block, when content
 // sharing is OFF, lives in dispatchToolCall (background/tools.ts).
-const PAGE_READS = new Set(['browser_snapshot', 'browser_get_text'])
+const PAGE_READS = new Set(['browser_snapshot', 'browser_get_text', 'browser_observe'])
 const STATE_CHANGING_ACTIONS = new Set([
   'browser_click',
   'browser_drag',
   'browser_type',
   'browser_press',
+  'browser_select_option',
+  'browser_upload_file',
+  'browser_dialog',
   'browser_navigate',
   'browser_back',
   'browser_forward',
@@ -39,7 +42,9 @@ export function approvalPromptForCall(
       action: call.name,
       summary: call.name === 'browser_snapshot'
         ? localized(locale, 'Read the current page and accessible iframes', '读取当前页面及可访问 iframe')
-        : localized(locale, 'Read text from the specified area of the current page', '读取当前页面的指定文本区域'),
+        : call.name === 'browser_observe'
+          ? localized(locale, 'Read console errors and failed requests from the current page', '读取当前页面的控制台错误与失败请求')
+          : localized(locale, 'Read text from the specified area of the current page', '读取当前页面的指定文本区域'),
       origins: uniqueOrigins(targetFrames, frames),
       canTrust: false,
     }
@@ -49,7 +54,13 @@ export function approvalPromptForCall(
   const frameId = requestedFrame(call.args)
   const target = frames.find((frame) => frame.frameId === frameId) ?? frames.find((frame) => frame.frameId === 0)
   const origins = uniqueOrigins(target === undefined ? [] : [target], frames)
-  let canTrust = origins.length === 1 && call.name !== 'browser_back' && call.name !== 'browser_forward'
+  let canTrust = origins.length === 1
+    && call.name !== 'browser_back'
+    && call.name !== 'browser_forward'
+    // Uploading local files and answering a native dialog are high-impact
+    // boundary crossings: never persist trust for them.
+    && call.name !== 'browser_upload_file'
+    && call.name !== 'browser_dialog'
   if (call.name === 'browser_navigate') {
     const destination = originFromUrl(typeof call.args.url === 'string' ? call.args.url : '')
     if (destination !== undefined && !origins.includes(destination)) origins.push(destination)
@@ -120,6 +131,16 @@ function summarizeAction(call: ToolCall, locale: UiLocale): string {
       locale,
       `Press “${safeInline(typeof call.args.key === 'string' ? call.args.key : '')}”${frame}`,
       `发送按键「${safeInline(typeof call.args.key === 'string' ? call.args.key : '')}」${frame}`,
+    )
+    case 'browser_select_option': return localized(locale, `Choose an option in element [${index}]${frame}`, `在元素 [${index}] 中选择选项${frame}`)
+    case 'browser_upload_file': {
+      const count = Array.isArray(call.args.paths) ? call.args.paths.length : 0
+      return localized(locale, `Upload ${count} local file(s) into element [${index}]${frame}`, `向元素 [${index}] 上传 ${count} 个本地文件${frame}`)
+    }
+    case 'browser_dialog': return localized(
+      locale,
+      `${call.args.accept === false ? 'Dismiss' : 'Accept'} the open JavaScript dialog${frame}`,
+      `${call.args.accept === false ? '取消' : '确认'}当前打开的 JavaScript 弹窗${frame}`,
     )
     case 'browser_navigate': return localized(
       locale,

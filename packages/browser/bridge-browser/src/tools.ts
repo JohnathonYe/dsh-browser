@@ -156,6 +156,28 @@ async function commitScreenshotImage(ctx: Context, exec: ToolRunContext, raw: Sc
   }
 }
 
+/** Tools that may appear as a step inside browser_batch. */
+const BATCHABLE_ACTIONS = new Set([
+  'browser_snapshot',
+  'browser_click',
+  'browser_hover',
+  'browser_drag',
+  'browser_type',
+  'browser_press',
+  'browser_select_option',
+  'browser_upload_file',
+  'browser_dialog',
+  'browser_scroll',
+  'browser_navigate',
+  'browser_back',
+  'browser_forward',
+  'browser_reload',
+  'browser_get_text',
+  'browser_wait',
+  'browser_wait_for',
+  'browser_tab_switch',
+])
+
 /** Output contract shared by every browser tool. */
 const TEXT_OUTPUT = {
   schema: {
@@ -172,6 +194,13 @@ const TEXT_OUTPUT = {
 const FRAME_PARAMETER = {
   type: 'number' as const,
   description: 'Iframe number from browser_snapshot; omit for the top page.',
+}
+
+/** Modifier keys held for a click or key press. */
+const MODIFIERS_PARAMETER = {
+  type: 'array' as const,
+  description: 'Modifier keys to hold, e.g. ["Meta"] for Cmd/Ctrl-click or ["Shift"].',
+  items: { type: 'string' as const, enum: ['Alt', 'Control', 'Meta', 'Shift'] },
 }
 
 /** Optional target tab id from browser_tab_list; when omitted the current authorized tab is used. */
@@ -203,6 +232,9 @@ export const BROWSER_TOOL_NAMES = [
   'browser_drag',
   'browser_type',
   'browser_press',
+  'browser_select_option',
+  'browser_upload_file',
+  'browser_dialog',
   'browser_scroll',
   'browser_navigate',
   'browser_back',
@@ -212,7 +244,11 @@ export const BROWSER_TOOL_NAMES = [
   'browser_find_dom',
   'browser_get_dom',
   'browser_wait',
+  'browser_wait_for',
+  'browser_observe',
+  'browser_batch',
   'browser_tab_list',
+  'browser_tab_switch',
   'browser_new_tab',
   'browser_close_tab',
   'browser_screenshot',
@@ -328,7 +364,82 @@ export function registerBrowserTools(
     },
   })
 
-  for (const tool of [...defineTools(call, options), screenshot(), ...defineInstanceTools(bridge, options)]) {
+  // A short sequence of actions in one host call: the common "click, type,
+  // press Enter" flow otherwise costs three model round trips and three page
+  // settle windows. Steps run sequentially in the same target tab; the first
+  // failure stops the batch and reports which step failed.
+  const batch = (): ToolDefinition => defineTool({
+    name: 'browser_batch',
+    description: 'Run up to 10 browser actions sequentially in one call; stops at the first failure. Steps are {action, args} where action is a browser_* tool name (or its suffix, e.g. "click").',
+    parameters: {
+      tabId: TAB_ID_PARAMETER,
+      steps: {
+        type: 'array',
+        required: true,
+        description: 'Ordered actions to run, e.g. [{action:"click", args:{index:4}}, {action:"type", args:{index:7, text:"hello"}}, {action:"press", args:{key:"Enter"}}].',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            action: { type: 'string', required: true, description: 'Action name, e.g. click, type, press, wait_for, select_option.' },
+            args: { type: 'object', additionalProperties: true, description: 'Arguments for that action.' },
+          },
+        },
+      },
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: async (args, exec) => {
+      const a = args as { tabId?: number; steps?: unknown }
+      if (!Array.isArray(a.steps) || a.steps.length === 0) {
+        throw new BridgeToolError('bad-args', 'browser_batch requires a non-empty steps array.')
+      }
+      if (a.steps.length > 10) {
+        throw new BridgeToolError('bad-args', 'browser_batch accepts at most 10 steps per call.')
+      }
+      const lines: string[] = []
+      let stoppedAt: number | undefined
+      let stopReason = ''
+      for (let index = 0; index < a.steps.length; index += 1) {
+        const raw = a.steps[index]
+        if (typeof raw !== 'object' || raw === null) {
+          stoppedAt = index + 1
+          stopReason = 'step must be an object with action and args.'
+          break
+        }
+        const step = raw as { action?: unknown; args?: unknown }
+        const requested = typeof step.action === 'string' ? step.action.trim() : ''
+        const name = requested.startsWith('browser_') ? requested : `browser_${requested}`
+        if (!BATCHABLE_ACTIONS.has(name)) {
+          stoppedAt = index + 1
+          stopReason = `"${requested}" is not allowed inside a batch. Allowed: ${[...BATCHABLE_ACTIONS].map((value) => value.replace('browser_', '')).join(', ')}.`
+          break
+        }
+        const stepArgs = {
+          ...a.tabId === undefined ? {} : { tabId: a.tabId },
+          ...typeof step.args === 'object' && step.args !== null ? step.args as Record<string, unknown> : {},
+          // Only the final step carries the automatic page delta; intermediate
+          // deltas would bloat one batch result with repeated page content.
+          ...index < a.steps.length - 1 ? { noDelta: true } : {},
+        }
+        try {
+          const result = await request(exec, name, stepArgs)
+          lines.push(`${index + 1}. ${name.replace('browser_', '')} → ${normalizeTextResult(result, name).text}`)
+        } catch (error: unknown) {
+          stoppedAt = index + 1
+          stopReason = error instanceof Error ? error.message : String(error)
+          break
+        }
+      }
+      const body = lines.length === 0 ? 'No step completed.' : lines.join('\n')
+      if (stoppedAt !== undefined) {
+        throw new BridgeToolError('action-failed', `Batch stopped at step ${stoppedAt}/${a.steps.length}: ${stopReason}\n${body}`)
+      }
+      return { text: `Batch completed ${a.steps.length}/${a.steps.length} steps:\n${body}` }
+    },
+  })
+
+  for (const tool of [...defineTools(call, options), screenshot(), batch(), ...defineInstanceTools(bridge, options)]) {
     disposers.set(tool.name, ctx.tools.register(tool))
   }
   return disposers
@@ -370,11 +481,15 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
 
   const click = (): ToolDefinition => defineTool({
     name: 'browser_click',
-    description: 'Click an element from browser_snapshot (by its index, or by the viewport point from its AX bounds); include frame for an iframe target.',
+    description: 'Click an element from browser_snapshot by index (or by the viewport point from its AX bounds). Supports right/middle/double clicks and held modifiers; text is a fallback locator when the index is stale.',
     parameters: {
       tabId: TAB_ID_PARAMETER,
       index: { type: 'number', description: 'Element index from the browser_snapshot inventory.' },
+      text: { type: 'string', description: 'Fallback: accessible/visible name of the target when the index is stale or unknown.' },
       point: POINT_PARAMETER,
+      button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button; defaults to left.' },
+      clickCount: { type: 'number', description: '1 = single click (default), 2 = double click.' },
+      modifiers: MODIFIERS_PARAMETER,
       frame: FRAME_PARAMETER,
     },
     timeoutMs: options.toolTimeoutMs,
@@ -388,16 +503,18 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     parameters: {
       tabId: TAB_ID_PARAMETER,
       index: { type: 'number', description: 'Element index from the browser_snapshot inventory.' },
+      text: { type: 'string', description: 'Fallback: accessible/visible name of the target when the index is stale or unknown.' },
       point: POINT_PARAMETER,
       frame: FRAME_PARAMETER,
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { index?: number; point?: Record<string, unknown>; frame?: number; tabId?: number }
+      const a = args as { index?: number; text?: string; point?: Record<string, unknown>; frame?: number; tabId?: number }
       return call(exec, 'browser_hover', {
         ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         ...a.index !== undefined ? { index: a.index } : {},
+        ...a.text !== undefined ? { text: a.text } : {},
         ...a.point !== undefined ? { point: a.point } : {},
         ...a.frame !== undefined ? { frame: a.frame } : {},
       })
@@ -432,34 +549,37 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
 
   const type = (): ToolDefinition => defineTool({
     name: 'browser_type',
-    description: 'Append text to a field (index); replace=true clears it. Sensitive values are never returned.',
+    description: 'Type into a field with real keyboard events (index); replace=true clears it first; submit=true submits its form. Sensitive values are never returned.',
     parameters: {
       tabId: TAB_ID_PARAMETER,
       index: { type: 'number', required: true, description: 'Form-field index from the browser_snapshot forms inventory.' },
       frame: FRAME_PARAMETER,
-      text: { type: 'string', required: true, description: 'Text to enter.' },
-      replace: { type: 'boolean', description: 'When true, clear the existing value before entering text. Defaults to append.' },
+      text: { type: 'string', required: true, description: 'Text to enter. Newlines press Enter; non-US text uses insertText.' },
+      replace: { type: 'boolean', description: 'When true, select all and delete before typing. Defaults to append at the caret.' },
+      submit: { type: 'boolean', description: 'When true, submit the owning form after typing.' },
     },
     timeoutMs: options.toolTimeoutMs,
     output: TEXT_OUTPUT,
     execute: (args, exec) => {
-      const a = args as { index: number; frame?: number; text: string; replace?: boolean; tabId?: number }
+      const a = args as { index: number; frame?: number; text: string; replace?: boolean; submit?: boolean; tabId?: number }
       return call(exec, 'browser_type', {
         ...a.tabId !== undefined ? { tabId: a.tabId } : {},
         index: a.index,
         ...a.frame !== undefined ? { frame: a.frame } : {},
         text: a.text,
         ...a.replace !== undefined ? { replace: a.replace } : {},
+        ...a.submit !== undefined ? { submit: a.submit } : {},
       })
     },
   })
 
   const press = (): ToolDefinition => defineTool({
     name: 'browser_press',
-    description: 'Send one key press, such as Enter, Tab, Escape, an arrow, Backspace, or Delete.',
+    description: 'Press one key or combination with real keyboard events, e.g. Enter, Tab, Escape, ArrowDown, Meta+A, Control+Shift+Enter.',
     parameters: {
       tabId: TAB_ID_PARAMETER,
-      key: { type: 'string', required: true, description: 'Key name using KeyboardEvent.key semantics.' },
+      key: { type: 'string', required: true, description: 'Key or combination, e.g. Enter, Escape, Meta+A, Control+Shift+Enter.' },
+      modifiers: MODIFIERS_PARAMETER,
       frame: FRAME_PARAMETER,
     },
     timeoutMs: options.toolTimeoutMs,
@@ -601,6 +721,80 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     },
   })
 
+  const selectOption = (): ToolDefinition => defineTool({
+    name: 'browser_select_option',
+    description: 'Choose an option in a native <select> by value, label, optionIndex, or values[]; fires the select\'s own input/change.',
+    parameters: {
+      tabId: TAB_ID_PARAMETER,
+      index: { type: 'number', required: true, description: 'Index of the <select> from browser_snapshot.' },
+      value: { type: 'string', description: 'Exact option value.' },
+      label: { type: 'string', description: 'Option label (exact, then unique case-insensitive substring).' },
+      optionIndex: { type: 'number', description: 'Zero-based option position.' },
+      values: { type: 'array', items: { type: 'string' }, description: 'Multiple values for a <select multiple>.' },
+      frame: FRAME_PARAMETER,
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_select_option', args as Record<string, unknown>),
+  })
+
+  const uploadFile = (): ToolDefinition => defineTool({
+    name: 'browser_upload_file',
+    description: 'Attach one or more local files to a file input (index from browser_snapshot; top frame only). Paths must be absolute.',
+    parameters: {
+      tabId: TAB_ID_PARAMETER,
+      index: { type: 'number', required: true, description: 'Index of the <input type="file"> from browser_snapshot.' },
+      paths: { type: 'array', items: { type: 'string' }, required: true, description: 'Absolute paths of the files to attach on this machine.' },
+      frame: FRAME_PARAMETER,
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_upload_file', args as Record<string, unknown>),
+  })
+
+  const dialog = (): ToolDefinition => defineTool({
+    name: 'browser_dialog',
+    description: 'Accept or dismiss the native JavaScript alert/confirm/prompt/beforeunload dialog blocking the tab.',
+    parameters: {
+      tabId: TAB_ID_PARAMETER,
+      accept: { type: 'boolean', required: true, description: 'true accepts (OK), false dismisses (Cancel).' },
+      promptText: { type: 'string', description: 'Text to enter for a prompt() dialog.' },
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_dialog', args as Record<string, unknown>),
+  })
+
+  const waitFor = (): ToolDefinition => defineTool({
+    name: 'browser_wait_for',
+    description: 'Wait until a selector is visible/hidden, page text appears, or the URL contains a string; returns as soon as the condition holds. Use this instead of polling with re-snapshots.',
+    parameters: {
+      tabId: TAB_ID_PARAMETER,
+      selector: { type: 'string', description: 'CSS selector to wait for.' },
+      text: { type: 'string', description: 'Visible text substring to wait for (scoped to selector when both are given).' },
+      urlContains: { type: 'string', description: 'URL substring to wait for.' },
+      state: { type: 'string', enum: ['visible', 'hidden'], description: 'For selector: wait until visible (default) or hidden/removed.' },
+      ignoreCase: { type: 'boolean', description: 'Case-insensitive text match; defaults to true.' },
+      timeoutMs: { type: 'number', description: 'Timeout in ms (100-15000, default 5000).' },
+      frame: FRAME_PARAMETER,
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_wait_for', args as Record<string, unknown>),
+  })
+
+  const observe = (): ToolDefinition => defineTool({
+    name: 'browser_observe',
+    description: 'Read recent console errors/warnings, uncaught page errors, and failed network requests (status >= 400 or network error) from the controlled page.',
+    parameters: {
+      tabId: TAB_ID_PARAMETER,
+      clear: { type: 'boolean', description: 'Clear the buffered entries after reading; defaults to true.' },
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_observe', args as Record<string, unknown>),
+  })
+
   const tabList = (): ToolDefinition => defineTool({
     name: 'browser_tab_list',
     description: 'List tabs authorized to this agent (grouped by DSH- group) with tabId, title, url.',
@@ -609,6 +803,17 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     output: TEXT_OUTPUT,
     execute: (_args, exec) => call(exec, 'browser_tab_list', {}),
   })
+  const switchTab = (): ToolDefinition => defineTool({
+    name: 'browser_tab_switch',
+    description: 'Make one authorized tab the current target for subsequent browser_* calls.',
+    parameters: {
+      tabId: { type: 'number', required: true, description: 'Authorized tabId from browser_tab_list.' },
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_tab_switch', args as Record<string, unknown>),
+  })
+
   const newTab = (): ToolDefinition => defineTool({
     name: 'browser_new_tab',
     description: 'Open a new tab in the authorized group; joins it and becomes operable. Pass name to label this agent/group.',
@@ -636,6 +841,9 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     drag(),
     type(),
     press(),
+    selectOption(),
+    uploadFile(),
+    dialog(),
     scroll(),
     navigate(),
     simple('browser_back', 'Go back to the previous page.'),
@@ -645,7 +853,10 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     findDom(),
     getDom(),
     wait(),
+    waitFor(),
+    observe(),
     tabList(),
+    switchTab(),
     newTab(),
     closeTab(),
   ]

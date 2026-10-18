@@ -35,6 +35,7 @@ import {
   MIN_SNAPSHOT_MAX_CHARS,
 } from './protocol.ts'
 import { resolveToken } from './token.ts'
+import { closeFixedDiscoveryServer, createFixedDiscoveryServer, listenFixedDiscoveryServer } from './discovery.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'bridge-browser'
@@ -54,6 +55,13 @@ const DEFAULT_SESSION_WORKSPACE_PATH = dshHomePath('browser-sessions')
 /** Default: sessions materialize only on the first message (open-and-close leaves no trace). */
 const DEFAULT_DEFER_SESSION_CREATE = true
 
+/**
+ * Stable loopback discovery port. The host web port is random on some desktop
+ * launches, while the extension probes fixed ports; binding 19387 keeps the
+ * bridge discoverable across restarts. Set `discoveryPort: 0` to disable.
+ */
+const DEFAULT_DISCOVERY_PORT = 19387
+
 /** Plugin config: deployment-varying tunables only; the wire contract stays fixed. */
 export interface Config {
   /** Fixed bearer token. When absent, a token is generated on first boot and persisted under the dsh home (0600). */
@@ -68,6 +76,8 @@ export interface Config {
   sessionWorkspacePath?: string
   /** Defer real session creation until the first prompt. Defaults to true. */
   deferSessionCreate?: boolean
+  /** Stable loopback discovery port; 0 disables the extra listener. Defaults to 19387. */
+  discoveryPort?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -77,6 +87,7 @@ export const Config: z<Config> = z.object({
   maxInteractiveItems: z.number().step(1).min(1).default(DEFAULT_MAX_INTERACTIVE_ITEMS),
   sessionWorkspacePath: z.string().default(DEFAULT_SESSION_WORKSPACE_PATH),
   deferSessionCreate: z.boolean().default(DEFAULT_DEFER_SESSION_CREATE),
+  discoveryPort: z.number().step(1).min(0).default(DEFAULT_DISCOVERY_PORT),
 })
 
 /** The shape after schemastery applies its defaults to every field. */
@@ -102,6 +113,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     maxInteractiveItems: config.maxInteractiveItems ?? DEFAULT_MAX_INTERACTIVE_ITEMS,
     sessionWorkspacePath: config.sessionWorkspacePath ?? DEFAULT_SESSION_WORKSPACE_PATH,
     deferSessionCreate: config.deferSessionCreate ?? DEFAULT_DEFER_SESSION_CREATE,
+    discoveryPort: config.discoveryPort ?? DEFAULT_DISCOVERY_PORT,
   }
   assertPositiveInteger('toolTimeoutMs', resolved.toolTimeoutMs)
   assertPositiveInteger('snapshotMaxChars', resolved.snapshotMaxChars)
@@ -109,6 +121,9 @@ export function resolveConfig(config: Config): ResolvedConfig {
     throw new Error(`bridge-browser: snapshotMaxChars must be at least ${MIN_SNAPSHOT_MAX_CHARS}`)
   }
   assertPositiveInteger('maxInteractiveItems', resolved.maxInteractiveItems)
+  if (!Number.isInteger(resolved.discoveryPort) || resolved.discoveryPort < 0) {
+    throw new Error('bridge-browser: discoveryPort must be a non-negative integer')
+  }
   return resolved
 }
 
@@ -209,6 +224,30 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }
   ctx.effect(() => ctx.webServer.register(configRoute), 'bridge-browser: /ext/bridge-config route')
 
+  // Stable discovery listener: the host webserver port is random on some
+  // desktop launches, so an extension probing fixed ports would never find the
+  // bridge after a restart. This loopback-only listener exposes the same config
+  // JSON and forwards upgrades to the same BridgeServer. Disabled with
+  // discoveryPort: 0 (tests that boot many compositions in parallel).
+  if (resolved.discoveryPort > 0) {
+    const fixedDiscovery = createFixedDiscoveryServer({
+      port: resolved.discoveryPort,
+      bridgePath: BRIDGE_PATH,
+      configPath: BRIDGE_CONFIG_PATH,
+      handleUpgrade: (req, socket, head) => { server.handleUpgrade(req, socket, head) },
+    })
+    try {
+      await listenFixedDiscoveryServer(fixedDiscovery, resolved.discoveryPort)
+      ctx.effect(() => () => closeFixedDiscoveryServer(fixedDiscovery), 'bridge-browser: fixed discovery listener')
+      ctx.logger.info(`browser bridge: stable discovery listening on 127.0.0.1:${resolved.discoveryPort}`)
+    } catch (error) {
+      // A port conflict must not prevent the bridge from working on the host
+      // port; manual URLs and other instances can still reach it.
+      ctx.logger.warn(`browser bridge: stable discovery port ${resolved.discoveryPort} is unavailable (${String(error)}); continuing on the host web port`)
+      await closeFixedDiscoveryServer(fixedDiscovery).catch(() => {})
+    }
+  }
+
   ctx.effect(() => {
     const disposers = registerBrowserTools(ctx, server, {
       toolTimeoutMs: resolved.toolTimeoutMs,
@@ -219,152 +258,67 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return () => { for (const dispose of disposers.values()) dispose() }
   }, 'bridge-browser: browser tools')
 
-  // Optional system-prompt contribution: a one-line hint only — the model is
-  // told to fetch snapshots on demand instead of hoarding page text.
+  // Optional system-prompt contribution. Keep this short and non-duplicated:
+  // the tool schemas and action results carry their own recovery guidance, and
+  // every token here is paid on every turn. English only (composition.spec
+  // asserts no Han characters).
   const systemPrompt = ctx.get('systemPrompt')
   if (systemPrompt !== undefined) {
-    // AX-first locating: the snapshot's inventory is the browser's accessibility
-    // semantic tree (role/name + real pixel bounds + stable index), not a DOM
-    // heuristic list and not a screenshot. The model locates by role/name, acts
-    // by index (or bounds centre), and confirms the landing point via the
-    // coordinate→element readback. English only (composition.spec asserts no Han).
-    ctx.effect(() => systemPrompt.section({
-      name: 'tool:bridge-browser:ax-locate',
-      order: 106,
-      text: 'Locate targets by the browser\'s accessibility (AX) semantic tree that browser_snapshot returns, not by reading '
-        + 'pixels off a screenshot and not by guessing a CSS selector. Each listed item carries the AX role '
-        + '(button/link/heading/listitem/checkbox/...), the AX accessible name (the semantic label, which for rich '
-        + 'components such as video cards is the title/description), its real CSS-pixel bounds (x, y, width, height), and a '
-        + 'stable index. Act on an item with browser_click(index), browser_hover(index) or browser_drag(index); when the '
-        + 'index is unreliable or the element is layered under something else, aim at the bounds\' centre with a small jitter. '
-        + 'The click/hover result confirms the pointer\'s landing coordinate and the element at that coordinate (elementFromPoint); '
-        + 'confirm that element is the intended target before assuming the action worked. Bounds come from the browser layout, so '
-        + 'treat them as real geometry, never as a guarantee about what is on top: the coordinate→element confirmation is the check. '
-        + 'browser_screenshot is visual only and is never a locator; never convert screenshot pixels into a click point yourself.',
-    }), 'bridge-browser: ax-locate system prompt section')
-
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser',
-      order: 107,
-      text: 'A browser bridge may be connected. To read or operate the user\'s active browser page, call browser_snapshot '
-        + '(text-only; numbered items are the click/type targets and carry the AX role/name/bounds, unless the current turn '
-        + 'already includes a plugin-provided followed-page browser_snapshot). Reuse that injected snapshot and its indices '
-        + 'directly. Locate every target by its snapshot index (or the AX role/name/bounds that snapshot reports); never guess '
-        + 'absolute coordinates on a screenshot. Never assume page content you have not snapshotted.',
+      order: 106,
+      text: 'A browser bridge may be connected. To read or operate the user\'s page, call browser_snapshot '
+        + '(text-only; numbered items carry AX role/name/bounds). Reuse a snapshot already injected in this turn; '
+        + 'never assume page content you have not snapshotted. If no authorized group exists yet, open a real URL '
+        + 'with browser_navigate(<url>) or browser_new_tab(<url>) first.',
     }), 'bridge-browser: system prompt section')
 
-    // Multi-instance selection is model-driven. When several browser instances
-    // are connected and no target is chosen, every browser_* tool errors with a
-    // message listing the available instances; the model must ask the user which
-    // one to use instead of guessing, then select it before retrying the action.
     ctx.effect(() => systemPrompt.section({
-      name: 'tool:bridge-browser:multi-instance',
-      order: 108,
-      text: 'If any browser_* tool returns an error whose message contains "multiple browser instances are connected" '
-        + 'or "select one before issuing browser actions", more than one browser instance is connected and no target is '
-        + 'selected. Do not choose one on your own and do not retry the browser action. First ask the user which instance '
-        + 'to use. Use your ask/confirm-user tool (DSH\'s ask_user_question, or your available ask/confirm-user tool) to ask. '
-        + 'You may call browser_list_instances first to get a structured list of the same instances with their ids, labels, '
-        + 'tab counts, and the current selection. When asking, present each instance as a readable name such as '
-        + '"label (N tabs)"; do not use the instanceId prefix as an option name. The user is choosing which instance to '
-        + 'control, and the instanceId is the internal handle you must pass to browser_select_instance(instanceId). Once '
-        + 'the user names an instance, call browser_select_instance(instanceId) to select it and only then issue the intended '
-        + 'browser_* action. If the user cancels or does not provide a selection, do not choose an instance on your own; '
-        + 'tell the user a browser instance must be selected before proceeding.',
-    }), 'bridge-browser: multi-instance system prompt section')
+      name: 'tool:bridge-browser:locate',
+      order: 107,
+      text: 'Act by snapshot index, not by screenshot pixels: browser_snapshot lists each target with its AX role, '
+        + 'accessible name, real bounds, and a stable index; browser_click(index), browser_hover(index), '
+        + 'browser_drag(index), browser_type(index) and browser_select_option(index) address it. The action result '
+        + 'reports where the pointer landed and the element at that coordinate; verify it before assuming success, '
+        + 'and if an overlay or parent was hit, scroll or pick another index instead of clicking blindly. '
+        + 'browser_screenshot is a visual aid only and is not a locator. If an index is stale, the tool re-resolves it '
+        + 'by role/name when unambiguous; otherwise use browser_find_dom, browser_wait_for, or browser_snapshot '
+        + 'delta:true to get current indices. Snapshot only when the page changed or you need new targets.',
+    }), 'bridge-browser: locate system prompt section')
 
-    // No authorized group yet: every browser_* URL-less tool errors, while
-    // browser_navigate/browser_new_tab with a real URL auto-create a new tab
-    // and an authorized DSH- group. Guide the model to establish the target
-    // page first instead of calling a URL-less tool (snapshot/click/scroll/...)
-    // and tripping the error. English only (composition.spec asserts no Han).
+    // No authorized group yet: the URL-less tools fail closed, while
+    // browser_navigate/browser_new_tab with a real URL auto-create the group.
     ctx.effect(() => systemPrompt.section({
       name: 'tool:bridge-browser:no-auth-group',
-      order: 109,
-      text: 'If there is no authorized browser group yet (any browser_* tool returns "No authorized group. Open a target page '
-        + 'first with browser_navigate or browser_new_tab (a real URL)..."), do not lead with a URL-less tool such as '
-        + 'browser_snapshot, browser_click, browser_scroll, browser_hover or browser_get_text; they need an already-open '
-        + 'target page and will fail with that error. To work on a page, first open it with browser_navigate(<url>) or '
-        + 'browser_new_tab(<url>) — this opens the target in a new tab and creates an authorized group automatically, after '
-        + 'which the page is operable. Order: establish the target page with browser_navigate/browser_new_tab first, then '
-        + 'read it with browser_snapshot, then act with browser_click/browser_scroll/browser_type.',
+      order: 108,
+      text: 'If a browser_* tool reports no authorized group, do not lead with a URL-less tool such as '
+        + 'browser_snapshot, browser_click or browser_scroll. Open the target with browser_navigate(<url>) or '
+        + 'browser_new_tab(<url>) first; that creates the authorized group.',
     }), 'bridge-browser: no-auth-group system prompt section')
 
-    // Locating is DOM-driven. The numbered snapshot inventory is the locator:
-    // read it with browser_snapshot and act by index. The AI cursor overlay is
-    // still a pure visual (the real pointer position), but the model must NOT
-    // read coordinates off a screenshot to pick a target — it should locate by
-    // snapshot index and use the coordinate→element confirmation the click /
-    // hover tools return to verify the pointer landed where it intended.
-    // English only (composition.spec asserts no Han characters).
+    // Deterministic primitives beat guess-and-re-snapshot loops.
     ctx.effect(() => systemPrompt.section({
-      name: 'tool:bridge-browser:confirm-before-click',
+      name: 'tool:bridge-browser:workflow',
+      order: 109,
+      text: 'Prefer one deterministic tool over polling: browser_wait_for for a selector/text/URL, '
+        + 'browser_select_option for native selects, browser_upload_file for file inputs (absolute paths), '
+        + 'browser_dialog to accept or dismiss a native alert/confirm/prompt, and browser_observe when an action '
+        + 'seems to do nothing (console/page/network errors). Use browser_batch for up to 10 dependent actions in '
+        + 'one call, and browser_type with submit:true to fill and submit a form.',
+    }), 'bridge-browser: workflow system prompt section')
+
+    // Multi-instance selection is model-driven. When several instances are
+    // connected and no target is chosen, every browser_* tool errors with a
+    // message listing them; the model asks the user instead of guessing.
+    ctx.effect(() => systemPrompt.section({
+      name: 'tool:bridge-browser:multi-instance',
       order: 110,
-      text: 'Locate every target by its numbered snapshot index from browser_snapshot, then act with browser_click(index), '
-        + 'browser_hover(index) or browser_drag(index). After a browser_click or browser_hover the result reports the '
-        + 'pointer\'s landing coordinate and the element at that coordinate (e.g. "the element at that coordinate is '
-        + '<button>Submit</button>"); confirm that element is the intended target before assuming the action worked. If it '
-        + 'names a different element (an overlay, a parent, or page background), the target is covered or mis-located: '
-        + 'fix it first (scroll it into view, re-snapshot for a fresh index, or click a different index) rather than '
-        + 'clicking blindly. Do not guess absolute coordinates from a screenshot to pick a target; the screenshot is only '
-        + 'a visual, the snapshot index is the locator.',
-    }), 'bridge-browser: confirm-before-click system prompt section')
-
-    // DOM-first, and coordinate→element confirmation is the certain path: the
-    // model reads the target\'snapshot index and lets the click/hover result
-    // confirm the landing element at that coordinate. There is no screenshot-
-    // pixel coordinate tool; the model never converts screenshot pixels itself.
-    // English only (composition.spec asserts no Han characters).
-    ctx.effect(() => systemPrompt.section({
-      name: 'tool:bridge-browser:click-at',
-      order: 111,
-      text: 'To act precisely on an element, use the snapshot index: browser_click(index), browser_hover(index) and '
-        + 'browser_drag(index) act on the numbered inventory from browser_snapshot. Each click or hover result confirms '
-        + 'the pointer\'s landing coordinate and names the element at that coordinate, so you can verify the point hit the '
-        + 'intended target. browser_screenshot is available when you need a visual of the whole page, but it is not a '
-        + 'locator: do not read a pixel position off it and do not try to convert screenshot coordinates yourself. After '
-        + 'acting, use the returned coordinate→element confirmation, and only re-snapshot when the page or target changed.',
-    }), 'bridge-browser: click-at system prompt section')
-
-    // Index-locate failure is DOM-driven too: when the snapshot index cannot
-    // locate the target it never means "switch to coordinates"; it means the
-    // index is stale, off-screen, or the element is not in the inventory. The
-    // fix is to re-snapshot for current indices, scroll the target into view,
-    // or read the target\'s region — not to guess a screenshot point.
-    // English only (composition.spec asserts no Han characters).
-    ctx.effect(() => systemPrompt.section({
-      name: 'tool:bridge-browser:index-fallback',
-      order: 112,
-      text: 'Use the snapshot index first: browser_click(index), browser_hover(index) and browser_drag(index) act on the '
-        + 'numbered inventory from browser_snapshot. If the snapshot index cannot locate the target (the element is not in '
-        + 'the interactive inventory, the index is stale or distorted, or the page changed), stop guessing an index and '
-        + 'fix the locator instead of probing blindly: call browser_snapshot again (or browser_snapshot with delta:true to '
-        + 'read only the changes) to get current indices, browser_scroll to bring the target into view, or browser_get_text '
-        + 'with a selector to find the element\'s region and re-snapshot. Do not read a coordinate off a screenshot to '
-        + 'act; the snapshot index is the only locator, and the click/hover result\'s coordinate→element confirmation tells '
-        + 'you whether the pointer actually reached the intended element.',
-    }), 'bridge-browser: index-fallback system prompt section')
-
-    // Over-confirmation blooms: a model that re-snapshots or re-screenshots
-    // the same view on every step turns a short locate into a long loop. This
-    // is a soft constraint on TOP of the guidance above (confirm-before-click
-    // / index-fallback still want one confirm before an action) — it says:
-    // confirm once, then act, do not re-confirm the same region repeatedly.
-    // English only (composition.spec asserts no Han).
-    ctx.effect(() => systemPrompt.section({
-      name: 'tool:bridge-browser:reduce-reconfirm',
-      order: 113,
-      text: 'Do not take snapshots or screenshots unless you actually need them. Use browser_snapshot to read page '
-        + 'context or its changes, and browser_screenshot only when the visual state cannot be judged from the snapshot '
-        + '(it is a visual aid, never a locator). Do not re-capture on every step. If you already know the target index '
-        + 'or already saw that region and the page has not changed, do not re-snapshot or re-screenshot the same '
-        + 'region; with delta:true take only the changes instead of a full capture. Re-capture only when navigation, '
-        + 'scroll, or a click changed the view, or when you need a new target; in a single locating flow do not '
-        + 'repeatedly snapshot/screenshot the same region. The coordinate→element confirmation returned by '
-        + 'browser_click / browser_hover is one check right before an action, not part of a repeating snapshot -> '
-        + 'screenshot -> judge -> snapshot -> screenshot loop; if one click result already names the intended element, act '
-        + 'directly.',
-    }), 'bridge-browser: reduce-reconfirm system prompt section')
+      text: 'If any browser_* tool says multiple browser instances are connected or no target is selected, do not '
+        + 'choose an instance on your own. Ask the user with ask_user_question, showing each instance as a readable '
+        + '"label (N tabs)" name (call browser_list_instances for the ids, labels, and tab counts). After the user '
+        + 'names one, call browser_select_instance(instanceId) and retry the action. On cancel or no selection, do '
+        + 'not guess: tell the user a browser instance must be selected first.',
+    }), 'bridge-browser: multi-instance system prompt section')
   }
 
   ctx.logger.info(

@@ -10,15 +10,25 @@
  * @module
  */
 
-import { pageText, truncate } from './extract.ts'
+import { accessibleName, collectInteractive, pageText, truncate } from './extract.ts'
 import { findDom } from './find.ts'
 import type { ElementIds } from './ids.ts'
 import type { SnapshotBudget } from './snapshot.ts'
 import type { AxNodeInput } from '../ax-shared.ts'
-import { buildSnapshot, renderSnapshot } from './snapshot.ts'
+import { buildSnapshot, renderSnapshot, roleOf } from './snapshot.ts'
+import { selectNativeOption, type SelectResult } from './select.ts'
+import { waitForCondition } from './wait-for.ts'
+import { collectAxCandidates } from './ax.ts'
+import {
+  buildKeySteps,
+  buildTypeSteps,
+  selectAllSteps,
+  sendKeyStepsToCdp,
+} from './keyboard.ts'
 import {
   clickElement,
   confirmElementHit,
+  type ClickOptions,
   describeElementAt,
   dragFromTo,
   elementAtPoint,
@@ -156,12 +166,116 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms) })
 }
 
-function elementOrThrow(ids: ElementIds, index: number): Element {
-  const el = ids.elementByIndex(index)
-  if (el === undefined) {
-    throw new ActionError('action-failed', `Element [${index}] does not exist; the page may have changed. Call browser_snapshot again to get current indices.`)
+/** Append a stale-index resolution note to a result built by a helper. */
+function withResolution(result: ActionResult, note: string | undefined): ActionResult {
+  return note === undefined ? result : { ...result, text: `${result.text} ${note}` }
+}
+
+/** A resolved action target, with a note when a stale index was healed. */
+interface TargetResolution {
+  element: Element
+  index: number
+  note?: string
+}
+
+/** The role/name an index had in the last snapshot, used to re-find it. */
+function lastIdentity(index: number): { role: string; name: string } | undefined {
+  if (lastSnapshot === null) return undefined
+  const item = lastSnapshot.items.find((candidate) => candidate.index === index)
+  if (item !== undefined) return { role: item.role, name: item.name }
+  const ax = lastSnapshot.axItems.find((candidate) => candidate.index === index)
+  return ax === undefined ? undefined : { role: ax.role, name: ax.name }
+}
+
+/** Current candidates that still carry the recorded role + accessible name. */
+function sameIdentity(role: string, name: string): Element[] {
+  const candidates = [...collectInteractive(document), ...collectAxCandidates(document)]
+  const seen = new Set<Element>()
+  const matches: Element[] = []
+  for (const element of candidates) {
+    if (seen.has(element)) continue
+    seen.add(element)
+    if (roleOf(element) !== role) continue
+    if (accessibleName(element) !== name) continue
+    matches.push(element)
   }
-  return el
+  return matches
+}
+
+/**
+ * Resolve an action index. If the element detached or the index vanished after
+ * a page update, re-find the same role + accessible name in the current DOM
+ * and return the element's new stable index. When several elements match, fail
+ * with their current indices instead of clicking a guess. `fallbackText`
+ * (optional) locates by visible/accessibility name when the index is entirely
+ * unknown.
+ */
+function resolveTarget(ids: ElementIds, index: number | undefined, fallbackText?: string): TargetResolution {
+  if (index !== undefined) {
+    const element = ids.elementByIndex(index)
+    const identity = lastIdentity(index)
+    // A registered element that was never snapshotted (or has no recorded
+    // identity) is still usable; only a removed element with a known
+    // role/name is treated as a stale index to heal.
+    if (element !== undefined && (element.isConnected || identity === undefined)) {
+      return { element, index }
+    }
+    if (identity !== undefined) {
+      const matches = sameIdentity(identity.role, identity.name)
+      if (matches.length === 1) {
+        const resolved = matches[0]!
+        const next = ids.register(resolved)
+        return {
+          element: resolved,
+          index: next,
+          note: `Index [${index}] was stale after the page changed; re-resolved to [${next}] by ${identity.role} "${identity.name}".`,
+        }
+      }
+      if (matches.length > 1) {
+        const choices = matches.slice(0, 8).map((candidate) => {
+          const id = ids.register(candidate)
+          return `[${id}] ${identity.role} "${identity.name}"`
+        })
+        throw new ActionError(
+          'action-failed',
+          `Index [${index}] was stale and ${matches.length} current elements match ${identity.role} "${identity.name}": ${choices.join(', ')}. Act on one of those indices, or call browser_snapshot for the current layout.`,
+        )
+      }
+    }
+  }
+  if (fallbackText !== undefined && fallbackText.trim() !== '') {
+    const needle = fallbackText.trim().toLowerCase()
+    const candidates = [...collectInteractive(document), ...collectAxCandidates(document)]
+    const seen = new Set<Element>()
+    const exact: Element[] = []
+    const partial: Element[] = []
+    for (const element of candidates) {
+      if (seen.has(element)) continue
+      seen.add(element)
+      const name = accessibleName(element).toLowerCase()
+      if (name === needle) exact.push(element)
+      else if (name.includes(needle)) partial.push(element)
+    }
+    const matches = exact.length > 0 ? exact : partial
+    if (matches.length === 1) {
+      const element = matches[0]!
+      const next = ids.register(element)
+      return { element, index: next, note: `Located [${next}] by text "${fallbackText}".` }
+    }
+    if (matches.length > 1) {
+      const choices = matches.slice(0, 8).map((candidate) => `[${ids.register(candidate)}] ${roleOf(candidate)} "${accessibleName(candidate)}"`)
+      throw new ActionError(
+        'action-failed',
+        `Text "${fallbackText}" matches ${matches.length} elements: ${choices.join(', ')}. Use one of those indices.`,
+      )
+    }
+  }
+  throw new ActionError(
+    'action-failed',
+    index === undefined
+      ? 'No target index or text was provided. Call browser_snapshot and pass an index.'
+      : `Element [${index}] is gone and could not be re-resolved after the page changed. Call browser_snapshot for current indices.`,
+  )
 }
 
 /** Error carrying a stable wire code. */
@@ -264,6 +378,10 @@ export async function runAction(action: string, args: Record<string, unknown>, c
       return typeAction(args, ctx)
     case 'browser_press':
       return pressAction(args, ctx)
+    case 'browser_select_option':
+      return selectOptionAction(args, ctx)
+    case 'browser_wait_for':
+      return waitForAction(args, ctx)
     case 'browser_scroll':
       return scrollAction(args, ctx)
     case 'browser_navigate':
@@ -327,12 +445,17 @@ function withPageDelta(text: string, ctx: ActionContext): ActionResult {
 
 async function clickAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const point = pointArg(args)
-  if (point !== undefined) return clickAtCoordinates(point, ctx)
-  const index = numberArg(args, 'index')
-  const el = elementOrThrow(ctx.ids, index)
+  const clickOptions = clickOptionsArg(args)
+  if (point !== undefined) return clickAtCoordinates(point, clickOptions, ctx)
+  const indexArg = args.index === undefined ? undefined : numberArg(args, 'index')
+  const resolution = resolveTarget(ctx.ids, indexArg, typeof args.text === 'string' ? args.text : undefined)
+  const el = resolution.element
+  const index = resolution.index
+  const resolved = (text: string): string => resolution.note === undefined ? text : `${text} ${resolution.note}`
   // Never operate on an off-screen target: bring it into the viewport first.
   ensureInViewport(el)
-  if (el instanceof HTMLAnchorElement) {
+  const plainLeftClick = clickOptions.button === 'left' && clickOptions.clickCount === 1 && clickOptions.modifiers === 0
+  if (el instanceof HTMLAnchorElement && plainLeftClick) {
     // Humanized pointer: glide the REAL cursor along a curve to a random point
     // on the link so the page sees the arrival + `:hover`. Activation stays on
     // the existing logic below (a cross-document CDP press/release would race
@@ -359,7 +482,7 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
       if (requiresNativeActivation) {
         setTimeout(() => { el.click() }, 0)
         return {
-          text: `Clicked link [${index}] using native browser activation. Call browser_snapshot to read the resulting state.`,
+          text: resolved(`Clicked link [${index}] using native browser activation. Call browser_snapshot to read the resulting state.`),
         }
       }
       // Dispatch the click handlers without its default navigation so a
@@ -371,7 +494,7 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
       }))
       if (!shouldNavigate) {
         await waitForPageSettled(ACTION_SETTLE)
-        return withPageDelta(`Clicked link [${index}].`, ctx)
+        return withPageDelta(resolved(`Clicked link [${index}].`), ctx)
       }
       const sameDocument = href.origin === location.origin
         && href.pathname === location.pathname
@@ -379,18 +502,18 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
       if (sameDocument) {
         if (href.hash !== location.hash) location.hash = href.hash
         await waitForPageSettled(ACTION_SETTLE)
-        return withPageDelta(`Clicked link [${index}].`, ctx)
+        return withPageDelta(resolved(`Clicked link [${index}].`), ctx)
       }
       // A cross-document navigation can unload this content script before an
       // awaited response. Answer first and navigate in the next task.
       setTimeout(() => { location.href = href.href }, 0)
       return {
-        text: `Clicked link [${index}]. Call browser_snapshot again after navigation settles.`,
+        text: resolved(`Clicked link [${index}]. Call browser_snapshot again after navigation settles.`),
         navigationPending: true,
       }
     }
     setTimeout(() => { el.click() }, 0)
-    return { text: `Clicked link [${index}]. The link may open outside the controlled frame.` }
+    return { text: resolved(`Clicked link [${index}]. The link may open outside the controlled frame.`) }
   }
   if (el instanceof HTMLButtonElement && el.disabled) {
     throw new ActionError('action-failed', `Button [${index}] is disabled.`)
@@ -401,7 +524,7 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
     const value = rangeClickValue(el)
     await dragRangeTo(el, value)
     await waitForPageSettled(ACTION_SETTLE)
-    return withPageDelta(`Dragged slider [${index}] to ${value}.`, ctx)
+    return withPageDelta(resolved(`Dragged slider [${index}] to ${value}.`), ctx)
   }
   // Real pointer: glide to a random point on the element, press, release. The
   // renderer synthesizes a genuine click (and `:active`), which synthetic
@@ -411,31 +534,149 @@ async function clickAction(args: Record<string, unknown>, ctx: ActionContext): P
   // under that point so the model can verify the pointer actually reached it.
   const target = elementRandomPoint(el)
   const hitInfo = confirmElementHit(el, target.x, target.y)
-  await clickElement(el, { at: target })
+  await clickElement(el, { at: target, ...clickOptions })
   await waitForPageSettled(ACTION_SETTLE)
   const at = describeElementAt(hitInfo.under)
   const confirmNote = hitInfo.hit ? '' : ' Note: the coordinate did not resolve to the target element itself (it may be covered or mis-located).'
-  return withPageDelta(`Clicked [${index}]. The pointer landed at (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}.${confirmNote}`, ctx)
+  return withPageDelta(resolved(`${clickVerb(clickOptions)} [${index}]. The pointer landed at (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}.${confirmNote}`), ctx)
+}
+
+/** Parse the button/clickCount/modifiers arguments into a CDP click plan. */
+function clickOptionsArg(args: Record<string, unknown>): Required<ClickOptions> {
+  const button = args.button === 'right' || args.button === 'middle' ? args.button : 'left'
+  const clickCount = typeof args.clickCount === 'number' && Number.isInteger(args.clickCount)
+    ? Math.min(Math.max(args.clickCount, 1), 3)
+    : 1
+  let modifiers = 0
+  if (Array.isArray(args.modifiers)) {
+    for (const raw of args.modifiers) {
+      if (typeof raw !== 'string') continue
+      const token = raw.trim().toLowerCase()
+      if (token === 'alt' || token === 'option') modifiers |= 1
+      else if (token === 'control' || token === 'ctrl') modifiers |= 2
+      else if (token === 'meta' || token === 'cmd' || token === 'command') modifiers |= 4
+      else if (token === 'shift') modifiers |= 8
+      else throw new ActionError('bad-args', `Unknown modifier "${raw}". Use Alt, Control, Meta, or Shift.`)
+    }
+  }
+  return { button, clickCount, modifiers }
+}
+
+/** Model-facing verb for the click that actually happened. */
+function clickVerb(options: Required<ClickOptions>): string {
+  const base = options.button === 'right'
+    ? 'Right-clicked'
+    : options.button === 'middle'
+      ? 'Middle-clicked'
+      : options.clickCount >= 2 ? 'Double-clicked' : 'Clicked'
+  const held = [
+    options.modifiers & 4 ? 'Meta' : '',
+    options.modifiers & 2 ? 'Control' : '',
+    options.modifiers & 1 ? 'Alt' : '',
+    options.modifiers & 8 ? 'Shift' : '',
+  ].filter((name) => name !== '')
+  return held.length === 0 ? base : `${base} with ${held.join('+')} held`
+}
+
+/**
+ * Put the caret at the end of an editable element without changing its value.
+ * `browser_type` without `replace` appends, which must not depend on where the
+ * focusing click happened to land.
+ */
+function placeCaretAtEnd(el: Element): void {
+  try {
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      el.setSelectionRange(el.value.length, el.value.length)
+      return
+    }
+    if (el instanceof HTMLElement && el.isContentEditable) {
+      const range = document.createRange()
+      range.selectNodeContents(el)
+      range.collapse(false)
+      const selection = window.getSelection()
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+    }
+  } catch {
+    // Input types without a selection API (number/date in some engines) ignore
+    // this; the real key events still land wherever the field places the caret.
+  }
+}
+
+/** The current editable value of a field or contenteditable host. */
+function editableValue(el: Element): string {
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return el.value
+  return el.textContent ?? ''
 }
 
 async function typeAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
-  const index = numberArg(args, 'index')
+  const indexArg = args.index === undefined ? undefined : numberArg(args, 'index')
   const text = typeof args.text === 'string' ? args.text : ''
   if (text === '') throw new ActionError('bad-args', 'text must not be empty.')
   const replace = args.replace === true
-  const el = elementOrThrow(ctx.ids, index)
+  const submit = args.submit === true
+  const resolution = resolveTarget(ctx.ids, indexArg)
+  const el = resolution.element
+  const index = resolution.index
+  const resolved = (status: string): string => resolution.note === undefined ? status : `${status} ${resolution.note}`
   ensureInViewport(el)
   const contentEditable = el instanceof HTMLElement && el.isContentEditable
   if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || contentEditable)) {
     throw new ActionError('action-failed', `Element [${index}] is not editable (${el.tagName.toLowerCase()}).`)
   }
-  // Focus the field before writing so the page sees a REAL focused caret
-  // rather than only a value mutation. A real CDP click focuses the control,
-  // places the caret and fires focus handlers; the value write below is then
-  // applied on top. Synthetic `.focus()` is kept only as the CDP fallback.
-  const field = el as HTMLInputElement | HTMLTextAreaElement | HTMLElement
+  if (el instanceof HTMLInputElement && (el.readOnly || el.disabled)) {
+    throw new ActionError('action-failed', `Element [${index}] is ${el.disabled ? 'disabled' : 'read-only'} and cannot be edited.`)
+  }
+  if (el instanceof HTMLTextAreaElement && (el.readOnly || el.disabled)) {
+    throw new ActionError('action-failed', `Element [${index}] is ${el.disabled ? 'disabled' : 'read-only'} and cannot be edited.`)
+  }
+  if (el instanceof HTMLInputElement) {
+    const textTypes = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number', 'date', 'datetime-local', 'month', 'week', 'time'])
+    if (!textTypes.has(el.type)) {
+      throw new ActionError(
+        'action-failed',
+        `Element [${index}] is <input type="${el.type}">, which browser_type cannot type into. Use browser_click, browser_select_option, browser_drag, or browser_upload_file instead.`,
+      )
+    }
+  }
+  const owningForm = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.form : null
+  if (submit && owningForm === null) {
+    throw new ActionError('action-failed', `Element [${index}] is not inside a form, so submit=true has nothing to submit.`)
+  }
+  // Focus the field with a real click so the page sees a focused caret and the
+  // keyboard plan below lands on the right control. The click also opens any
+  // widget affordances (date pickers, custom editors) exactly like a person.
   try { await clickElement(el) } catch { /* focus via CDP failed; fall through */ }
-  try { (field as HTMLElement).focus() } catch { /* some fields refuse focus; value write still applies */ }
+  try { (el as HTMLElement).focus() } catch { /* some fields refuse focus; keyboard/value write still applies */ }
+  // A real click lands at a random point and may place the caret mid-text.
+  // `replace:false` means "append", so move the caret to the end before typing.
+  if (!replace) placeCaretAtEnd(el)
+
+  const before = editableValue(el)
+  // Replace = select all, delete, then type. This is the same path a person
+  // uses and keeps React/Vue controlled inputs (and contenteditable editors)
+  // in their own event flow instead of mutating `value` behind their back.
+  const steps = [
+    ...replace ? [...selectAllSteps(), ...buildKeySteps('Backspace')] : [],
+    ...buildTypeSteps(text),
+  ]
+  const viaCdp = await sendKeyStepsToCdp(steps)
+  let synthetic = !viaCdp
+  if (viaCdp) {
+    // Give the page's input/validation handlers one frame to commit. If the
+    // field still looks untouched, the control rejected real keystrokes (some
+    // date/number widgets do) and the native value write below recovers.
+    await sleep(16)
+    if (editableValue(el) !== before || text === '') {
+      await waitForPageSettled(TYPE_SETTLE)
+      if (submit) return withResolution(submitTyped(el, text, index, replace), resolution.note)
+      return withPageDelta(
+        resolved(`Typed ${text.length} characters into [${index}] with real keyboard events${replace ? ' (replaced existing text)' : ''}.`),
+        ctx,
+      )
+    }
+    synthetic = true
+  }
   if (contentEditable) {
     if (replace) el.textContent = ''
     el.textContent = `${el.textContent ?? ''}${text}`
@@ -445,20 +686,141 @@ async function typeAction(args: Record<string, unknown>, ctx: ActionContext): Pr
     setNativeValue(el, `${el.value}${text}`)
   }
   await waitForPageSettled(TYPE_SETTLE)
-  return withPageDelta(`Entered ${text.length} characters into [${index}].`, ctx)
+  if (submit) return withResolution(submitTyped(el, text, index, replace), resolution.note)
+  return withPageDelta(
+    resolved(`Entered ${text.length} characters into [${index}]${synthetic ? ' using the synthetic value fallback (real keyboard input was unavailable)' : ''}.`),
+    ctx,
+  )
+}
+
+/**
+ * Submit the form owning a just-typed field. Answer first and submit in the
+ * next task: a cross-document submit would unload this content script and
+ * destroy the response port before the tool result is delivered.
+ */
+function submitTyped(el: Element, text: string, index: number, replace: boolean): ActionResult {
+  const form = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.form : null
+  if (form === null) {
+    throw new ActionError('action-failed', `Element [${index}] is not inside a form, so there is nothing to submit.`)
+  }
+  setTimeout(() => { form.requestSubmit() }, 0)
+  return {
+    text: `Typed ${text.length} characters into [${index}]${replace ? ' (replacing existing text)' : ''} and submitted its form. Call browser_snapshot again after the page loads.`,
+    navigationPending: true,
+  }
+}
+
+/** Modifier flags for the synthetic fallback, derived from a CDP key plan. */
+function modifierFlags(steps: ReturnType<typeof buildKeySteps>): { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean } {
+  const main = [...steps].reverse().find((step) => step.type === 'keyDown' || step.type === 'rawKeyDown')
+  const mask = main?.modifiers ?? 0
+  return {
+    altKey: (mask & 1) !== 0,
+    ctrlKey: (mask & 2) !== 0,
+    metaKey: (mask & 4) !== 0,
+    shiftKey: (mask & 8) !== 0,
+  }
 }
 
 async function pressAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
-  const key = typeof args.key === 'string' && args.key !== '' ? args.key : ''
+  const key = typeof args.key === 'string' && args.key.trim() !== '' ? args.key.trim() : ''
   if (key === '') throw new ActionError('bad-args', 'key must not be empty.')
-  const target = document.activeElement instanceof HTMLElement ? document.activeElement : document.body
-  target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }))
-  target.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, cancelable: true }))
-  if (key === 'Enter' && target instanceof HTMLInputElement && target.form !== null) {
-    target.form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+  const extraModifiers = Array.isArray(args.modifiers)
+    ? (args.modifiers as unknown[]).filter((value): value is string => typeof value === 'string')
+    : []
+  let steps: ReturnType<typeof buildKeySteps>
+  try {
+    steps = buildKeySteps(key, extraModifiers)
+  } catch (error: unknown) {
+    throw new ActionError('bad-args', error instanceof Error ? error.message : String(error))
+  }
+  const viaCdp = await sendKeyStepsToCdp(steps)
+  if (!viaCdp) {
+    // Synthetic fallback: keep the same event sequence shape for pages and
+    // jsdom, even though it cannot reproduce OS-level focus traversal.
+    const flags = modifierFlags(steps)
+    const main = [...steps].reverse().find((step) => step.type === 'keyDown' || step.type === 'rawKeyDown')
+    const eventKey = main?.key ?? key
+    const target = document.activeElement instanceof HTMLElement ? document.activeElement : document.body
+    target.dispatchEvent(new KeyboardEvent('keydown', { key: eventKey, bubbles: true, cancelable: true, ...flags }))
+    target.dispatchEvent(new KeyboardEvent('keyup', { key: eventKey, bubbles: true, cancelable: true, ...flags }))
+    if (eventKey === 'Enter' && target instanceof HTMLInputElement && target.form !== null) {
+      target.form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    }
   }
   await waitForPageSettled(ACTION_SETTLE)
-  return withPageDelta(`Sent key "${key}".`, ctx)
+  return withPageDelta(
+    `Pressed "${key}"${extraModifiers.length > 0 ? ` with ${extraModifiers.join('+')}` : ''}${viaCdp ? ' as a real keyboard event' : ' (synthetic fallback)'}.`,
+    ctx,
+  )
+}
+
+async function waitForAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const selector = typeof args.selector === 'string' && args.selector.trim() !== '' ? args.selector : undefined
+  const text = typeof args.text === 'string' && args.text.trim() !== '' ? args.text : undefined
+  const urlContains = typeof args.urlContains === 'string' && args.urlContains !== '' ? args.urlContains : undefined
+  if (selector === undefined && text === undefined && urlContains === undefined) {
+    throw new ActionError('bad-args', 'browser_wait_for requires selector, text, or urlContains.')
+  }
+  const state = args.state === 'hidden' ? 'hidden' : 'visible'
+  const outcome = await waitForCondition({
+    ...selector === undefined ? {} : { selector },
+    ...text === undefined ? {} : { text },
+    ...urlContains === undefined ? {} : { urlContains },
+    state,
+    ...args.ignoreCase === false ? { ignoreCase: false } : {},
+    ...typeof args.timeoutMs === 'number' ? { timeoutMs: args.timeoutMs } : {},
+  }, ctx.ids)
+  if (!outcome.matched) {
+    throw new ActionError(
+      'action-failed',
+      `Timed out after ${outcome.elapsedMs}ms waiting for ${outcome.description}. Call browser_snapshot to inspect the current page state.`,
+    )
+  }
+  const index = outcome.element === undefined ? undefined : ctx.ids.indexOf(outcome.element)
+  return withPageDelta(
+    `Waited ${outcome.elapsedMs}ms: ${outcome.description}${index === undefined ? '' : ` matched element [${index}]`}.`,
+    ctx,
+  )
+}
+
+async function selectOptionAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  const indexArg = args.index === undefined ? undefined : numberArg(args, 'index')
+  const resolution = resolveTarget(ctx.ids, indexArg)
+  const el = resolution.element
+  const index = resolution.index
+  const resolved = (status: string): string => resolution.note === undefined ? status : `${status} ${resolution.note}`
+  ensureInViewport(el)
+  if (!(el instanceof HTMLSelectElement)) {
+    throw new ActionError(
+      'action-failed',
+      `Element [${index}] is not a native <select>. For a custom dropdown, click it, call browser_snapshot, then click the option index.`,
+    )
+  }
+  const values = Array.isArray(args.values)
+    ? (args.values as unknown[]).filter((value): value is string => typeof value === 'string')
+    : undefined
+  const request = {
+    ...typeof args.value === 'string' ? { value: args.value } : {},
+    ...typeof args.label === 'string' ? { label: args.label } : {},
+    ...typeof args.optionIndex === 'number' && Number.isInteger(args.optionIndex) ? { optionIndex: args.optionIndex } : {},
+    ...values !== undefined && values.length > 0 ? { values } : {},
+  }
+  if (request.value === undefined && request.label === undefined && request.optionIndex === undefined && request.values === undefined) {
+    throw new ActionError('bad-args', 'Provide value, label, optionIndex, or values to choose an option.')
+  }
+  let result: SelectResult
+  try {
+    result = selectNativeOption(el, request)
+  } catch (error: unknown) {
+    throw new ActionError('action-failed', error instanceof Error ? error.message : String(error))
+  }
+  await waitForPageSettled(ACTION_SETTLE)
+  const chosen = result.selected.length === 0 ? '(nothing)' : result.selected.map((label) => `"${label}"`).join(', ')
+  return withPageDelta(
+    resolved(`Selected ${chosen} in [${index}]${result.multiple ? ' (multiple)' : ''} using the select\'s own input/change events.`),
+    ctx,
+  )
 }
 
 async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
@@ -494,8 +856,11 @@ async function scrollAction(args: Record<string, unknown>, ctx: ActionContext): 
 async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
   const point = pointArg(args)
   if (point !== undefined) return hoverAtCoordinates(point, ctx)
-  const index = numberArg(args, 'index')
-  const el = elementOrThrow(ctx.ids, index)
+  const indexArg = args.index === undefined ? undefined : numberArg(args, 'index')
+  const resolution = resolveTarget(ctx.ids, indexArg, typeof args.text === 'string' ? args.text : undefined)
+  const el = resolution.element
+  const index = resolution.index
+  const resolved = (status: string): string => resolution.note === undefined ? status : `${status} ${resolution.note}`
   ensureInViewport(el)
   // Move the REAL pointer over a random point on the element and let
   // :hover-driven affordances (tooltips, dropdown previews) render before the
@@ -508,14 +873,17 @@ async function hoverAction(args: Record<string, unknown>, ctx: ActionContext): P
   const at = describeElementAt(hitInfo.under)
   const confirmNote = hitInfo.hit ? '' : ' Note: the coordinate did not resolve to the target element itself (it may be covered or mis-located).'
   return withPageDelta(
-    `Hovered [${index}]. The pointer is over (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}. Call browser_snapshot to read any hover effect.${confirmNote}`,
+    resolved(`Hovered [${index}]. The pointer is over (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}. Call browser_snapshot to read any hover effect.${confirmNote}`),
     ctx,
   )
 }
 
 async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
-  const index = numberArg(args, 'index')
-  const el = elementOrThrow(ctx.ids, index)
+  const indexArg = args.index === undefined ? undefined : numberArg(args, 'index')
+  const resolution = resolveTarget(ctx.ids, indexArg)
+  const el = resolution.element
+  const index = resolution.index
+  const resolved = (status: string): string => resolution.note === undefined ? status : `${status} ${resolution.note}`
   ensureInViewport(el)
   if (isRangeElement(el)) {
     const value = typeof args.value === 'number' && Number.isFinite(args.value) ? args.value : undefined
@@ -524,7 +892,7 @@ async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Pr
     }
     await dragRangeTo(el, value)
     await waitForPageSettled(ACTION_SETTLE)
-    return withPageDelta(`Dragged slider [${index}] to ${clampRangeValue(el, value)}.`, ctx)
+    return withPageDelta(resolved(`Dragged slider [${index}] to ${clampRangeValue(el, value)}.`), ctx)
   }
   const dx = typeof args.dx === 'number' && Number.isFinite(args.dx) ? args.dx : 0
   const dy = typeof args.dy === 'number' && Number.isFinite(args.dy) ? args.dy : 0
@@ -536,7 +904,7 @@ async function dragAction(args: Record<string, unknown>, ctx: ActionContext): Pr
   const from = elementRandomPoint(el)
   await dragFromTo(el, from, { x: from.x + dx, y: from.y + dy }, { steps: 7 })
   await waitForPageSettled(ACTION_SETTLE)
-  return withPageDelta(`Dragged [${index}] by (${dx}, ${dy}).`, ctx)
+  return withPageDelta(resolved(`Dragged [${index}] by (${dx}, ${dy}).`), ctx)
 }
 
 async function navigateAction(args: Record<string, unknown>): Promise<ActionResult> {
@@ -642,7 +1010,7 @@ function jitterPoint(point: { x: number; y: number }): { x: number; y: number } 
 }
 
 /** Click at a raw viewport point (the AX bounds centre of a snapshot item). */
-async function clickAtCoordinates(point: { x: number; y: number }, ctx: ActionContext): Promise<ActionResult> {
+async function clickAtCoordinates(point: { x: number; y: number }, clickOptions: Required<ClickOptions>, ctx: ActionContext): Promise<ActionResult> {
   const target = jitterPoint(point)
   if (target.x < 0 || target.y < 0 || target.x > window.innerWidth || target.y > window.innerHeight) {
     throw new ActionError('action-failed', 'The point is outside the viewport; scroll to bring it into view first.')
@@ -650,11 +1018,11 @@ async function clickAtCoordinates(point: { x: number; y: number }, ctx: ActionCo
   const under = elementAtPoint(target.x, target.y)
   // No registered element exists for a raw coordinate; fall back to the page so
   // the humanized plan still has a synthetic target when CDP input is absent.
-  await clickElement(under ?? (document.body ?? document.documentElement), { at: target })
+  await clickElement(under ?? (document.body ?? document.documentElement), { at: target, ...clickOptions })
   await waitForPageSettled(ACTION_SETTLE)
   const at = describeElementAt(under)
   const confirmNote = under === null ? ' Note: the coordinate resolved to nothing (page background or blank area).' : ''
-  return withPageDelta(`Clicked at (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}.${confirmNote}`, ctx)
+  return withPageDelta(`${clickVerb(clickOptions)} at (${Math.round(target.x)}, ${Math.round(target.y)}); the element at that coordinate is ${at}.${confirmNote}`, ctx)
 }
 
 /** Hover at a raw viewport point (the AX bounds centre of a snapshot item). */

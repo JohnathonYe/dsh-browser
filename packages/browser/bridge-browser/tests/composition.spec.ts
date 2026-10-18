@@ -122,6 +122,7 @@ async function loadComposition(): Promise<{ ctx: Context; configPath: string; po
     // This spec drives the raw gateway chain (create → real session); the
     // deferred-creation behavior is covered by the extension e2e instead.
     '    deferSessionCreate: false',
+    '    discoveryPort: 0',
     '',
   ].join('\n'))
 
@@ -199,7 +200,7 @@ describe('real Loader composition', () => {
     const browserPrompt = (await ctx.systemPrompt.assemble()).sections
       .find((section) => section.name === 'tool:bridge-browser')?.text
     expect(browserPrompt).toContain('page content you have not snapshotted')
-    expect(browserPrompt).toContain('Reuse that injected snapshot')
+    expect(browserPrompt).toContain('Reuse a snapshot already injected')
     expect(browserPrompt).not.toMatch(/\p{Script=Han}/u)
 
     // Multi-instance selection must guide the model to present instances as a
@@ -225,53 +226,27 @@ describe('real Loader composition', () => {
     expect(noAuthGroupPrompt).toContain('do not lead with a URL-less tool')
     expect(noAuthGroupPrompt).not.toMatch(/\p{Script=Han}/u)
 
-    // Confirm-before-click guidance must require a screenshot before every
-    // click/hover/drag so the model verifies the AI cursor overlay is on the
-    // intended target instead of acting by index alone. Keep it English (no Han).
-    const confirmBeforeClickPrompt = (await ctx.systemPrompt.assemble()).sections
-      .find((section) => section.name === 'tool:bridge-browser:confirm-before-click')?.text
-    expect(confirmBeforeClickPrompt).toBeDefined()
-    expect(confirmBeforeClickPrompt).toContain('snapshot index')
-    expect(confirmBeforeClickPrompt).toContain('coordinate')
-    expect(confirmBeforeClickPrompt).toContain('blindly')
-    expect(confirmBeforeClickPrompt).not.toMatch(/browser_click_at|browser_hover_at|browser_drag_at/)
-    expect(confirmBeforeClickPrompt).not.toMatch(/\p{Script=Han}/u)
+    // Locating must be snapshot-index driven, confirm the landing element, and
+    // never treat a screenshot as a locator. Keep it English (no Han).
+    const locatePrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:locate')?.text
+    expect(locatePrompt).toBeDefined()
+    expect(locatePrompt).toContain('snapshot index')
+    expect(locatePrompt).toContain('coordinate')
+    expect(locatePrompt).toContain('blindly')
+    expect(locatePrompt).toContain('not a locator')
+    expect(locatePrompt).toContain('stale')
+    expect(locatePrompt).not.toMatch(/browser_click_at|browser_hover_at|browser_drag_at/)
+    expect(locatePrompt).not.toMatch(/\p{Script=Han}/u)
 
-    // DOM-first acting: locate by snapshot index and confirm the landing element
-    // via the coordinate→element readback, never by screenshot pixels. Keep it
-    // English (no Han).
-    const clickAtPrompt = (await ctx.systemPrompt.assemble()).sections
-      .find((section) => section.name === 'tool:bridge-browser:click-at')?.text
-    expect(clickAtPrompt).toBeDefined()
-    expect(clickAtPrompt).toContain('browser_click(index)')
-    expect(clickAtPrompt).toContain('snapshot index')
-    expect(clickAtPrompt).toContain('not a locator')
-    // The coordinate→element confirmation is DOM-driven, never screenshot pixels.
-    expect(clickAtPrompt).not.toMatch(/browser_click_at|browser_hover_at|browser_drag_at/)
-    expect(clickAtPrompt).not.toMatch(/\p{Script=Han}/u)
-
-    // Index-location failure steers back to a fresh snapshot / re-index, never
-    // to coordinate tools. Keep it English (no Han).
-    const indexFallbackPrompt = (await ctx.systemPrompt.assemble()).sections
-      .find((section) => section.name === 'tool:bridge-browser:index-fallback')?.text
-    expect(indexFallbackPrompt).toBeDefined()
-    expect(indexFallbackPrompt).toContain('snapshot index cannot locate the target')
-    expect(indexFallbackPrompt).toContain('browser_snapshot again')
-    expect(indexFallbackPrompt).toContain('coordinate')
-    expect(indexFallbackPrompt).not.toMatch(/browser_click_at|browser_hover_at|browser_drag_at/)
-    expect(indexFallbackPrompt).not.toMatch(/\p{Script=Han}/u)
-
-    // Over-confirmation guard must bound snapshot/screenshot to when they are
-    // needed, steer delta:true to fetch only changes, and forbid re-confirming
-    // the same region in a single locating flow. Keep it English (no Han).
-    const reduceReconfirmPrompt = (await ctx.systemPrompt.assemble()).sections
-      .find((section) => section.name === 'tool:bridge-browser:reduce-reconfirm')?.text
-    expect(reduceReconfirmPrompt).toBeDefined()
-    expect(reduceReconfirmPrompt).toContain('Do not take snapshots or screenshots unless you actually need them')
-    expect(reduceReconfirmPrompt).toContain('delta:true')
-    expect(reduceReconfirmPrompt).toContain('Do not re-capture on every step')
-    expect(reduceReconfirmPrompt).toContain('do not repeatedly snapshot/screenshot the same region')
-    expect(reduceReconfirmPrompt).not.toMatch(/\p{Script=Han}/u)
+    // New primitives are advertised where the model decides how to act.
+    const workflowPrompt = (await ctx.systemPrompt.assemble()).sections
+      .find((section) => section.name === 'tool:bridge-browser:workflow')?.text
+    expect(workflowPrompt).toBeDefined()
+    for (const tool of ['browser_wait_for', 'browser_select_option', 'browser_upload_file', 'browser_dialog', 'browser_observe', 'browser_batch']) {
+      expect(workflowPrompt).toContain(tool)
+    }
+    expect(workflowPrompt).not.toMatch(/\p{Script=Han}/u)
 
     // Zero-config discovery endpoint answers with the bridge WebSocket URL.
     const configResponse = await fetch(`http://127.0.0.1:${port}/ext/bridge-config`)

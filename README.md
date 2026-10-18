@@ -39,9 +39,15 @@ The paired Playwright / extension duration ratio was **1.24** (95% CI **1.16–1
 | Capability | Tool | Notes |
 |---|---|---|
 | Read page | `browser_snapshot` | Structured text snapshot: title, URL, main text, numbered controls, and masked form fields; `delta: true` returns only changes |
-| Click element | `browser_click` | Click links, buttons, checkboxes, and other controls by inventory number |
-| Fill forms | `browser_type` | React/Vue-compatible input; `replace` clears the field first |
-| Press keys | `browser_press` | Keyboard events such as Enter, Tab, Escape, and arrow keys |
+| Click element | `browser_click` | Click by inventory number or AX bounds; right/middle/double click and held modifiers |
+| Fill forms | `browser_type` | Real keyboard events (React/Vue/typeahead compatible); `replace` clears first, `submit` submits the form |
+| Press keys | `browser_press` | Real key events and combinations such as Enter, Tab, Escape, Meta+A, Control+Shift+Enter |
+| Choose option | `browser_select_option` | Native `<select>` by value, label, option index, or multiple values |
+| Upload files | `browser_upload_file` | Attach absolute local paths to a file input through CDP |
+| Answer dialogs | `browser_dialog` | Accept or dismiss native alert/confirm/prompt/beforeunload dialogs |
+| Wait for condition | `browser_wait_for` | Wait for a selector, visible text, or URL substring; returns as soon as it holds |
+| Batch actions | `browser_batch` | Run up to 10 dependent actions in one tool call |
+| Observe page health | `browser_observe` | Recent console/page errors and failed network requests |
 | Scroll | `browser_scroll` | Viewport scrolling: up, down, top, and bottom |
 | Navigate | `browser_navigate` / `browser_back` / `browser_forward` / `browser_reload` | Navigation inside the controlled tab, with login state preserved |
 | Read region | `browser_get_text` | Lazy-loaded or partial page text |
@@ -50,7 +56,15 @@ The paired Playwright / extension duration ratio was **1.24** (95% CI **1.16–1
 | Screenshot | `browser_screenshot` | `chrome.debugger` captures the exact controlled tab (background too), returning a rasterized viewport image |
 | Hover | `browser_hover` | Hover a target to preview (tooltip/dropdown) |
 | Drag | `browser_drag` | Drag sliders/elements with a human feel (down→move→up) |
-| Humanized | built-in | Curved movement, incremental wheel, hover-before-click, operate-on-visible, scroll-into-view first |
+| Humanized | built-in | Curved movement, real wheel/pointer/keyboard input, hover-before-click, operate-on-visible, scroll-into-view first |
+
+## Input fidelity and deterministic actions
+
+- `browser_type` and `browser_press` send **real CDP keyboard events** (`Input.dispatchKeyEvent` / `Input.insertText`), not synthetic `dispatchEvent` or a direct `value` write. Autocomplete, typeahead, rich-text editors, native form submission, and Tab traversal therefore behave as they do for a person; selected text is replaced with select-all + delete.
+- Clicking supports right/middle buttons, double clicks, and held modifiers (for "open in new tab" style actions). Native selects are set through the element's own model and dispatch `input`/`change`, so React/Vue controlled selects update.
+- `browser_wait_for`, `browser_select_option`, `browser_upload_file`, `browser_dialog`, and `browser_batch` remove the guess-and-re-snapshot loops that used to dominate multi-step flows.
+- A stale index is re-resolved by its recorded AX role + accessible name when that is unambiguous; otherwise the error names the current candidates. `browser_click` also accepts a visible/accessibility `text` fallback.
+- The system prompt is consolidated (locator, confirmation, recovery, and instance selection) instead of repeating the same guidance in several sections.
 
 ## Tab authorization groups (DSH-)
 
@@ -154,7 +168,7 @@ Local Chrome use requires no configuration; Firefox requires the local bridge to
 
 - Make sure dsh web is running locally (default `http://127.0.0.1:3080`).
 - Verify the bridge is loaded: open `http://127.0.0.1:3080/ext/bridge-config`. It should return JSON such as `{"wsUrl":"ws://127.0.0.1:3080/ext/bridge"}`. If it returns a web page instead of JSON, the running dsh predates the bridge registration — restart dsh and refresh the page; the extension reconnects on its own.
-- The extension probes ports 3080, 3081, 3090, and 14389 automatically. If dsh runs on another port — or you use a remote `--host 0.0.0.0` deployment — set the address (and bridge token) in the panel settings. Firefox always requires the token.
+- The extension probes ports 3080, 3081, 3090, 19387, and 14389 automatically. **19387 is the bridge's stable discovery port**: the plugin binds that loopback port even when the host web port changes between launches, so a desktop restart stays discoverable. Set `discoveryPort: 0` in the plugin config to disable it, or another port to move it (14389 is an older desktop build). If 19387 is already owned, the bridge logs a warning and continues on the host web port. Remote `--host 0.0.0.0` deployments still need the address (and bridge token) in the panel settings; Firefox always requires the token.
 
 ## Development
 
@@ -188,5 +202,6 @@ Notes:
 - Privileged gateway methods such as `settings.*`, `credentials.*`, and `host.open*` reject non-loopback sources.
 - Multi-instance connections: the server groups by instanceId; instances coexist, and an unselected target raises an error that prompts the model to ask the user (it never silently uses one instance).
 - The assistant works within the **authorized group**, bound to one or more tabs; there is no "follow the tab" logic. Switching tabs does not stop operations within an authorized group (background operation is allowed); retargeting is done via groups, not following. When a controlled tab closes, calls are rejected until an operable authorized page exists.
+- File upload uses absolute local paths; only authorize browser groups/pages you trust with that capability, because a page can read the attached file's contents.
 - Page-authored text is wrapped as untrusted input. The default `auto` mode reads only the controlled tab without an extra prompt; privacy-sensitive users can select `ask` for per-read confirmation or `off` to block reads entirely. In `ask` mode, the read dialog can allow one read or persistently switch back to `auto`; this can be reversed in Settings. Read page text is sent to the selected model.
 - Click, type, keypress, navigation, history, and reload calls fail closed until the user approves them. An origin may be trusted for the current side-panel session (cleared when the last panel closes or the service worker restarts), while permanent trust is managed explicitly in Settings. Explicit cross-origin `browser_navigate` calls and unknown history destinations always prompt again.

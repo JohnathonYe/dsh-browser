@@ -20,6 +20,8 @@ export interface MouseStep {
   /** Bitfield of buttons currently pressed. */
   buttons?: number
   clickCount?: number
+  /** CDP modifier bitfield: Alt=1, Control=2, Meta=4, Shift=8. */
+  modifiers?: number
   deltaX?: number
   deltaY?: number
   /** Pause (ms) to insert after this step; honored by CDP or the fallback. */

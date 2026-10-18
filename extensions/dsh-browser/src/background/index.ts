@@ -40,7 +40,9 @@ import { BridgeClient, type BridgeState } from './bridge.ts'
 import { createRpc } from './rpc.ts'
 import { dispatchToolCall, resetTabSnapshot, type ToolAnswer, type ToolCall } from './tools.ts'
 import { debuggerSession } from './debugger-session.ts'
-import { replayMouseSteps, type MouseStep } from './input.ts'
+import { replayKeySteps, replayMouseSteps, type MouseStep } from './input.ts'
+import type { KeyStep } from '../content/keyboard.ts'
+import { enablePageDialogs, forgetPageDialogs } from './dialog.ts'
 import {
   modelVisibleImageSize,
   pngSizeFromBase64,
@@ -103,8 +105,14 @@ const SETTINGS_DEFAULTS: Settings = {
   controlEnabled: true,
 }
 
-/** 自动探测的候选端口（dsh web 默认 3080；桌面应用常用 14389；--port 覆盖的常见值）。 */
-const DISCOVERY_PORTS = [3080, 3081, 3090, 14389]
+/**
+ * 自动探测的候选端口。
+ *
+ * dsh web 默认 3080；桌面应用固定 19387（其启动参数写死 --port 19387，不是随机挑的）；
+ * 3081/3090 是 --port 覆盖的常见值；14389 是旧版桌面应用。探测按顺序返回第一个
+ * 响应的桥，所以两个宿主都开着时仍优先 web。
+ */
+const DISCOVERY_PORTS = [3080, 3081, 3090, 19387, 14389]
 const LEGACY_LOCAL_URL = 'ws://127.0.0.1:3080'
 
 /** 探测本机 dsh 的桥地址：fetch /ext/bridge-config 直到成功。 */
@@ -555,18 +563,26 @@ function broadcastSettings(): void {
  *  调用方需容忍 hold 的 attach 失败（DevTools 占用/受保护页）：失败仅意味着无法常驻。 */
 async function syncDebuggerHold(): Promise<void> {
   if (!settings.controlEnabled) {
+    for (const held of debuggerSession.heldTabs()) forgetPageDialogs(held)
     await debuggerSession.releaseAllHolds()
     return
   }
   const targetId = tabAuthorization.snapshot().targetTabId
   if (targetId === null) {
+    for (const held of debuggerSession.heldTabs()) forgetPageDialogs(held)
     await debuggerSession.releaseAllHolds()
     return
   }
   for (const held of debuggerSession.heldTabs()) {
-    if (held !== targetId) await debuggerSession.releaseHold(held).catch(() => {})
+    if (held !== targetId) {
+      forgetPageDialogs(held)
+      await debuggerSession.releaseHold(held).catch(() => {})
+    }
   }
   await debuggerSession.hold(targetId).catch(() => {})
+  // Enable Page while the tab is responsive; doing it after a dialog opens can
+  // hang because the renderer is blocked.
+  void enablePageDialogs(targetId).catch(() => {})
 }
 
 /** Re-enumerate live group membership so the authorized set stays current (new drags / AI new tabs). */
@@ -913,7 +929,14 @@ async function openColdStartAuthorizedTab(url: string, ownerSessionId: string | 
   if (tab === null || tab.id === undefined) {
     return { ok: false, error: { code: 'action-failed', message: 'Could not open a new tab.' } }
   }
-  const groupId = await chrome.tabs.group({ tabIds: [tab.id] }).catch(() => -1)
+  let groupId = await chrome.tabs.group({ tabIds: [tab.id] }).catch(() => -1)
+  if (groupId < 0) {
+    // A freshly created tab can briefly be unattached when the group API runs
+    // (headless Chromium is especially prone to this). Retry once before
+    // failing the whole cold start.
+    await new Promise((resolveDelay) => { setTimeout(resolveDelay, 80) })
+    groupId = await chrome.tabs.group({ tabIds: [tab.id] }).catch(() => -1)
+  }
   if (groupId < 0) {
     return { ok: false, error: { code: 'action-failed', message: 'Could not group the new tab into a DSH- group.' } }
   }
@@ -966,6 +989,27 @@ async function runBrowserControlTool(call: ToolCall): Promise<ToolAnswer> {
       }
     }
     return { ok: true, result: { text: lines.join('\n') || 'No authorized tabs yet.' } }
+  }
+  if (call.name === 'browser_tab_switch') {
+    const tabId = Number((call.args as { tabId?: unknown })?.tabId)
+    if (!Number.isInteger(tabId)) {
+      return { ok: false, error: { code: 'bad-args', message: 'browser_tab_switch requires a numeric tabId from browser_tab_list.' } }
+    }
+    if (!tabAuthorization.isAuthorizedTabForSession(tabId, call.sessionId ?? '_default')) {
+      return { ok: false, error: { code: 'no-active-tab', message: 'The tab is not authorized for this agent. Use browser_tab_list first.' } }
+    }
+    const tab = await chrome.tabs.get(tabId).catch(() => null)
+    if (tab === null) {
+      return { ok: false, error: { code: 'no-active-tab', message: `Tab ${tabId} no longer exists. Use browser_tab_list for current tabs.` } }
+    }
+    tabAuthorization.setTarget(tabId, { title: tab.title ?? '', url: tab.url ?? '' })
+    persistTabAuthorization()
+    broadcastTabAuthorization()
+    await syncDebuggerHold()
+    return {
+      ok: true,
+      result: { text: `Now operating tab ${tabId}: ${tab.title || '(untitled)'} — ${tab.url || ''}. Call browser_snapshot to read it.` },
+    }
   }
   if (call.name === 'browser_close_tab') {
     const tabId = Number((call.args as { tabId?: unknown })?.tabId)
@@ -1111,7 +1155,7 @@ function routeToolCall(call: ToolCall): void {
     })
     return
   }
-  if (call.name === 'browser_tab_list' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot' || call.name === 'browser_close_tab') {
+  if (call.name === 'browser_tab_list' || call.name === 'browser_tab_switch' || call.name === 'browser_new_tab' || call.name === 'browser_screenshot' || call.name === 'browser_close_tab') {
     const controller = new AbortController()
     activeToolCalls.set(call.id, controller)
     const timer = setTimeout(() => { controller.abort() }, 90_000)
@@ -1538,7 +1582,7 @@ if (chrome.runtime.onMessage !== undefined) {
   chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
     if (typeof message !== 'object' || message === null) return
     const msg = message as { type?: unknown }
-    if (msg.type !== 'DSH_INPUT_MOUSE') return
+    if (msg.type !== 'DSH_INPUT_MOUSE' && msg.type !== 'DSH_INPUT_KEY') return
     const payload = message as { steps?: unknown }
     const tabId = sender.tab?.id
     if (tabId === undefined || !Array.isArray(payload.steps) || payload.steps.length === 0) {
@@ -1546,14 +1590,18 @@ if (chrome.runtime.onMessage !== undefined) {
       return
     }
     // Only the root frame produces viewport coordinates usable by CDP Input.
+    // Keyboard focus is likewise a top-level input concern; subframes fall back
+    // to synthetic key events in the content script.
     if ((sender as { frameId?: number }).frameId !== 0) {
       sendResponse({ ok: false, error: 'subframe' })
       return
     }
-    const steps = payload.steps as MouseStep[]
     // Reply immediately on the same message channel; the CDP replay runs in the
     // worker but must not hold the content script's action hostage on failure.
-    void replayMouseSteps(tabId, steps).then(
+    const replay = msg.type === 'DSH_INPUT_MOUSE'
+      ? replayMouseSteps(tabId, payload.steps as MouseStep[])
+      : replayKeySteps(tabId, payload.steps as KeyStep[])
+    void replay.then(
       () => { sendResponse({ ok: true }) },
       (error: unknown) => {
         const messageText = error instanceof Error ? error.message : String(error)

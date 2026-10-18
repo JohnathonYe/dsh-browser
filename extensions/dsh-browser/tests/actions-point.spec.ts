@@ -58,7 +58,7 @@ describe('browser_click / browser_hover by point (AX bounds)', () => {
   it('still requires an index when no point is supplied', async () => {
     const result = await runAction('browser_click', {}, context()).catch((error: unknown) => error)
     expect(result).toBeInstanceOf(ActionError)
-    expect((result as Error).message).toContain('index must be a non-negative integer')
+    expect((result as Error).message).toContain('No target index or text was provided')
   })
 })
 

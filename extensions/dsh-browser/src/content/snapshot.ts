@@ -22,7 +22,7 @@ import {
 import type { AxNodeInput } from '../ax-shared.ts'
 
 /** Role label per element kind (model-facing vocabulary). */
-function roleOf(el: Element): string {
+export function roleOf(el: Element): string {
   const role = el.getAttribute('role')
   if (role !== null && role !== '') return role
   if (el instanceof HTMLAnchorElement) return 'link'

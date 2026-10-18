@@ -55,6 +55,35 @@ describe('registerBrowserTools', () => {
     expect(requestTool).toHaveBeenLastCalledWith('browser_hover', { point }, exec.signal, 1_000)
   })
 
+  it('forwards click buttons, double clicks, modifiers, text locators, and type submit', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const byName = new Map(registered.map((r) => [r.name, r.definition]))
+    const exec = { signal: new AbortController().signal }
+    const run = async (name: string, args: unknown): Promise<void> => {
+      await (byName.get(name)!.execute as (a: unknown, e: { signal: AbortSignal }) => Promise<unknown>)(args, exec)
+    }
+
+    await run('browser_click', { index: 4, button: 'right', clickCount: 2, modifiers: ['Meta'] })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_click', { index: 4, button: 'right', clickCount: 2, modifiers: ['Meta'] }, exec.signal, 1_000)
+    await run('browser_click', { text: 'Continue' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_click', { text: 'Continue' }, exec.signal, 1_000)
+    await run('browser_type', { index: 7, text: 'query', submit: true })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_type', { index: 7, text: 'query', submit: true }, exec.signal, 1_000)
+    await run('browser_press', { key: 'Meta+A', modifiers: ['Shift'] })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_press', { key: 'Meta+A', modifiers: ['Shift'] }, exec.signal, 1_000)
+    await run('browser_wait_for', { selector: '.result', timeoutMs: 2_000 })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_wait_for', { selector: '.result', timeoutMs: 2_000 }, exec.signal, 1_000)
+    await run('browser_select_option', { index: 9, value: 'bj' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_select_option', { index: 9, value: 'bj' }, exec.signal, 1_000)
+    await run('browser_upload_file', { index: 11, paths: ['/tmp/a.png'] })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_upload_file', { index: 11, paths: ['/tmp/a.png'] }, exec.signal, 1_000)
+    await run('browser_dialog', { accept: false })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_dialog', { accept: false }, exec.signal, 1_000)
+    await run('browser_observe', { clear: false })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_observe', { clear: false }, exec.signal, 1_000)
+  })
+
   it('associates browser calls with the owning Agent session', async () => {
     const { ctx, bridge, requestTool, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
@@ -185,7 +214,9 @@ describe('registerBrowserTools', () => {
     const { ctx, bridge, registered } = makeHarness()
     registerBrowserTools(ctx, bridge, { toolTimeoutMs: 5_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
     const descriptionChars = registered.reduce((sum, { definition }) => sum + String(definition.description).length, 0)
-    expect(descriptionChars).toBeLessThan(1_700)
+    // 28 tools with the added select/upload/dialog/wait/observe/batch primitives
+    // still stay under ~700 tokens of schema text.
+    expect(descriptionChars).toBeLessThan(2_800)
   })
 
   it('exposes optional frame routing on frame-local tools only', () => {
@@ -376,5 +407,67 @@ describe('registerBrowserTools', () => {
     const output = tool.definition.output as { render: (args: unknown, value: unknown) => unknown }
     const rendered = output.render({}, result) as { type: string; text?: string }[]
     expect(rendered).toEqual([{ type: 'text', text: 'Captured the controlled tab.' }])
+  })
+})
+
+describe('browser_batch', () => {
+  function batchHarness() {
+    const registered: { name: string; definition: Record<string, unknown> }[] = []
+    const ctx = {
+      tools: { register: vi.fn((definition: { name: string }) => { registered.push({ name: definition.name, definition: definition as Record<string, unknown> }); return () => {} }) },
+      get: vi.fn(() => undefined),
+    } as unknown as Context
+    const requestTool = vi.fn(async (): Promise<unknown> => ({ text: 'ok' }))
+    const bridge = { requestTool } as unknown as BridgeServer
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 5_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const batch = registered.find((r) => r.name === 'browser_batch')!.definition
+    const execute = batch.execute as (args: unknown, exec: { signal: AbortSignal }) => Promise<unknown>
+    return { requestTool, execute }
+  }
+
+  it('runs steps in order and suppresses intermediate page deltas', async () => {
+    const { requestTool, execute } = batchHarness()
+    requestTool
+      .mockResolvedValueOnce({ text: 'Clicked [4].' })
+      .mockResolvedValueOnce({ text: 'Typed 5 characters.' })
+      .mockResolvedValueOnce({ text: 'Pressed "Enter".' })
+    const result = await execute({
+      steps: [
+        { action: 'click', args: { index: 4 } },
+        { action: 'type', args: { index: 7, text: 'hello' } },
+        { action: 'press', args: { key: 'Enter' } },
+      ],
+    }, { signal: new AbortController().signal })
+
+    expect(requestTool.mock.calls.map((call) => call[0])).toEqual(['browser_click', 'browser_type', 'browser_press'])
+    expect(requestTool.mock.calls[0]![1]).toEqual({ index: 4, noDelta: true })
+    expect(requestTool.mock.calls[1]![1]).toEqual({ index: 7, text: 'hello', noDelta: true })
+    expect(requestTool.mock.calls[2]![1]).toEqual({ key: 'Enter' })
+    const text = (result as { text: string }).text
+    expect(text).toContain('Batch completed 3/3 steps')
+    expect(text).toContain('1. click → Clicked [4].')
+  })
+
+  it('stops at the first failure and reports which step failed', async () => {
+    const { requestTool, execute } = batchHarness()
+    requestTool
+      .mockResolvedValueOnce({ text: 'Clicked [4].' })
+      .mockRejectedValueOnce(new Error('Element [7] is gone'))
+    await expect(execute({
+      steps: [
+        { action: 'click', args: { index: 4 } },
+        { action: 'type', args: { index: 7, text: 'hello' } },
+        { action: 'press', args: { key: 'Enter' } },
+      ],
+    }, { signal: new AbortController().signal })).rejects.toThrow(/Batch stopped at step 2\/3: Element \[7\] is gone/)
+    expect(requestTool).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects unknown, recursive, and oversized batches', async () => {
+    const { execute } = batchHarness()
+    await expect(execute({ steps: [] }, { signal: new AbortController().signal })).rejects.toThrow(/non-empty steps/)
+    await expect(execute({ steps: [{ action: 'batch' }] }, { signal: new AbortController().signal })).rejects.toThrow(/not allowed inside a batch/)
+    await expect(execute({ steps: Array.from({ length: 11 }, () => ({ action: 'click', args: { index: 1 } })) }, { signal: new AbortController().signal }))
+      .rejects.toThrow(/at most 10 steps/)
   })
 })

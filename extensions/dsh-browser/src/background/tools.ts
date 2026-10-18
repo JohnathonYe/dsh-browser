@@ -21,6 +21,9 @@ import {
 import { wrapUntrustedContent } from './untrusted.ts'
 import { approvalPromptForCall } from './authorization.ts'
 import { waitForNextDocumentReady } from './navigation.ts'
+import { uploadFiles } from './upload.ts'
+import { handleDialog } from './dialog.ts'
+import { formatObservation, observePage } from './observe.ts'
 import type { ApprovalAuthorization, ApprovalPrompt } from '../security/approval.ts'
 
 /** A tool call from the bridge. */
@@ -54,12 +57,17 @@ const ACTION_DELTA_TOOLS = new Set([
   'browser_drag',
   'browser_type',
   'browser_press',
+  'browser_select_option',
+  'browser_upload_file',
   'browser_scroll',
   'browser_wait',
+  'browser_wait_for',
 ])
 const ACTION_DELTA_GUIDANCE = 'The page settled and its current changes are included below. Continue from this state; take another snapshot only when broader page context is needed.'
 const NAVIGATION_CANDIDATE_TOOLS = new Set([
   'browser_click',
+  'browser_type',
+  'browser_select_option',
   'browser_navigate',
   'browser_back',
   'browser_forward',
@@ -165,7 +173,7 @@ function isCancelled(call: ToolCall, signal: AbortSignal | undefined): boolean {
 }
 
 function withoutFrame(args: Record<string, unknown>): Record<string, unknown> {
-  const { frame: _frame, tabId: _tabId, ...rest } = args
+  const { frame: _frame, tabId: _tabId, noDelta: _noDelta, ...rest } = args
   return rest
 }
 
@@ -314,6 +322,9 @@ async function dispatchOnce(
   if (isCancelled(call, signal)) return cancelled()
   if (targetStillAllowed?.() === false) return targetChanged()
   if (call.name === 'browser_snapshot') return snapshotAllFrames(tabId, frames, call, budget)
+  if (call.name === 'browser_upload_file') return uploadTool(tabId, call)
+  if (call.name === 'browser_dialog') return dialogTool(tabId, call)
+  if (call.name === 'browser_observe') return observeTool(tabId, call)
 
   const frameId = requestedFrame(call.args)
   if (frameId < 0) return { ok: false, error: { code: 'action-failed', message: 'frame must be a non-negative integer.' } }
@@ -326,7 +337,7 @@ async function dispatchOnce(
   if (isCancelled(call, signal)) return cancelled()
   if (targetStillAllowed?.() === false) return targetChanged()
   const hasSnapshotBaseline = snapshotDocumentsByTab.get(tabId)?.get(frameId) === frameDocumentKey(frame)
-  const requestPageDelta = includeActionDelta && hasSnapshotBaseline && ACTION_DELTA_TOOLS.has(call.name)
+  const requestPageDelta = includeActionDelta && call.args.noDelta !== true && hasSnapshotBaseline && ACTION_DELTA_TOOLS.has(call.name)
   const navigationWait = includeActionDelta && NAVIGATION_CANDIDATE_TOOLS.has(call.name)
     ? waitForNextDocumentReady(tabId, frameId, frame.documentId, signal)
     : undefined
@@ -407,7 +418,12 @@ export async function dispatchToolCall(
 ): Promise<ToolAnswer> {
   if (isCancelled(call, signal)) return cancelled()
   // Privacy boundary: with sharing off, no page content may leave the page.
-  if (sharePageContent === 'off' && (call.name === 'browser_snapshot' || call.name === 'browser_get_text' || call.name === 'browser_find_dom')) {
+  if (sharePageContent === 'off' && (
+    call.name === 'browser_snapshot'
+    || call.name === 'browser_get_text'
+    || call.name === 'browser_find_dom'
+    || call.name === 'browser_observe'
+  )) {
     return { ok: false, error: { code: 'action-failed', message: 'Page content sharing is disabled in Settings > Page content sharing.' } }
   }
   const tab = targetTab ?? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]
@@ -497,6 +513,63 @@ export async function dispatchToolCall(
   }
 }
 
+/** Attach local files to a file input through CDP (top frame only). */
+async function uploadTool(tabId: number, call: ToolCall): Promise<ToolAnswer> {
+  const frameId = requestedFrame(call.args)
+  if (frameId !== 0) {
+    return { ok: false, error: { code: 'action-failed', message: 'File upload is only supported in the top frame; frame must be 0.' } }
+  }
+  const index = call.args.index
+  if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
+    return { ok: false, error: { code: 'bad-args', message: 'browser_upload_file requires a non-negative integer index from browser_snapshot.' } }
+  }
+  try {
+    const result = await uploadFiles(tabId, index, call.args.paths)
+    return {
+      ok: true,
+      result: {
+        text: `Attached ${result.files} file(s) to [${index}] through the file input. The page's input/change handlers have run; call browser_snapshot to confirm the selection is shown.`,
+      },
+    }
+  } catch (error: unknown) {
+    return { ok: false, error: { code: 'action-failed', message: error instanceof Error ? error.message : String(error) } }
+  }
+}
+
+/** Answer the native JavaScript dialog blocking the tab, if any. */
+async function dialogTool(tabId: number, call: ToolCall): Promise<ToolAnswer> {
+  if (requestedFrame(call.args) !== 0) {
+    return { ok: false, error: { code: 'action-failed', message: 'JavaScript dialogs belong to the top frame; omit frame or use frame 0.' } }
+  }
+  if (typeof call.args.accept !== 'boolean') {
+    return { ok: false, error: { code: 'bad-args', message: 'browser_dialog requires accept: true (OK) or false (Cancel).' } }
+  }
+  const accept = call.args.accept
+  const promptText = typeof call.args.promptText === 'string' ? call.args.promptText : undefined
+  try {
+    const result = await handleDialog(tabId, accept, promptText)
+    return {
+      ok: true,
+      result: { text: `${result.accepted ? 'Accepted' : 'Dismissed'} the JavaScript dialog. Call browser_snapshot to read the page state after the dialog.` },
+    }
+  } catch (error: unknown) {
+    return { ok: false, error: { code: 'action-failed', message: error instanceof Error ? error.message : String(error) } }
+  }
+}
+
+/** Read buffered console/page/network failures from the page's main world. */
+async function observeTool(tabId: number, call: ToolCall): Promise<ToolAnswer> {
+  if (requestedFrame(call.args) !== 0) {
+    return { ok: false, error: { code: 'action-failed', message: 'browser_observe reads the top frame; omit frame or use frame 0.' } }
+  }
+  try {
+    const snapshot = await observePage(tabId, call.args.clear !== false)
+    return { ok: true, result: { text: formatObservation(snapshot) } }
+  } catch (error: unknown) {
+    return { ok: false, error: { code: 'action-failed', message: error instanceof Error ? error.message : String(error) } }
+  }
+}
+
 function validateFrameTarget(call: ToolCall, frames: TabFrame[]): ToolAnswer | undefined {
   if (call.name === 'browser_snapshot') return undefined
   const frameId = requestedFrame(call.args)
@@ -508,7 +581,12 @@ function validateFrameTarget(call: ToolCall, frames: TabFrame[]): ToolAnswer | u
 }
 
 function validateElementTarget(call: ToolCall, tabId: number, frames: TabFrame[]): ToolAnswer | undefined {
-  if (call.name !== 'browser_click' && call.name !== 'browser_type' && call.name !== 'browser_hover' && call.name !== 'browser_drag') return undefined
+  if (call.name !== 'browser_click'
+    && call.name !== 'browser_type'
+    && call.name !== 'browser_hover'
+    && call.name !== 'browser_drag'
+    && call.name !== 'browser_select_option'
+    && call.name !== 'browser_upload_file') return undefined
   const frameId = requestedFrame(call.args)
   const frame = frames.find((candidate) => candidate.frameId === frameId)
   const snapshotted = snapshotDocumentsByTab.get(tabId)?.get(frameId)

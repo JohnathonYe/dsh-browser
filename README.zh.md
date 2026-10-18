@@ -39,9 +39,15 @@ Playwright / 扩展的配对耗时比为 **1.24**（95% CI **1.16–1.34**）：
 | 能力 | 工具 | 说明 |
 |---|---|---|
 | 读取页面 | `browser_snapshot` | 结构化文本快照：标题/URL/正文/编号交互清单/表单字段（敏感值掩码）；`delta: true` 只返回变化 |
-| 点击元素 | `browser_click` | 按编号点击链接/按钮/复选框等 |
-| 填写表单 | `browser_type` | 输入文本（React/Vue 受控组件兼容），`replace` 清空重填 |
-| 按键 | `browser_press` | 键盘事件（Enter/Tab/Escape/方向键…） |
+| 点击元素 | `browser_click` | 按编号或 AX 坐标点击；支持右键/中键/双击与修饰键 |
+| 填写表单 | `browser_type` | 真实键盘事件（React/Vue/联想输入兼容），`replace` 清空重填，`submit` 提交表单 |
+| 按键 | `browser_press` | 真实按键与组合键（Enter/Tab/Escape、Meta+A、Control+Shift+Enter…） |
+| 选择下拉项 | `browser_select_option` | 原生 `<select>` 按 value/label/optionIndex/多选值选择 |
+| 上传文件 | `browser_upload_file` | 通过 CDP 把本地绝对路径文件写入 file input |
+| 处理弹窗 | `browser_dialog` | 确认或取消 alert/confirm/prompt/beforeunload 原生弹窗 |
+| 条件等待 | `browser_wait_for` | 等待选择器/文本/URL 片段出现，满足即返回 |
+| 批量动作 | `browser_batch` | 一次调用顺序执行最多 10 个依赖动作 |
+| 页面健康 | `browser_observe` | 读取最近的 console/页面错误与失败请求 |
 | 滚动 | `browser_scroll` | 视口滚动（up/down/top/bottom） |
 | 页面导航 | `browser_navigate` / `browser_back` / `browser_forward` / `browser_reload` | 受控标签页内导航，保留登录态 |
 | 读取区域 | `browser_get_text` | 懒加载内容 / 局部文本 |
@@ -50,7 +56,15 @@ Playwright / 扩展的配对耗时比为 **1.24**（95% CI **1.16–1.34**）：
 | 截图 | `browser_screenshot` | `chrome.debugger` 精确截取受控标签页（可后台），返回光栅化视口截图 |
 | 悬停 | `browser_hover` | 对目标先悬停预览（tooltip/下拉） |
 | 拖动 | `browser_drag` | 滑块/元素随手感拖动（down→move→up） |
-| 拟人操作 | 内建 | 曲线移动、分档滚轮、先 hover 再点击、目标可见才操作、屏外先滚到可见 |
+| 拟人操作 | 内建 | 曲线移动、真实滚轮/指针/键盘、先 hover 再点击、目标可见才操作、屏外先滚到可见 |
+
+## 输入保真与确定性动作
+
+- `browser_type` / `browser_press` 走 **真实 CDP 键盘事件**（`Input.dispatchKeyEvent` / `Input.insertText`），不再用合成 `dispatchEvent` 或直接写 `value`。联想输入、富文本、原生表单提交、Tab 焦点切换都与人工操作一致；`replace` 用全选 + 删除实现。
+- 点击支持右键/中键/双击与按住修饰键（用于“新标签页打开”等）；原生下拉通过元素自身模型选中并派发 `input`/`change`，React/Vue 受控下拉也会更新。
+- `browser_wait_for`、`browser_select_option`、`browser_upload_file`、`browser_dialog`、`browser_batch` 取代了多步流程里“猜一下再重新快照”的循环。
+- 失效编号会按记录的 AX role + 可访问名自动重定位；同名多个时直接列出当前候选，不再盲点。`browser_click` 还支持用可见文本/可访问名作为兜底定位。
+- 系统提示词已合并精简（定位、落点确认、失效恢复、多实例选择），不再把同一条指引重复写在多个段落里。
 
 ## 授权组（DSH-）
 
@@ -155,7 +169,7 @@ Chrome 本机使用无需配置；Firefox 需要填写上述本地桥 token。�
 
 - 确认本机 dsh web 正在运行（默认 `http://127.0.0.1:3080`）。
 - 确认桥接已加载：浏览器打开 `http://127.0.0.1:3080/ext/bridge-config`，应返回类似 `{"wsUrl":"ws://127.0.0.1:3080/ext/bridge"}` 的 JSON。如果返回的是网页而不是 JSON，说明当前运行的 dsh 早于桥接注册——重启 dsh 并刷新页面即可，扩展会自动重连。
-- 扩展会自动探测 3080/3081/3090/14389 端口。若 dsh 运行在其它端口，或使用 `--host 0.0.0.0` 远程部署，请在面板设置中填写地址与桥接 token。Firefox 始终需要 token。
+- 扩展会自动探测 3080/3081/3090/19387/14389 端口。**19387 是桥的稳定发现端口**：即使宿主 web 端口每次启动都变，插件也会在这个 loopback 端口上提供发现与 WebSocket 转发，所以桌面版重启后扩展仍能自动找到它。可在插件配置中设 `discoveryPort: 0` 关闭，或改成其它端口（14389 是旧版桌面应用）。若 19387 已被占用，桥会记录警告并继续使用宿主 web 端口。使用 `--host 0.0.0.0` 的远程部署仍需在面板中填写地址与 token；Firefox 始终需要 token。
 
 ## 开发
 
@@ -189,5 +203,6 @@ pnpm --filter dsh-browser-extension run test
 - 特权网关方法（`settings.*`/`credentials.*`/`host.open*`）对非回环来源一律拒绝。
 - 多实例连接：服务端按 instanceId 分组，实例可共存；未显式选择时工具调用会报错并让模型询问用户，不会悄悄用一个实例。
 - 助手在**授权组**内工作，绑定一个或一组标签页；不再有「跟随标签页」逻辑。用户切页不影响已授权组内的操作（后台可操作）；想切换目标需通过授权组而非跟随。受控标签页关闭时，相关工具调用会被拒绝，直到有可操作的授权页面。
+- 文件上传使用本地绝对路径；请只把该能力授权给你信任的浏览器组/页面，因为页面可以读取被附加文件的内容。
 - 网页文字会标记为不可信输入。默认「自动共享」只按需读取受控标签页且不额外弹窗；对隐私敏感时可选择「每次询问」，或用「关闭」完全阻断读取。在「每次询问」模式下，读取弹窗可以仅允许一次，也可以持久切回自动读取；之后仍可在设置中关闭。读取的页面文字会发送给当前选择的模型。
 - 点击、输入、按键、导航、历史跳转和刷新默认失败关闭，必须由用户批准。可以只在当前侧栏会话中信任单个 origin（最后一个侧栏关闭或 Service Worker 重启即清空）；永久信任需在设置中显式管理。显式跨域 `browser_navigate` 和未知目标的历史跳转始终重新询问。
